@@ -87,6 +87,24 @@ Every command accepts `--help`. Use `--json` on automation-friendly commands whe
 Add `--follow-up` to `ask` for a non-persistent in-memory question session; entering a blank line
 ends it. Follow-up context is never written to the repository or consent state.
 
+## Agent Skill
+
+The repository ships a local-only Codex Skill at
+[`skills/repolocus-analyze-repo`](skills/repolocus-analyze-repo). Its adapter exposes `doctor`,
+`scan`, `ask`, `map`, and `diagram` while forcing extractive local answers and sending generated
+documents to stdout instead of writing them into the target repository.
+
+From a source checkout, install RepoLocus and copy the Skill into Codex's skill directory:
+
+```bash
+pipx install .
+mkdir -p ~/.codex/skills
+cp -R skills/repolocus-analyze-repo ~/.codex/skills/
+```
+
+Then invoke it as `$repolocus-analyze-repo`. The Skill intentionally exposes no cloud-consent
+flags; an agent cannot silently send repository content to a remote provider through this path.
+
 Install the API extra with `pipx install 'repolocus[api]'`, then constrain the server to
 one repository tree:
 

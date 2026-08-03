@@ -1,0 +1,4 @@
+interface:
+  display_name: "RepoLocus Repository Analysis"
+  short_description: "Analyze repositories with local, source-backed evidence"
+  default_prompt: "Use $repolocus-analyze-repo to explain this repository with file-and-line evidence."

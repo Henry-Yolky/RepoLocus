@@ -44,6 +44,21 @@ repolocus ask "请求如何进入核心循环？" --model ollama/qwen3-coder
 - 隐私控制：默认关闭遥测，云端逐次授权或按仓库记忆授权，可预览与撤回；
 - 自托管 API：安装 `api` 可选依赖后运行 `repolocus serve`。
 
+## Agent Skill
+
+仓库内置 [`skills/repolocus-analyze-repo`](skills/repolocus-analyze-repo)，可供 Codex 等具备
+Shell 能力的 Agent 调用。它提供 `doctor`、`scan`、`ask`、`map` 和 `diagram`，强制使用
+本地提取式回答，并让项目地图和架构图输出到 stdout，避免自动写入目标仓库。
+
+```bash
+pipx install .
+mkdir -p ~/.codex/skills
+cp -R skills/repolocus-analyze-repo ~/.codex/skills/
+```
+
+安装后以 `$repolocus-analyze-repo` 调用。该 Skill 不暴露云端授权参数，Agent 不能通过
+这条路径静默把仓库内容发送给远程模型。
+
 API 默认只监听回环地址、只允许访问 `--root` 指定目录之下的仓库，并禁用云模型。
 对外监听必须显式使用 `--allow-remote`，且应放在具备认证和授权的网关之后；服务端若要
 开放云模型，还需显式使用 `--allow-cloud-api`。
