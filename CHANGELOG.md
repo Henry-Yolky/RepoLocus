@@ -3,6 +3,14 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and versions use
 Semantic Versioning while the project is in alpha.
 
+## [0.1.1] - 2026-08-03
+
+### Changed
+
+- Release tags must point to commits on `main`'s first-parent history, preventing tags on merged
+  pull-request heads from producing incomplete generated release notes.
+- Documented the repeatable version-bump, merge, tag, approval, and immutable-tag release flow.
+
 ## [0.1.0] - 2026-08-03
 
 ### Added
