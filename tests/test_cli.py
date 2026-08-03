@@ -5,6 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from repolocus import __version__
 from repolocus.cli import _index_cache_permission_status, app
 from repolocus.config import Settings
 from repolocus.core import RepoLocusService
@@ -20,7 +21,7 @@ def test_cli_help_and_version() -> None:
     assert help_result.exit_code == 0
     assert "source-backed answers" in help_result.stdout
     assert version_result.exit_code == 0
-    assert "RepoLocus 0.1.0" in version_result.stdout
+    assert f"RepoLocus {__version__}" in version_result.stdout
 
 
 def test_cli_scan_map_ask_and_diagram(sample_repo: Path, isolated_user_dirs: Path) -> None:

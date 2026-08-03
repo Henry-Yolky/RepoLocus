@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 
+from repolocus import __version__
 from repolocus.api import create_app
 
 
@@ -37,7 +38,7 @@ def test_self_hosted_api_health_and_local_workflow(
     )
 
     assert health.status_code == 200
-    assert health.json()["version"] == "0.1.0"
+    assert health.json()["version"] == __version__
     assert scan.status_code == 200, scan.text
     assert scan.json()["scan"]["indexed_files"] >= 4
     assert project_map.status_code == 200, project_map.text
