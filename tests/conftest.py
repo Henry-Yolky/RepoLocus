@@ -12,6 +12,8 @@ def isolated_user_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(state / "config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(state / "data"))
     monkeypatch.setenv("XDG_STATE_HOME", str(state / "state"))
+    monkeypatch.setenv("LOCALAPPDATA", str(state / "local"))
+    monkeypatch.setenv("APPDATA", str(state / "roaming"))
     return state
 
 

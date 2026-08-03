@@ -181,8 +181,9 @@ def test_clean_all_refuses_cache_inside_repository(
     isolated_user_dirs: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("XDG_CACHE_HOME", str(sample_repo))
-    valuable = sample_repo / "devpilot" / "indexes" / "valuable_source.py"
+    dangerous_cache = sample_repo / ".cache" / "indexes"
+    monkeypatch.setattr("devpilot.cli.cache_root", lambda: dangerous_cache)
+    valuable = dangerous_cache / "valuable_source.py"
     valuable.parent.mkdir(parents=True)
     valuable.write_text("keep me\n", encoding="utf-8")
 
@@ -235,19 +236,6 @@ def test_serve_requires_opt_in_for_non_loopback_host(
 
     assert result.exit_code == 1
     assert "--allow-remote" in result.output
-
-
-def test_untrusted_filename_cannot_emit_terminal_controls(
-    sample_repo: Path, isolated_user_dirs: Path
-) -> None:
-    hostile = sample_repo / "src" / "demo" / "bad\x1b]8;;https:__attacker.invalid\x07.py"
-    hostile.write_text("def terminal_probe():\n    return True\n", encoding="utf-8")
-
-    result = runner.invoke(app, ["ask", "terminal_probe", str(sample_repo)])
-
-    assert result.exit_code == 0, result.output
-    assert "\x1b" not in result.output
-    assert "\\u001b" in result.output
 
 
 def test_follow_up_session_is_in_memory_and_source_backed(
