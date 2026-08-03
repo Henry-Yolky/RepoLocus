@@ -1,24 +1,24 @@
 # Privacy
 
-DevPilot is local-first. Telemetry is disabled and there is no DevPilot-operated service in
+RepoLocus is local-first. Telemetry is disabled and there is no RepoLocus-operated service in
 v0.1.
 
 ## Data stored locally
 
 The scanner stores file hashes, paths, extracted text chunks, symbols, imports, and line ranges
 in a SQLite database under the operating-system user cache directory. It does not store Git
-author names, email addresses, or commit messages. `devpilot clean` removes an index, and
-`devpilot clean --all` removes all DevPilot indexes after confirmation.
+author names, email addresses, or commit messages. `repolocus clean` removes an index, and
+`repolocus clean --all` removes all RepoLocus indexes after confirmation.
 
 Per-repository cloud-provider grants are stored separately in the operating-system user state
-directory. `devpilot privacy status` displays them and `devpilot privacy revoke` deletes them.
+directory. `repolocus privacy status` displays them and `repolocus privacy revoke` deletes them.
 
 ## Network access
 
 `local` mode has no network access. Ollama defaults to `http://127.0.0.1:11434`; only a loopback
 Ollama URL is treated as local. A non-loopback Ollama endpoint and every cloud provider are
 disabled until the user either passes `--allow-cloud` for one call or records a
-repository/provider grant. Before every approved remote CLI call, DevPilot displays the exact
+repository/provider grant. Before every approved remote CLI call, RepoLocus displays the exact
 redacted source content and ranges, fragment count, estimated tokens, and redaction count that
 will be sent, including calls covered by a remembered grant. The self-hosted API has no
 interactive confirmation UI; cloud access is operator-disabled by default and should remain so
@@ -35,4 +35,14 @@ must confirm they have authority to send the selected repository content.
 Common credential filenames, `.env` variants, private keys, binary files, oversized files, and
 files with high-confidence secret patterns are not indexed. These safeguards reduce risk but
 are not a guarantee that arbitrary source contains no confidential information. Always inspect
-`devpilot privacy preview` before sending sensitive repositories to a cloud model.
+`repolocus privacy preview` before sending sensitive repositories to a cloud model.
+
+## Pre-rename alpha data
+
+RepoLocus does not import configuration, indexes, environment-variable settings, or remembered
+cloud consent from pre-rename DevPilot alpha builds. Requiring fresh configuration and consent
+prevents old network destinations or grants from silently carrying over. The legacy
+`.devpilot/` directory remains excluded from scans, and existing generated documents can still
+be safely replaced, but `repolocus clean --all` and `repolocus privacy revoke` operate only on
+RepoLocus state. Inspect and explicitly remove obsolete operating-system config, cache, and state
+directories named `devpilot` if they are no longer needed.

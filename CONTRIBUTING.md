@@ -5,10 +5,10 @@ Thank you for helping make repository understanding more verifiable.
 ## Setup
 
 ```bash
-cd /path/to/devpilot
+cd /path/to/repolocus
 uv sync --all-extras
 uv run ruff check .
-uv run pytest --cov=devpilot --cov-report=term-missing
+uv run pytest --cov=repolocus --cov-report=term-missing
 ```
 
 Pull requests should be focused, include tests for behavior changes, update user-facing docs,

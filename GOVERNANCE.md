@@ -1,6 +1,6 @@
 # Governance
 
-DevPilot begins with a lightweight maintainer model.
+RepoLocus begins with a lightweight maintainer model.
 
 - The Lead Maintainer owns roadmap and release decisions.
 - Core Reviewers approve scanner, parser, index, retrieval, and provider changes.

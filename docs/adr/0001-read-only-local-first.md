@@ -19,6 +19,6 @@ context.
 
 ## Consequences
 
-DevPilot is not a coding agent. The smaller permission surface is easier to test and explain.
+RepoLocus is not a coding agent. The smaller permission surface is easier to test and explain.
 Future write or execution features require a new ADR and must not silently broaden existing
 commands.

@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from devpilot.index import RepositoryIndex
-from devpilot.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
-from devpilot.retrieval import RetrievalEngine
+from repolocus.index import RepositoryIndex
+from repolocus.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
+from repolocus.retrieval import RetrievalEngine
 
 
 def _source(

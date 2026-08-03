@@ -1,6 +1,6 @@
 # Contributor Covenant Code of Conduct
 
-We pledge to make participation in DevPilot a harassment-free experience for everyone,
+We pledge to make participation in RepoLocus a harassment-free experience for everyone,
 regardless of age, body size, disability, ethnicity, sex characteristics, gender identity and
 expression, level of experience, education, socio-economic status, nationality, personal
 appearance, race, religion, or sexual identity and orientation.

@@ -6,8 +6,9 @@ import stat
 from pathlib import Path
 
 import pytest
+from platformdirs import user_state_dir
 
-from devpilot.security import (
+from repolocus.security import (
     ConsentRequiredError,
     PathSecurityError,
     PrivacyStore,
@@ -96,6 +97,20 @@ def test_privacy_store_remembers_per_repo_provider_outside_repo(tmp_path: Path) 
     assert store.status(repo) == {}
 
 
+def test_pre_rename_consent_is_not_inherited(tmp_path: Path, isolated_user_dirs: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    legacy_path = Path(user_state_dir("devpilot", appauthor=False)) / "privacy.json"
+    current_path = Path(user_state_dir("repolocus", appauthor=False)) / "privacy.json"
+    PrivacyStore(legacy_path).grant(repo, "openai")
+
+    current_store = PrivacyStore()
+
+    assert legacy_path != current_path
+    assert current_store.path == current_path
+    assert current_store.is_allowed(repo, "openai") is False
+
+
 def test_privacy_store_requests_restrictive_permissions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -152,7 +167,7 @@ def test_privacy_store_revoke_all_is_repository_scoped(tmp_path: Path) -> None:
 
 
 def test_privacy_store_refuses_state_inside_repository(tmp_path: Path) -> None:
-    store = PrivacyStore(tmp_path / ".devpilot-privacy.json")
+    store = PrivacyStore(tmp_path / ".repolocus-privacy.json")
 
     with pytest.raises(PrivacyStoreError, match="outside the repository"):
         store.grant(tmp_path, "openai")

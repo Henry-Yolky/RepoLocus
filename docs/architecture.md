@@ -1,6 +1,6 @@
 # Architecture
 
-DevPilot deliberately separates deterministic evidence production from optional model
+RepoLocus deliberately separates deterministic evidence production from optional model
 explanation.
 
 ```mermaid
@@ -43,7 +43,7 @@ all structured citation markers resolve inside retrieved evidence.
 The canonical repository path is hashed to choose an opaque database name under the user cache
 directory. The database records its canonical root and schema/parser versions. A scan removes
 rows for deleted files, replaces rows for changed hashes, and leaves identical hashes untouched.
-`devpilot clean` deletes only that database and its SQLite sidecars.
+`repolocus clean` deletes only that database and its SQLite sidecars.
 
 For a compatible analysis version, the scanner safely re-reads and hashes candidate files but
 reuses stored parser facts when the bytes are identical. This avoids trusting timestamps alone,

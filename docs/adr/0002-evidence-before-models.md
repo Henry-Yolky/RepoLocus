@@ -13,7 +13,7 @@ line ranges can be derived locally and tested independently.
 
 Scanning, indexing, retrieval, project maps, and Mermaid generation are deterministic. Optional
 providers receive a bounded evidence set. Their structured citations must fall inside that set;
-otherwise DevPilot returns the extractive fallback.
+otherwise RepoLocus returns the extractive fallback.
 
 ## Consequences
 

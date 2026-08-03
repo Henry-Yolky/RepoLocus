@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from devpilot.config import Settings
-from devpilot.core import DevPilotService
-from devpilot.index import RepositoryIndex
-from devpilot.retrieval import RetrievalEngine
+from repolocus.config import Settings
+from repolocus.core import RepoLocusService
+from repolocus.index import RepositoryIndex
+from repolocus.retrieval import RetrievalEngine
 
 
 def test_repository_question_set_keeps_top_five_path_hit_rate(
@@ -14,7 +14,7 @@ def test_repository_question_set_keeps_top_five_path_hit_rate(
 ) -> None:
     repository = Path(__file__).resolve().parents[1]
     cases = json.loads((repository / "evaluation" / "questions.json").read_text(encoding="utf-8"))
-    DevPilotService(Settings(model="local")).scan(repository)
+    RepoLocusService(Settings(model="local")).scan(repository)
 
     passed = 0
     with RepositoryIndex.open(repository) as index:

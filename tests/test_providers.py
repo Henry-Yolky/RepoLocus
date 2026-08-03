@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-from devpilot.config import Settings
-from devpilot.providers import (
+from repolocus.config import Settings
+from repolocus.providers import (
     AnthropicProvider,
     ExtractiveProvider,
     OllamaProvider,

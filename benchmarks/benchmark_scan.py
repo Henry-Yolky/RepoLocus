@@ -11,8 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from devpilot.config import Settings
-from devpilot.core import DevPilotService
+from repolocus.config import Settings
+from repolocus.core import RepoLocusService
 
 
 def _populate(root: Path, count: int) -> None:
@@ -27,7 +27,7 @@ def _populate(root: Path, count: int) -> None:
         )
 
 
-def _timed(service: DevPilotService, repository: Path) -> tuple[float, dict[str, object]]:
+def _timed(service: RepoLocusService, repository: Path) -> tuple[float, dict[str, object]]:
     started = time.perf_counter()
     operation = service.scan(repository)
     elapsed = time.perf_counter() - started
@@ -44,15 +44,15 @@ def main() -> int:
 
     temporary = None
     if arguments.keep:
-        repository = Path(tempfile.mkdtemp(prefix="devpilot-benchmark-")) / "repository"
+        repository = Path(tempfile.mkdtemp(prefix="repolocus-benchmark-")) / "repository"
     else:
-        temporary = tempfile.TemporaryDirectory(prefix="devpilot-benchmark-")
+        temporary = tempfile.TemporaryDirectory(prefix="repolocus-benchmark-")
         repository = Path(temporary.name) / "repository"
     repository.mkdir()
     cache = repository.parent / "cache"
     os.environ["XDG_CACHE_HOME"] = str(cache)
     _populate(repository, arguments.files)
-    service = DevPilotService(Settings(model="local"))
+    service = RepoLocusService(Settings(model="local"))
     cold_seconds, cold = _timed(service, repository)
     warm_seconds, warm = _timed(service, repository)
     changed_file = repository / "src" / "group_000" / "module_000000.py"

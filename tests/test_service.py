@@ -4,15 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from devpilot.config import Settings
-from devpilot.core import DevPilotService, PrivacyRequiredError
-from devpilot.models import Evidence
-from devpilot.security import CloudSendPreview, PrivacyStore
+from repolocus.config import Settings
+from repolocus.core import PrivacyRequiredError, RepoLocusService
+from repolocus.models import Evidence
+from repolocus.security import CloudSendPreview, PrivacyStore
 
 
-def _service(root: Path, state: Path, *, model: str = "local") -> DevPilotService:
+def _service(root: Path, state: Path, *, model: str = "local") -> RepoLocusService:
     settings = Settings(model=model)
-    return DevPilotService(settings, privacy=PrivacyStore(state / "privacy.json"))
+    return RepoLocusService(settings, privacy=PrivacyStore(state / "privacy.json"))
 
 
 def test_end_to_end_local_workflow_is_incremental(
@@ -37,7 +37,7 @@ def test_end_to_end_local_workflow_is_incremental(
     assert answer.confidence == "confirmed"
     assert any(item.path == "src/demo/config.py" for item in answer.evidence)
     assert preview.fragment_count == len(answer.evidence)
-    assert not (sample_repo / ".devpilot").exists()
+    assert not (sample_repo / ".repolocus").exists()
 
 
 def test_changed_file_updates_only_changed_content(
@@ -73,7 +73,7 @@ def test_remote_ollama_requires_cloud_consent(sample_repo: Path, isolated_user_d
         model="ollama/test-model",
         ollama_base_url="https://ollama.example.invalid",
     )
-    service = DevPilotService(
+    service = RepoLocusService(
         settings,
         privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
     )
@@ -99,7 +99,7 @@ def test_cloud_send_uses_the_exact_evidence_shown_in_preview(
             return "The function is defined here [[src/demo/config.py:1]]."
 
     monkeypatch.setattr(
-        "devpilot.core.service.create_provider",
+        "repolocus.core.service.create_provider",
         lambda model, settings: FakeProvider(),
     )
     service = _service(sample_repo, isolated_user_dirs, model="openai/test-model")
@@ -166,7 +166,7 @@ def test_context_escapes_source_delimiters_and_limits_citable_ranges(
     sample_repo: Path, isolated_user_dirs: Path
 ) -> None:
     settings = Settings(model="local", context_char_budget=300)
-    service = DevPilotService(
+    service = RepoLocusService(
         settings,
         privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
     )
@@ -255,7 +255,7 @@ def test_extractive_answer_escapes_untrusted_display_controls() -> None:
         reason="exact symbol match",
     )
 
-    answer = DevPilotService(Settings(model="local"))._extractive_answer(
+    answer = RepoLocusService(Settings(model="local"))._extractive_answer(
         f"where is {control}?", [evidence]
     )
 

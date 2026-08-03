@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from devpilot.generators import MermaidGenerator, ProjectMapGenerator, validate_mermaid
-from devpilot.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
+from repolocus.generators import MermaidGenerator, ProjectMapGenerator, validate_mermaid
+from repolocus.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
 
 
 def _result() -> ScanResult:

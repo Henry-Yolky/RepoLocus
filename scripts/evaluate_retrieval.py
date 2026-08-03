@@ -7,10 +7,10 @@ import argparse
 import json
 from pathlib import Path
 
-from devpilot.config import Settings
-from devpilot.core import DevPilotService
-from devpilot.index import RepositoryIndex
-from devpilot.retrieval import RetrievalEngine
+from repolocus.config import Settings
+from repolocus.core import RepoLocusService
+from repolocus.index import RepositoryIndex
+from repolocus.retrieval import RetrievalEngine
 
 
 def main() -> int:
@@ -25,7 +25,7 @@ def main() -> int:
     if not isinstance(questions, list) or not questions:
         raise ValueError("evaluation file must contain a non-empty JSON list")
     repository = arguments.repository.resolve(strict=True)
-    operation = DevPilotService(Settings(model="local")).scan(repository)
+    operation = RepoLocusService(Settings(model="local")).scan(repository)
     outcomes: list[dict[str, object]] = []
     with RepositoryIndex.open(repository) as index:
         retrieval = RetrievalEngine(index)

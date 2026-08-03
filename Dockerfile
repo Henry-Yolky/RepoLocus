@@ -9,13 +9,13 @@ RUN uv sync --frozen --no-dev --extra api --no-editable
 
 FROM python:3.12-slim
 
-RUN useradd --create-home --uid 10001 devpilot \
+RUN useradd --create-home --uid 10001 repolocus \
     && mkdir -p /workspace \
-    && chown devpilot:devpilot /workspace
+    && chown repolocus:repolocus /workspace
 COPY --from=builder /build/.venv /build/.venv
 ENV PATH="/build/.venv/bin:$PATH"
-USER devpilot
+USER repolocus
 WORKDIR /workspace
 EXPOSE 8765
-ENTRYPOINT ["devpilot"]
+ENTRYPOINT ["repolocus"]
 CMD ["serve", "--root", "/workspace", "--host", "127.0.0.1", "--port", "8765"]

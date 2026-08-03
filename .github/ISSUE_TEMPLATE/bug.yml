@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible DevPilot failure.
+description: Report a reproducible RepoLocus failure.
 title: "[Bug]: "
 labels: ["type:bug", "status:needs-triage"]
 body:
@@ -19,8 +19,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: DevPilot version
-      placeholder: devpilot --version
+      label: RepoLocus version
+      placeholder: repolocus --version
     validations:
       required: true
   - type: input

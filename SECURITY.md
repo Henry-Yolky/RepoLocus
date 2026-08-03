@@ -16,7 +16,7 @@ channel. A release must not advertise a private-reporting address that has not b
 
 ## Security boundary
 
-DevPilot treats repository data as untrusted, never executes repository commands, does not
+RepoLocus treats repository data as untrusted, never executes repository commands, does not
 follow symlinks, checks canonical paths, excludes sensitive and binary files, validates
 model-provided citations, and generates Mermaid from a restricted deterministic form. Cloud
 providers require explicit consent. See [docs/security-model.md](docs/security-model.md) for
