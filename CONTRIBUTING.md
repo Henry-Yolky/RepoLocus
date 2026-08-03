@@ -34,5 +34,25 @@ the PyPI Trusted Publisher (or pending publisher) with these exact claims:
 
 Require a maintainer approval on the `pypi` environment. Do not add a long-lived PyPI token to
 GitHub secrets. The release workflow accepts version tags such as `v0.1.0` only when the tag
-matches `pyproject.toml` and its commit belongs to `main`; it then tests, builds, publishes with
-OIDC, and creates the GitHub Release with checksums, an SBOM, and the standalone Codex Skill.
+matches `pyproject.toml` and its commit appears on `main`'s first-parent history; it then tests,
+builds, publishes with OIDC, and creates the GitHub Release with checksums, an SBOM, and the
+standalone Codex Skill.
+
+For each release:
+
+1. Update the version in `pyproject.toml` and `src/repolocus/__init__.py`, refresh `uv.lock`, and
+   update `CHANGELOG.md` in a pull request.
+2. Wait for the required CI check and merge the pull request into `main`.
+3. Tag the resulting `main` commit, not the pull-request head:
+
+   ```bash
+   git switch main
+   git pull --ff-only origin main
+   git tag -a vX.Y.Z -m "RepoLocus vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+4. Approve the waiting `pypi` environment deployment. The remaining PyPI and GitHub Release
+   steps are automatic.
+
+Never move or reuse a published release tag.
