@@ -1,50 +1,50 @@
 [
   {
     "question": "Where is Settings configuration validated?",
-    "expected_paths": ["src/devpilot/config.py"]
+    "expected_paths": ["src/repolocus/config.py"]
   },
   {
     "question": "How is cloud provider consent enforced?",
-    "expected_paths": ["src/devpilot/core/service.py", "src/devpilot/security/privacy.py"]
+    "expected_paths": ["src/repolocus/core/service.py", "src/repolocus/security/privacy.py"]
   },
   {
     "question": "Where are symlinks rejected during repository scanning?",
-    "expected_paths": ["src/devpilot/scanner/repository.py"]
+    "expected_paths": ["src/repolocus/scanner/repository.py"]
   },
   {
     "question": "Where is the SQLite FTS5 schema created?",
-    "expected_paths": ["src/devpilot/index/store.py"]
+    "expected_paths": ["src/repolocus/index/store.py"]
   },
   {
     "question": "How is generated Mermaid syntax validated?",
-    "expected_paths": ["src/devpilot/generators/mermaid.py"]
+    "expected_paths": ["src/repolocus/generators/mermaid.py"]
   },
   {
     "question": "Where does the OpenAI-compatible provider send requests?",
-    "expected_paths": ["src/devpilot/providers/http.py"]
+    "expected_paths": ["src/repolocus/providers/http.py"]
   },
   {
     "question": "How does the API confine requests to its configured root?",
-    "expected_paths": ["src/devpilot/api/app.py"]
+    "expected_paths": ["src/repolocus/api/app.py"]
   },
   {
     "question": "Where are secrets redacted before model use?",
-    "expected_paths": ["src/devpilot/security/redaction.py", "src/devpilot/core/service.py"]
+    "expected_paths": ["src/repolocus/security/redaction.py", "src/repolocus/core/service.py"]
   },
   {
     "question": "Where are generated output paths kept inside the repository?",
-    "expected_paths": ["src/devpilot/security/paths.py", "src/devpilot/cli.py"]
+    "expected_paths": ["src/repolocus/security/paths.py", "src/repolocus/cli.py"]
   },
   {
     "question": "Where is the parser plugin registry implemented?",
-    "expected_paths": ["src/devpilot/parsers/base.py"]
+    "expected_paths": ["src/repolocus/parsers/base.py"]
   },
   {
     "question": "How are retrieval candidates ranked and deduplicated?",
-    "expected_paths": ["src/devpilot/retrieval/engine.py"]
+    "expected_paths": ["src/repolocus/retrieval/engine.py"]
   },
   {
     "question": "Where does clean refuse unsafe cache contents?",
-    "expected_paths": ["src/devpilot/cli.py"]
+    "expected_paths": ["src/repolocus/cli.py"]
   }
 ]

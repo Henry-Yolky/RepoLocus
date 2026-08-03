@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from devpilot.models import Chunk
-from devpilot.parsers import ParseResult, ParserRegistry
-from devpilot.scanner import (
+from repolocus.models import Chunk
+from repolocus.parsers import ParseResult, ParserRegistry
+from repolocus.scanner import (
     RepositoryScanner,
     contains_likely_secret,
     detect_language,
@@ -102,9 +102,14 @@ def test_nested_gitignore_and_negation_are_scoped(tmp_path: Path) -> None:
 
 
 def test_strong_default_ignores_cannot_be_negated(tmp_path: Path) -> None:
-    _write(tmp_path, ".gitignore", "!node_modules/kept.js\n!build/kept.py\n")
+    _write(
+        tmp_path,
+        ".gitignore",
+        "!node_modules/kept.js\n!build/kept.py\n!.devpilot/legacy.py\n",
+    )
     _write(tmp_path, "node_modules/kept.js", "export function no() {}\n")
     _write(tmp_path, "build/kept.py", "def no(): pass\n")
+    _write(tmp_path, ".devpilot/legacy.py", "SECRET = 'never index legacy state'\n")
     _write(tmp_path, "src/yes.py", "def yes(): pass\n")
 
     result = RepositoryScanner().scan(tmp_path)
@@ -112,7 +117,8 @@ def test_strong_default_ignores_cannot_be_negated(tmp_path: Path) -> None:
     assert {item.path for item in result.files} >= {"src/yes.py", ".gitignore"}
     assert not any(item.path.endswith("kept.py") for item in result.files)
     assert not any("node_modules" in item.path for item in result.files)
-    assert result.stats.skipped["default_ignored"] == 2
+    assert not any(".devpilot" in item.path for item in result.files)
+    assert result.stats.skipped["default_ignored"] == 3
 
 
 def test_symlinks_are_never_followed_and_outside_target_is_reported(tmp_path: Path) -> None:

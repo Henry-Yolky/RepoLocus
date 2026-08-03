@@ -3,14 +3,14 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "devpilot-codebase"
+name = "repolocus"
 version = "0.1.0"
 description = "A read-only, local-first codebase map with source-backed answers."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES"]
-authors = [{ name = "DevPilot contributors" }]
+authors = [{ name = "RepoLocus contributors" }]
 keywords = ["codebase", "architecture", "mermaid", "rag", "local-first"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -41,10 +41,10 @@ dev = [
 ]
 
 [project.scripts]
-devpilot = "devpilot.cli:app"
+repolocus = "repolocus.cli:app"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/devpilot"]
+packages = ["src/repolocus"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config"
@@ -52,7 +52,7 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 branch = true
-source = ["devpilot"]
+source = ["repolocus"]
 
 [tool.coverage.report]
 show_missing = true

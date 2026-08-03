@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 dist/
 build/
+.repolocus/
 .devpilot/
 .env
 .DS_Store

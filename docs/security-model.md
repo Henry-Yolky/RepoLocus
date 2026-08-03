@@ -2,7 +2,7 @@
 
 ## Protected assets
 
-DevPilot protects source text outside the selected root, excluded secrets within the root,
+RepoLocus protects source text outside the selected root, excluded secrets within the root,
 cloud credentials, locally indexed content, and the user's expectation that analysis is
 read-only.
 
@@ -18,13 +18,13 @@ read-only.
 | Excessive cloud disclosure | Retrieval limit, context budget, preview, and redaction |
 | Fabricated source citations | Structured citation markers validated against retrieved ranges |
 | Mermaid links or directives | Deterministic restricted grammar; model output is never diagram source |
-| Index committed to Git | Cache defaults outside the repository; `.devpilot/` is ignored |
+| Index committed to Git | Cache defaults outside the repository; `.repolocus/` is ignored |
 
 ## Non-goals and residual risk
 
-DevPilot is not a malware scanner, a data-loss-prevention system, a compiler, or a sandbox. A
+RepoLocus is not a malware scanner, a data-loss-prevention system, a compiler, or a sandbox. A
 secret embedded in an ordinary source expression may evade pattern matching. A user can
-reconfigure Ollama to a remote host, in which case DevPilot requires the same explicit consent
+reconfigure Ollama to a remote host, in which case RepoLocus requires the same explicit consent
 boundary used for cloud providers. Static analysis cannot reliably reconstruct
 reflection, runtime code generation, dependency injection, or dynamic imports. A process with
 the user's operating-system permissions can read the local index. SQLCipher and operating-system

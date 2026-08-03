@@ -8,13 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from devpilot.config import Settings
-from devpilot.core import DevPilotService
-from devpilot.index import IndexFormatError, RepositoryIndex, index_path_for
-from devpilot.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
-from devpilot.parsers import ParseResult, ParserRegistry
-from devpilot.scanner import RepositoryScanner
-from devpilot.security import (
+from repolocus.config import Settings
+from repolocus.core import RepoLocusService
+from repolocus.index import IndexFormatError, RepositoryIndex, index_path_for
+from repolocus.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
+from repolocus.parsers import ParseResult, ParserRegistry
+from repolocus.scanner import RepositoryScanner
+from repolocus.security import (
     PathSecurityError,
     PrivacyStore,
     PrivacyStoreError,
@@ -141,7 +141,7 @@ def test_scanner_detects_a_file_replaced_during_its_read(
 ) -> None:
     source = tmp_path / "app.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
-    from devpilot.scanner import repository as scanner_repository
+    from repolocus.scanner import repository as scanner_repository
 
     original_safe_read = scanner_repository._safe_read
 
@@ -218,7 +218,7 @@ def test_unversioned_foreign_database_is_not_overwritten(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     ("tamper", "message"),
     [
-        ("application", "not a DevPilot index"),
+        ("application", "not a RepoLocus index"),
         ("identity", "identity does not match"),
         ("format", "format version is incompatible"),
         ("table", "schema is incomplete"),
@@ -285,9 +285,9 @@ def test_cloud_model_success_can_remember_repository_scoped_consent(
         def generate(self, system_prompt: str, user_prompt: str) -> str:
             return "Configuration is loaded here [[src/demo/config.py:1-2]]."
 
-    monkeypatch.setattr("devpilot.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
     privacy = PrivacyStore(isolated_user_dirs / "privacy.json")
-    service = DevPilotService(Settings(model="openai/test-model"), privacy=privacy)
+    service = RepoLocusService(Settings(model="openai/test-model"), privacy=privacy)
 
     answer, _operation, _preview = service.ask(
         "Where is load_config defined?",
@@ -313,8 +313,8 @@ def test_unverifiable_model_response_falls_back_to_source_evidence(
         def generate(self, system_prompt: str, user_prompt: str) -> str:
             return "Trust me: configuration is definitely uploaded elsewhere."
 
-    monkeypatch.setattr("devpilot.core.service.create_provider", lambda *_args: FakeProvider())
-    service = DevPilotService(
+    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
+    service = RepoLocusService(
         Settings(model="openai/test-model"),
         privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
     )
@@ -341,8 +341,8 @@ def test_no_evidence_returns_without_cloud_consent_or_provider_call(
     def unexpected_provider(*args: object, **kwargs: object) -> object:
         raise AssertionError("a provider must not be called without evidence")
 
-    monkeypatch.setattr("devpilot.core.service.create_provider", unexpected_provider)
-    service = DevPilotService(
+    monkeypatch.setattr("repolocus.core.service.create_provider", unexpected_provider)
+    service = RepoLocusService(
         Settings(model="openai/test-model"),
         privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
     )
@@ -366,10 +366,10 @@ def test_remote_ollama_can_use_explicitly_remembered_remote_scope(
         def generate(self, system_prompt: str, user_prompt: str) -> str:
             return "Configuration is loaded here [[src/demo/config.py:1]]."
 
-    monkeypatch.setattr("devpilot.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
     privacy = PrivacyStore(isolated_user_dirs / "privacy.json")
     privacy.grant(sample_repo, "ollama-remote")
-    service = DevPilotService(
+    service = RepoLocusService(
         Settings(
             model="ollama/test-model",
             ollama_base_url="https://ollama.example.invalid",

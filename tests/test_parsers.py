@@ -4,14 +4,14 @@ from dataclasses import dataclass
 
 import pytest
 
-from devpilot.parsers import (
+from repolocus.parsers import (
     HeuristicParser,
     ParseResult,
     ParserRegistry,
     PythonParser,
     parse_source,
 )
-from devpilot.parsers.chunking import Region, semantic_chunks
+from repolocus.parsers.chunking import Region, semantic_chunks
 
 
 def test_python_ast_extracts_qualified_symbols_imports_and_entry_point() -> None:

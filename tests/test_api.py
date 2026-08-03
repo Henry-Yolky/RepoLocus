@@ -5,7 +5,7 @@ from pathlib import Path
 
 import httpx
 
-from devpilot.api import create_app
+from repolocus.api import create_app
 
 
 def _request(application, method: str, path: str, **kwargs: object) -> httpx.Response:

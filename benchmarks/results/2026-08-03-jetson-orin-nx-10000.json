@@ -1,9 +1,9 @@
 {
   "benchmark": "synthetic-python-scan-v1",
-  "benchmark_script_sha256": "854416369d199f9c04613e3f9e233cfe512d4388ed03c01d11789a0492e22a73",
-  "cold_seconds": 7.517489,
+  "benchmark_script_sha256": "81726cb2648febd2e9bf5792dd7bc9b0396f244ca0b8288f2d8a59a130a6f4d6",
+  "cold_seconds": 7.542244,
   "date": "2026-08-03",
-  "devpilot_version": "0.1.0",
+  "repolocus_version": "0.1.0",
   "files": 10000,
   "hardware": {
     "cpu_visible_to_process": 6,
@@ -14,7 +14,7 @@
   "indexed_bytes_cold": 1277780,
   "platform": "Linux 5.15.148-tegra aarch64",
   "python": "3.10.12",
-  "single_change_seconds": 2.685213,
+  "single_change_seconds": 2.693698,
   "single_change_update": {
     "added": 0,
     "changed": 1,
@@ -22,7 +22,7 @@
     "removed": 0,
     "unchanged": 9999
   },
-  "warm_seconds": 2.688924,
+  "warm_seconds": 2.69703,
   "warm_update": {
     "added": 0,
     "changed": 0,

@@ -11,14 +11,14 @@ from threading import Barrier
 
 import pytest
 
-from devpilot.index import (
+from repolocus.index import (
     IndexClosedError,
     IndexFormatError,
     RepositoryIndex,
     cache_root,
     index_path_for,
 )
-from devpilot.models import (
+from repolocus.models import (
     Chunk,
     Dependency,
     ScannedFile,
@@ -101,7 +101,7 @@ def test_cache_path_is_deterministic_external_and_not_created(
     repository.mkdir()
     base = tmp_path / "user-cache"
     monkeypatch.setattr(
-        "devpilot.index.store.user_cache_path",
+        "repolocus.index.store.user_cache_path",
         lambda *args, **kwargs: base,
     )
 

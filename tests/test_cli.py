@@ -5,10 +5,10 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from devpilot.cli import app
-from devpilot.config import Settings
-from devpilot.core import DevPilotService
-from devpilot.security import PrivacyStore
+from repolocus.cli import app
+from repolocus.config import Settings
+from repolocus.core import RepoLocusService
+from repolocus.security import PrivacyStore
 
 runner = CliRunner()
 
@@ -20,7 +20,7 @@ def test_cli_help_and_version() -> None:
     assert help_result.exit_code == 0
     assert "source-backed answers" in help_result.stdout
     assert version_result.exit_code == 0
-    assert "DevPilot 0.1.0" in version_result.stdout
+    assert "RepoLocus 0.1.0" in version_result.stdout
 
 
 def test_cli_scan_map_ask_and_diagram(sample_repo: Path, isolated_user_dirs: Path) -> None:
@@ -98,7 +98,7 @@ def test_remembered_cloud_grant_still_prints_exact_preview(
             return "Configuration is loaded here [[src/demo/config.py:1]]."
 
     PrivacyStore().grant(sample_repo, "openai")
-    monkeypatch.setattr("devpilot.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
 
     result = runner.invoke(
         app,
@@ -122,12 +122,12 @@ def test_doctor_does_not_probe_non_loopback_ollama(
     isolated_user_dirs: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("DEVPILOT_OLLAMA_BASE_URL", "https://ollama.example.invalid")
+    monkeypatch.setenv("REPOLOCUS_OLLAMA_BASE_URL", "https://ollama.example.invalid")
 
     def unexpected_client(*args: object, **kwargs: object) -> None:
         raise AssertionError("remote Ollama endpoint must not be probed by doctor")
 
-    monkeypatch.setattr("devpilot.cli.httpx.Client", unexpected_client)
+    monkeypatch.setattr("repolocus.cli.httpx.Client", unexpected_client)
     result = runner.invoke(app, ["doctor", str(sample_repo), "--json"])
 
     assert result.exit_code == 0, result.output
@@ -156,6 +156,23 @@ def test_generated_output_refuses_escape_and_unrecognized_overwrite(
     assert "escapes repository root" in escape.output
 
 
+def test_generated_output_migrates_the_pre_rename_marker(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    output = sample_repo / "PROJECT_MAP.md"
+    output.write_text(
+        "<!-- Generator: DevPilot 0.1.0; deterministic source map. -->\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["map", str(sample_repo)])
+
+    assert result.exit_code == 0, result.output
+    generated = output.read_text(encoding="utf-8")
+    assert "Generator: RepoLocus" in generated
+    assert "Generator: DevPilot" not in generated
+
+
 def test_privacy_status_defaults_to_no_grants(sample_repo: Path, isolated_user_dirs: Path) -> None:
     result = runner.invoke(app, ["privacy", "status", str(sample_repo), "--json"])
 
@@ -168,7 +185,7 @@ def test_privacy_status_defaults_to_no_grants(sample_repo: Path, isolated_user_d
 def test_map_stdout_is_byte_exact_without_terminal_wrapping(
     sample_repo: Path, isolated_user_dirs: Path
 ) -> None:
-    expected, _scan = DevPilotService(Settings(model="local")).map(sample_repo)
+    expected, _scan = RepoLocusService(Settings(model="local")).map(sample_repo)
 
     result = runner.invoke(app, ["map", str(sample_repo), "--stdout"])
 
@@ -182,7 +199,7 @@ def test_clean_all_refuses_cache_inside_repository(
     monkeypatch,
 ) -> None:
     dangerous_cache = sample_repo / ".cache" / "indexes"
-    monkeypatch.setattr("devpilot.cli.cache_root", lambda: dangerous_cache)
+    monkeypatch.setattr("repolocus.cli.cache_root", lambda: dangerous_cache)
     valuable = dangerous_cache / "valuable_source.py"
     valuable.parent.mkdir(parents=True)
     valuable.write_text("keep me\n", encoding="utf-8")

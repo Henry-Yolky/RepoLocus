@@ -36,7 +36,7 @@ jobs:
       - run: uv sync --all-extras --locked
       - run: uv run ruff format --check .
       - run: uv run ruff check .
-      - run: uv run pytest --cov=devpilot --cov-report=term-missing
+      - run: uv run pytest --cov=repolocus --cov-report=term-missing
 
   security:
     runs-on: ubuntu-latest
@@ -46,7 +46,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --all-extras --locked
-      - run: uv run devpilot doctor --security --json
+      - run: uv run repolocus doctor --security --json
       - name: Scan Python for medium/high-severity security issues
         run: uvx bandit==1.9.4 -q -r src -ll
       - name: Export runtime SBOM, including API dependencies
@@ -86,10 +86,10 @@ jobs:
       - run: uv build
       - name: Install wheel in a clean environment
         run: |
-          uv venv /tmp/devpilot-wheel-test
-          wheel="$(find dist -maxdepth 1 -name 'devpilot_codebase-*.whl' -print -quit)"
+          uv venv /tmp/repolocus-wheel-test
+          wheel="$(find dist -maxdepth 1 -name 'repolocus-*.whl' -print -quit)"
           test -n "$wheel"
-          uv pip install --python /tmp/devpilot-wheel-test/bin/python "${wheel}[api]"
-          /tmp/devpilot-wheel-test/bin/devpilot --version
+          uv pip install --python /tmp/repolocus-wheel-test/bin/python "${wheel}[api]"
+          /tmp/repolocus-wheel-test/bin/repolocus --version
       - name: Build container image
-        run: docker build --tag devpilot:ci .
+        run: docker build --tag repolocus:ci .
