@@ -454,15 +454,19 @@ def _source_entry_point(path: str, text: str, language: str) -> bool:
     return False
 
 
+_MD_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_MD_SETEXT_UNDERLINE_RE = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
+
+
 def _markdown_symbols(path: str, text: str) -> list[Symbol]:
     headings: list[tuple[int, int, str, str]] = []
     lines = text.splitlines()
     for index, line in enumerate(lines, start=1):
-        match = re.match(r"^[ \t]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", line)
+        match = _MD_ATX_HEADING_RE.match(line)
         if match:
             headings.append((index, len(match.group(1)), match.group(2).strip(), line.strip()))
             continue
-        if index > 1 and re.match(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$", line):
+        if index > 1 and _MD_SETEXT_UNDERLINE_RE.match(line):
             previous = lines[index - 2].strip()
             if previous:
                 headings.append((index - 1, 1 if "=" in line else 2, previous, previous))
@@ -478,17 +482,23 @@ def _markdown_symbols(path: str, text: str) -> list[Symbol]:
     return symbols
 
 
+_CFG_SECTION_RE = re.compile(r"^[ \t]*\[\[?\s*([^\]]+?)\s*\]\]?[ \t]*(?:[#;].*)?$")
+_CFG_KEY_RE = re.compile(
+    r'^[ \t]*(?:"(?P<quoted>[^"\n]+)"|(?P<plain>[A-Za-z_][\w.-]*))\s*[:=]'
+)
+_CARGO_SECTION_RE = re.compile(r"^\s*\[([^]]+)]")
+_CARGO_DEP_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*=")
+_GOMOD_REQUIRE_RE = re.compile(r"^\s*(?:require\s+)?([\w./-]+)\s+v\d")
+
+
 def _config_symbols(path: str, text: str) -> list[Symbol]:
     candidates: list[tuple[int, str, str]] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
-        section = re.match(r"^[ \t]*\[\[?\s*([^\]]+?)\s*\]\]?[ \t]*(?:[#;].*)?$", line)
+        section = _CFG_SECTION_RE.match(line)
         if section:
             candidates.append((line_number, section.group(1).strip(), "section"))
             continue
-        key = re.match(
-            r'^[ \t]*(?:"(?P<quoted>[^"\n]+)"|(?P<plain>[A-Za-z_][\w.-]*))\s*[:=]',
-            line,
-        )
+        key = _CFG_KEY_RE.match(line)
         if key:
             candidates.append((line_number, key.group("quoted") or key.group("plain"), "key"))
     line_count = len(text.splitlines())
@@ -542,18 +552,18 @@ def _config_dependencies(path: str, text: str) -> list[Dependency]:
     elif basename == "cargo.toml":
         in_dependencies = False
         for line_number, line in enumerate(text.splitlines(), start=1):
-            section = re.match(r"^\s*\[([^]]+)]", line)
+            section = _CARGO_SECTION_RE.match(line)
             if section:
                 name = section.group(1).strip()
                 in_dependencies = name == "dependencies" or name.endswith(".dependencies")
                 continue
             if in_dependencies:
-                match = re.match(r"^\s*([A-Za-z_][\w-]*)\s*=", line)
+                match = _CARGO_DEP_RE.match(line)
                 if match:
                     dependencies.append(Dependency(path, match.group(1), "package", line_number))
     elif basename == "go.mod":
         for line_number, line in enumerate(text.splitlines(), start=1):
-            match = re.match(r"^\s*(?:require\s+)?([\w./-]+)\s+v\d", line)
+            match = _GOMOD_REQUIRE_RE.match(line)
             if match:
                 dependencies.append(Dependency(path, match.group(1), "package", line_number))
     return dependencies
