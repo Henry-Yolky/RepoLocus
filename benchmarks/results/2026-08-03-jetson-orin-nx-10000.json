@@ -1,0 +1,33 @@
+{
+  "benchmark": "synthetic-python-scan-v1",
+  "benchmark_script_sha256": "854416369d199f9c04613e3f9e233cfe512d4388ed03c01d11789a0492e22a73",
+  "cold_seconds": 7.517489,
+  "date": "2026-08-03",
+  "devpilot_version": "0.1.0",
+  "files": 10000,
+  "hardware": {
+    "cpu_visible_to_process": 6,
+    "device": "NVIDIA Jetson Orin NX Engineering Reference Developer Kit",
+    "memory_gib": 7.4,
+    "storage": "not characterized"
+  },
+  "indexed_bytes_cold": 1277780,
+  "platform": "Linux 5.15.148-tegra aarch64",
+  "python": "3.10.12",
+  "single_change_seconds": 2.685213,
+  "single_change_update": {
+    "added": 0,
+    "changed": 1,
+    "chunks": 2,
+    "removed": 0,
+    "unchanged": 9999
+  },
+  "warm_seconds": 2.688924,
+  "warm_update": {
+    "added": 0,
+    "changed": 0,
+    "chunks": 0,
+    "removed": 0,
+    "unchanged": 10000
+  }
+}

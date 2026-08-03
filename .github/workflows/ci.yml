@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --all-extras --locked
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run pytest --cov=devpilot --cov-report=term-missing
+      - run: uv build
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras --locked
+      - run: uv run devpilot doctor --security --json
+      - name: Scan Python for medium/high-severity security issues
+        run: uvx bandit==1.9.4 -q -r src -ll
+      - name: Export runtime SBOM, including API dependencies
+        run: >-
+          uv export --frozen --no-dev --extra api --preview-features sbom-export
+          --format cyclonedx1.5 --output-file sbom.json
+      - name: Export auditable requirements
+        run: >-
+          uv export --frozen --no-dev --extra api --no-hashes
+          --output-file requirements-audit.txt
+      - name: Audit known dependency vulnerabilities
+        run: uvx pip-audit==2.10.1 -r requirements-audit.txt
+      - name: Record and check dependency licenses
+        run: |
+          uv run --with pip-licenses==5.5.5 pip-licenses \
+            --from=mixed --format=json --output-file=licenses.json
+          uv run python scripts/check_licenses.py licenses.json
+      - name: Upload supply-chain reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-reports
+          path: |
+            sbom.json
+            licenses.json
+            requirements-audit.txt
+          if-no-files-found: warn
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv build
+      - name: Install wheel in a clean environment
+        run: |
+          uv venv /tmp/devpilot-wheel-test
+          wheel="$(find dist -maxdepth 1 -name 'devpilot_codebase-*.whl' -print -quit)"
+          test -n "$wheel"
+          uv pip install --python /tmp/devpilot-wheel-test/bin/python "${wheel}[api]"
+          /tmp/devpilot-wheel-test/bin/devpilot --version
+      - name: Build container image
+        run: docker build --tag devpilot:ci .

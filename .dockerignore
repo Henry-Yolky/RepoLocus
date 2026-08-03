@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.ruff_cache
+.coverage
+dist
+build
+tests
+*.md
+!README.md
+!LICENSE

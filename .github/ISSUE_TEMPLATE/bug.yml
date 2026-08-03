@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible DevPilot failure.
+title: "[Bug]: "
+labels: ["type:bug", "status:needs-triage"]
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Include the exact command and sanitized output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: DevPilot version
+      placeholder: devpilot --version
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Python
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials and private source from this report.
+          required: true

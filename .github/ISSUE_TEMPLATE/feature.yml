@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a scoped improvement.
+title: "[Feature]: "
+labels: ["type:feature", "status:needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Recent problem
+      description: Describe the concrete repository-understanding task and current workaround.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Desired evidence-backed outcome
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and safety impact
+      description: Note any new file reads, writes, command execution, or network access.
+    validations:
+      required: true

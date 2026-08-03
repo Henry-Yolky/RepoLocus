@@ -1,0 +1,431 @@
+"""Configuration loading for DevPilot.
+
+Configuration is deliberately split from credentials.  Repository and user
+TOML files may contain behaviour settings, while provider secrets are read by
+the provider adapters directly from their documented environment variables.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import math
+import os
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+DEFAULT_MODEL = "local"
+MAX_CONFIG_BYTES = 1_000_000
+
+
+class ConfigError(ValueError):
+    """Raised when a configuration source is invalid or unsafe."""
+
+
+_DEFAULTS: dict[str, object] = {
+    "model": DEFAULT_MODEL,
+    "telemetry": False,
+    "ollama_base_url": "http://127.0.0.1:11434",
+    "openai_base_url": "https://api.openai.com/v1",
+    "anthropic_base_url": "https://api.anthropic.com",
+    "request_timeout": 30.0,
+    "max_output_tokens": 2048,
+    "max_file_bytes": 1_000_000,
+    "context_char_budget": 24_000,
+}
+
+_ALIASES = {
+    "telemetry_enabled": "telemetry",
+    "timeout": "request_timeout",
+}
+
+_ENV_KEYS = {
+    "DEVPILOT_MODEL": "model",
+    "DEVPILOT_TELEMETRY": "telemetry",
+    "DEVPILOT_OLLAMA_BASE_URL": "ollama_base_url",
+    "DEVPILOT_OPENAI_BASE_URL": "openai_base_url",
+    "DEVPILOT_ANTHROPIC_BASE_URL": "anthropic_base_url",
+    "DEVPILOT_REQUEST_TIMEOUT": "request_timeout",
+    "DEVPILOT_MAX_OUTPUT_TOKENS": "max_output_tokens",
+    "DEVPILOT_MAX_FILE_BYTES": "max_file_bytes",
+    "DEVPILOT_CONTEXT_CHAR_BUDGET": "context_char_budget",
+}
+
+_SECRET_KEY_RE = re.compile(
+    r"(?:^|_)(?:api_?key|access_?key|secret|token|password|passwd|credential)s?(?:$|_)",
+    re.IGNORECASE,
+)
+
+# Repository files are untrusted input. A committed config may only tighten
+# local resource limits; it cannot select a model, network destination,
+# telemetry policy, request timeout, or spending limit.
+_REPOSITORY_LIMIT_KEYS = frozenset({"max_file_bytes", "context_char_budget"})
+
+
+def _default_user_config_path() -> Path:
+    """Return the platform-specific config path without a mandatory import."""
+
+    try:
+        from platformdirs import user_config_dir
+
+        return Path(user_config_dir("devpilot", appauthor=False)) / "config.toml"
+    except ImportError:  # pragma: no cover - installed as a project dependency
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        return base / "devpilot" / "config.toml"
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    """Effective, non-secret DevPilot settings.
+
+    Precedence, from lowest to highest, is defaults, user config, repository
+    config, then environment variables.  Telemetry and cloud access are both
+    opt-in; the default provider is a deterministic local provider.
+    """
+
+    model: str = DEFAULT_MODEL
+    telemetry: bool = False
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    openai_base_url: str = "https://api.openai.com/v1"
+    anthropic_base_url: str = "https://api.anthropic.com"
+    request_timeout: float = 30.0
+    max_output_tokens: int = 2048
+    max_file_bytes: int = 1_000_000
+    context_char_budget: int = 24_000
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ConfigError("model must be a non-empty string")
+        if not isinstance(self.telemetry, bool):
+            raise ConfigError("telemetry must be true or false")
+        if self.telemetry:
+            raise ConfigError("telemetry is not implemented in v0.1 and must remain false")
+        for field_name in ("ollama_base_url", "openai_base_url", "anthropic_base_url"):
+            _validate_base_url(field_name, getattr(self, field_name))
+        if (
+            isinstance(self.request_timeout, bool)
+            or not isinstance(self.request_timeout, (int, float))
+            or not math.isfinite(self.request_timeout)
+            or self.request_timeout <= 0
+        ):
+            raise ConfigError("request_timeout must be greater than zero")
+        for field_name in ("max_output_tokens", "max_file_bytes", "context_char_budget"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"{field_name} must be a positive integer")
+
+    @property
+    def telemetry_enabled(self) -> bool:
+        """Compatibility alias with an explicit boolean name."""
+
+        return self.telemetry
+
+    @classmethod
+    def load(
+        cls,
+        root: Path | str | None = None,
+        *,
+        environ: Mapping[str, str] | None = None,
+        user_config_path: Path | str | None = None,
+        repo_config_path: Path | str | None = None,
+    ) -> Settings:
+        """Load settings without ever reading credentials from a TOML file."""
+
+        env = os.environ if environ is None else environ
+        values = dict(_DEFAULTS)
+
+        if user_config_path is None:
+            configured_path = env.get("DEVPILOT_CONFIG")
+            user_path = Path(configured_path) if configured_path else _default_user_config_path()
+        else:
+            user_path = Path(user_config_path)
+        if user_path.is_file():
+            values.update(_normalise_config(_read_config(user_path, source="user"), user_path))
+
+        if repo_config_path is not None:
+            repo_paths = [Path(repo_config_path)]
+        elif root is not None:
+            repo_root = Path(root).expanduser().resolve()
+            repo_paths = [
+                repo_root / "pyproject.toml",
+                repo_root / ".devpilot" / "config.toml",
+                repo_root / ".devpilot.toml",
+            ]
+        else:
+            repo_paths = []
+
+        for path in repo_paths:
+            if not path.is_file():
+                continue
+            if root is not None:
+                _ensure_repo_config_path(Path(root), path)
+            if path.name == "pyproject.toml" and not _pyproject_declares_devpilot(path):
+                continue
+            table = _read_config(path, source="repository")
+            # A pyproject is relevant only when it contains [tool.devpilot].
+            if path.name == "pyproject.toml" and not _has_devpilot_table(table):
+                continue
+            repository_values = _normalise_config(
+                table,
+                path,
+                allowed_keys=_REPOSITORY_LIMIT_KEYS,
+            )
+            for key, value in repository_values.items():
+                values[key] = min(int(values[key]), int(value))
+
+        for env_name, setting_name in _ENV_KEYS.items():
+            if env_name in env:
+                values[setting_name] = _coerce_value(setting_name, env[env_name], env_name)
+
+        return cls(**values)
+
+
+def load_settings(
+    root: Path | str | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    user_config_path: Path | str | None = None,
+    repo_config_path: Path | str | None = None,
+) -> Settings:
+    """Functional wrapper around :meth:`Settings.load`."""
+
+    return Settings.load(
+        root,
+        environ=environ,
+        user_config_path=user_config_path,
+        repo_config_path=repo_config_path,
+    )
+
+
+def _validate_base_url(name: str, value: object) -> None:
+    if not isinstance(value, str):
+        raise ConfigError(f"{name} must be a URL string")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ConfigError(f"{name} must not contain control characters")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ConfigError(f"{name} must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigError(f"{name} must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ConfigError(f"{name} must not contain a query or fragment")
+
+
+def _ensure_repo_config_path(root: Path, config_path: Path) -> None:
+    root_real = root.expanduser().resolve(strict=True)
+    config_real = config_path.expanduser().resolve(strict=True)
+    try:
+        config_real.relative_to(root_real)
+    except ValueError as exc:
+        raise ConfigError(f"repository config escapes repository root: {config_path}") from exc
+
+
+def _has_devpilot_table(data: Mapping[str, Any]) -> bool:
+    tool = data.get("tool")
+    return isinstance(tool, Mapping) and isinstance(tool.get("devpilot"), Mapping)
+
+
+def _pyproject_declares_devpilot(path: Path) -> bool:
+    try:
+        text = _read_config_bytes(path, source="repository").decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"cannot inspect repository config {path}: {exc}") from exc
+    return bool(re.search(r"(?m)^\s*\[tool\.devpilot\]\s*(?:#.*)?$", text))
+
+
+def _extract_table(data: Mapping[str, Any]) -> Mapping[str, Any]:
+    tool = data.get("tool")
+    if isinstance(tool, Mapping) and isinstance(tool.get("devpilot"), Mapping):
+        return tool["devpilot"]
+    devpilot = data.get("devpilot")
+    if isinstance(devpilot, Mapping):
+        return devpilot
+    return data
+
+
+def _normalise_config(
+    data: Mapping[str, Any],
+    path: Path,
+    *,
+    allowed_keys: frozenset[str] | None = None,
+) -> dict[str, object]:
+    table = _extract_table(data)
+    result: dict[str, object] = {}
+    for raw_key, value in table.items():
+        key = str(raw_key).strip().lower().replace("-", "_")
+        if _SECRET_KEY_RE.search(key):
+            raise ConfigError(
+                f"credentials are not allowed in {path}; use provider environment variables"
+            )
+        key = _ALIASES.get(key, key)
+        if key not in _DEFAULTS:
+            raise ConfigError(f"unknown DevPilot setting {raw_key!r} in {path}")
+        if allowed_keys is not None and key not in allowed_keys:
+            allowed = ", ".join(sorted(allowed_keys))
+            raise ConfigError(
+                f"repository config cannot set {raw_key!r}; only local limits are allowed "
+                f"({allowed}). Put model and network settings in the user config or environment."
+            )
+        result[key] = _coerce_value(key, value, str(path))
+    return result
+
+
+def _coerce_value(key: str, value: object, source: str) -> object:
+    if key == "telemetry":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        raise ConfigError(f"{source}: telemetry must be true or false")
+    if key == "request_timeout":
+        try:
+            parsed = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{source}: request_timeout must be a number") from exc
+        return parsed
+    if key in {"max_output_tokens", "max_file_bytes", "context_char_budget"}:
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ConfigError(f"{source}: {key} must be an integer")
+        try:
+            parsed_int = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{source}: {key} must be an integer") from exc
+        return parsed_int
+    if not isinstance(value, str):
+        raise ConfigError(f"{source}: {key} must be a string")
+    return value.strip()
+
+
+def _read_config(path: Path, *, source: str) -> Mapping[str, Any]:
+    raw = _read_config_bytes(path, source=source)
+    try:
+        try:
+            import tomllib  # type: ignore[import-not-found]
+
+            parsed = tomllib.loads(raw.decode("utf-8"))
+        except ModuleNotFoundError:
+            text = raw.decode("utf-8")
+            if path.name == "pyproject.toml":
+                text = _devpilot_pyproject_subset(text)
+            parsed = _parse_toml_subset(text)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ConfigError(f"invalid TOML in {source} config {path}: {exc}") from exc
+    if not isinstance(parsed, Mapping):
+        raise ConfigError(f"invalid TOML table in {source} config {path}")
+    return parsed
+
+
+def _read_config_bytes(path: Path, *, source: str) -> bytes:
+    try:
+        if path.stat().st_size > MAX_CONFIG_BYTES:
+            raise ConfigError(f"{source} config exceeds the {MAX_CONFIG_BYTES}-byte limit: {path}")
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"cannot read {source} config {path}: {exc}") from exc
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError(f"{source} config exceeds the {MAX_CONFIG_BYTES}-byte limit: {path}")
+    return raw
+
+
+def _parse_toml_subset(text: str) -> dict[str, Any]:
+    """Parse the scalar TOML subset used by DevPilot on Python 3.10.
+
+    Python 3.11 and newer use the standard-library parser.  Keeping this tiny
+    fallback avoids making Python 3.10 silently unsupported solely for config.
+    """
+
+    result: dict[str, Any] = {}
+    current = result
+    for line_number, original in enumerate(text.splitlines(), start=1):
+        line = _strip_toml_comment(original).strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            if not section or section.startswith("["):
+                raise ValueError(f"unsupported table declaration on line {line_number}")
+            current = result
+            for part in section.split("."):
+                key = part.strip().strip("\"'")
+                if not key:
+                    raise ValueError(f"empty table name on line {line_number}")
+                child = current.setdefault(key, {})
+                if not isinstance(child, dict):
+                    raise ValueError(f"table conflicts with value on line {line_number}")
+                current = child
+            continue
+        if "=" not in line:
+            raise ValueError(f"expected key = value on line {line_number}")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip().strip("\"'")
+        if not key:
+            raise ValueError(f"empty key on line {line_number}")
+        current[key] = _parse_toml_scalar(raw_value.strip(), line_number)
+    return result
+
+
+def _devpilot_pyproject_subset(text: str) -> str:
+    """Extract [tool.devpilot] so the Python 3.10 parser skips unrelated TOML."""
+
+    selected: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == "[tool.devpilot]"
+        if in_section:
+            selected.append(line)
+    return "\n".join(selected)
+
+
+def _strip_toml_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote == '"':
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+        elif char == "#" and quote is None:
+            return line[:index]
+    return line
+
+
+def _parse_toml_scalar(value: str, line_number: int) -> object:
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if value.startswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid string on line {line_number}") from exc
+    if value.startswith("'"):
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(f"invalid string on line {line_number}") from exc
+    try:
+        return int(value.replace("_", ""))
+    except ValueError:
+        try:
+            return float(value.replace("_", ""))
+        except ValueError as exc:
+            raise ValueError(f"unsupported value on line {line_number}") from exc
