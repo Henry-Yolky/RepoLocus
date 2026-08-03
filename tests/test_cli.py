@@ -5,7 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from repolocus.cli import app
+from repolocus.cli import _index_cache_permission_status, app
 from repolocus.config import Settings
 from repolocus.core import RepoLocusService
 from repolocus.security import PrivacyStore
@@ -135,6 +135,48 @@ def test_doctor_does_not_probe_non_loopback_ollama(
     ollama = next(check for check in data["checks"] if check["name"] == "ollama")
     assert ollama["required"] is False
     assert "not loopback" in ollama["detail"]
+
+
+def test_windows_cache_acl_status_is_unknown(tmp_path: Path) -> None:
+    ok, detail, required = _index_cache_permission_status(tmp_path, "nt")
+
+    assert ok is False
+    assert detail == "unknown: Windows ACLs were not inspected"
+    assert required is False
+
+
+def test_doctor_reports_unverified_cache_permissions_as_warning(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "repolocus.cli._index_cache_permission_status",
+        lambda _path, _platform_name: (
+            False,
+            "unknown: Windows ACLs were not inspected",
+            False,
+        ),
+    )
+
+    result = runner.invoke(app, ["doctor", str(sample_repo), "--security", "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    permissions = next(
+        check for check in data["checks"] if check["name"] == "index_cache_permissions"
+    )
+    assert permissions == {
+        "name": "index_cache_permissions",
+        "ok": False,
+        "detail": "unknown: Windows ACLs were not inspected",
+        "required": False,
+    }
+
+    table_result = runner.invoke(app, ["doctor", str(sample_repo), "--security"])
+    assert table_result.exit_code == 0, table_result.output
+    assert "WARN" in table_result.output
+    assert "Windows ACLs were not inspected" in table_result.output
 
 
 def test_generated_output_refuses_escape_and_unrecognized_overwrite(

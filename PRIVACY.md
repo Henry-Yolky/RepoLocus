@@ -16,13 +16,15 @@ directory. `repolocus privacy status` displays them and `repolocus privacy revok
 ## Network access
 
 `local` mode has no network access. Ollama defaults to `http://127.0.0.1:11434`; only a loopback
-Ollama URL is treated as local. A non-loopback Ollama endpoint and every cloud provider are
-disabled until the user either passes `--allow-cloud` for one call or records a
-repository/provider grant. Before every approved remote CLI call, RepoLocus displays the exact
-redacted source content and ranges, fragment count, estimated tokens, and redaction count that
-will be sent, including calls covered by a remembered grant. The self-hosted API has no
-interactive confirmation UI; cloud access is operator-disabled by default and should remain so
-unless a trusted front end provides an equivalent review step.
+Ollama URL is treated as local. Plain HTTP is accepted only for loopback endpoints; every
+non-loopback Ollama, OpenAI-compatible, or Anthropic endpoint must use HTTPS. A non-loopback
+Ollama endpoint and every cloud provider are disabled until the user either passes
+`--allow-cloud` for one call or records a repository/provider grant. Before every approved
+remote CLI call, RepoLocus displays the exact redacted source content and ranges, fragment count,
+estimated tokens, and redaction count that will be sent, including calls covered by a remembered
+grant. System and user prompts are redacted again immediately before transport. The self-hosted
+API has no interactive confirmation UI; cloud access is operator-disabled by default and should
+remain so unless a trusted front end provides an equivalent review step.
 
 Only retrieved fragments needed for the question are sent. API credentials are read from
 environment variables and are never written to repository or consent configuration.

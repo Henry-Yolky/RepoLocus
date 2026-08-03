@@ -168,6 +168,48 @@ def test_base_url_cannot_embed_credentials() -> None:
         Settings(openai_base_url="https://example.invalid/\nredirect")
 
 
+@pytest.mark.parametrize(
+    "environment_name",
+    [
+        "REPOLOCUS_OLLAMA_BASE_URL",
+        "REPOLOCUS_OPENAI_BASE_URL",
+        "REPOLOCUS_ANTHROPIC_BASE_URL",
+    ],
+)
+def test_non_loopback_plain_http_base_urls_are_rejected_during_load(
+    tmp_path: Path,
+    environment_name: str,
+) -> None:
+    with pytest.raises(
+        ConfigError,
+        match="must use HTTPS unless it targets a loopback address",
+    ):
+        Settings.load(
+            environ={environment_name: "http://provider.example.invalid"},
+            user_config_path=tmp_path / "missing.toml",
+        )
+
+
+def test_loopback_http_and_https_base_urls_are_allowed() -> None:
+    loopback = Settings(
+        ollama_base_url="http://localhost:11434",
+        openai_base_url="http://127.0.0.1:8080/v1",
+        anthropic_base_url="http://[::1]:8081",
+    )
+    secure_remote = Settings(
+        ollama_base_url="https://ollama.example.invalid",
+        openai_base_url="https://openai.example.invalid/v1",
+        anthropic_base_url="https://anthropic.example.invalid",
+    )
+
+    assert loopback.ollama_base_url.startswith("http://")
+    assert loopback.openai_base_url.startswith("http://")
+    assert loopback.anthropic_base_url.startswith("http://")
+    assert secure_remote.ollama_base_url.startswith("https://")
+    assert secure_remote.openai_base_url.startswith("https://")
+    assert secure_remote.anthropic_base_url.startswith("https://")
+
+
 def test_oversized_repository_config_is_rejected(tmp_path: Path) -> None:
     config = tmp_path / ".repolocus.toml"
     config.write_text("#" + "x" * 1_000_000, encoding="utf-8")

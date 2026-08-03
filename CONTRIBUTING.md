@@ -21,3 +21,18 @@ line ranges. Security fixes should include a regression test without publishing 
 
 Use conventional commit-style subjects where practical (`feat:`, `fix:`, `docs:`, `test:`).
 Maintainers squash only when it preserves contributor attribution and DCO sign-offs.
+
+## Releasing
+
+Before the first release, configure a protected GitHub environment named `pypi` and register
+the PyPI Trusted Publisher (or pending publisher) with these exact claims:
+
+- owner: `Henry-Yolky`;
+- repository: `RepoLocus`;
+- workflow: `release.yml`;
+- environment: `pypi`.
+
+Require a maintainer approval on the `pypi` environment. Do not add a long-lived PyPI token to
+GitHub secrets. The release workflow accepts version tags such as `v0.1.0` only when the tag
+matches `pyproject.toml` and its commit belongs to `main`; it then tests, builds, publishes with
+OIDC, and creates the GitHub Release with checksums, an SBOM, and the standalone Codex Skill.

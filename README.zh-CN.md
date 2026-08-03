@@ -11,8 +11,22 @@ Mermaid 图，并为代码问题检索可核验的源码证据。
 
 ## 快速开始
 
+RepoLocus 需要 Python 3.10 或更高版本。对于已经发布到 PyPI 的 tag 版本：
+
 ```bash
 pipx install repolocus
+```
+
+如果所需版本尚未发布到 PyPI，请从源码检出安装：
+
+```bash
+git clone https://github.com/Henry-Yolky/RepoLocus.git
+pipx install ./RepoLocus
+```
+
+然后进入需要分析的仓库：
+
+```bash
 cd 你的仓库
 repolocus scan
 repolocus map
@@ -27,7 +41,8 @@ repolocus ask "请求如何进入核心循环？" --model ollama/qwen3-coder
 ```
 
 只有回环地址上的 Ollama 被视为本地服务；如果把 Ollama 地址配置到其他主机，RepoLocus
-会将它按远程供应商处理并要求授权。
+会将它按远程供应商处理并要求授权。明文 HTTP 仅允许用于回环地址，所有非回环供应商
+端点都必须使用 HTTPS；提示词会在发送前再次脱敏。
 
 云模型调用前，RepoLocus 会展示将发送的源码片段、文件列表和估算 Token 数。可用
 `--allow-cloud` 仅授权本次调用，或同时使用 `--remember-consent` 为当前仓库记住该供应商。
@@ -46,18 +61,44 @@ repolocus ask "请求如何进入核心循环？" --model ollama/qwen3-coder
 
 ## Agent Skill
 
-仓库内置 [`skills/repolocus-analyze-repo`](skills/repolocus-analyze-repo)，可供 Codex 等具备
-Shell 能力的 Agent 调用。它提供 `doctor`、`scan`、`ask`、`map` 和 `diagram`，强制使用
-本地提取式回答，并让项目地图和架构图输出到 stdout，避免自动写入目标仓库。
+仓库内置
+[`skills/repolocus-analyze-repo`](https://github.com/Henry-Yolky/RepoLocus/tree/main/skills/repolocus-analyze-repo)，
+可供 Codex 等具备 Shell 能力的 Agent 调用。它提供 `doctor`、`scan`、`ask`、`map` 和
+`diagram`，强制使用本地提取式回答，并让项目地图和架构图输出到 stdout，避免自动写入
+目标仓库。
+
+GitHub Release 会单独提供 `repolocus-analyze-repo-VERSION.zip`。请将其解压为
+`$CODEX_HOME/skills/repolocus-analyze-repo`；未设置 `CODEX_HOME` 时默认使用
+`~/.codex`。也可以从源码检出安装：
 
 ```bash
 pipx install .
-mkdir -p ~/.codex/skills
-cp -R skills/repolocus-analyze-repo ~/.codex/skills/
+export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+mkdir -p "$CODEX_HOME/skills"
+cp -R skills/repolocus-analyze-repo "$CODEX_HOME/skills/"
 ```
 
-安装后以 `$repolocus-analyze-repo` 调用。该 Skill 不暴露云端授权参数，Agent 不能通过
-这条路径静默把仓库内容发送给远程模型。
+PowerShell 等价命令：
+
+```powershell
+pipx install .
+if (-not $env:CODEX_HOME) { $env:CODEX_HOME = Join-Path $HOME ".codex" }
+New-Item -ItemType Directory -Force (Join-Path $env:CODEX_HOME "skills") | Out-Null
+Copy-Item -Recurse -Force "skills/repolocus-analyze-repo" (Join-Path $env:CODEX_HOME "skills")
+```
+
+复制后请重启 Codex；如果宿主提供 Skill 注册表重载操作，也可以执行重载。之后以
+`$repolocus-analyze-repo` 调用。该 Skill 不暴露云端授权参数，Agent 不能通过这条路径
+静默把仓库内容发送给远程模型。
+
+## 自托管 API
+
+安装 API 可选依赖，并把服务限制在一个允许的仓库目录树中：
+
+```bash
+pipx install 'repolocus[api]'
+repolocus serve --root /path/to/allowed/repositories
+```
 
 API 默认只监听回环地址、只允许访问 `--root` 指定目录之下的仓库，并禁用云模型。
 对外监听必须显式使用 `--allow-remote`，且应放在具备认证和授权的网关之后；服务端若要
@@ -70,5 +111,11 @@ README、注释和测试数据都按不可信输入处理。当前 Python 使用
 JavaScript、Go、Rust、Java、C/C++ 使用保守的启发式解析器；动态调用、反射、依赖注入
 和生成代码可能无法被静态分析还原。
 
-完整命令、架构、测试与开发说明以英文 [README.md](README.md) 为准。隐私与安全细节见
-[PRIVACY.md](PRIVACY.md) 和 [SECURITY.md](SECURITY.md)，路线图见 [ROADMAP.md](ROADMAP.md)。
+索引和授权记录均保存在仓库之外。POSIX 平台会收紧文件权限；Windows 上尚未实现原生
+ACL 检查，因此 `doctor --security` 会明确将 ACL 状态报告为“未验证”，不会声称检查成功。
+
+完整命令、架构、测试与开发说明以英文
+[README.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/README.md) 为准。隐私与安全
+细节见 [PRIVACY.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/PRIVACY.md) 和
+[SECURITY.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/SECURITY.md)，路线图见
+[ROADMAP.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/ROADMAP.md)。

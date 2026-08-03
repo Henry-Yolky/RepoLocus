@@ -48,7 +48,10 @@ jobs:
       - run: uv sync --all-extras --locked
       - run: uv run repolocus doctor --security --json
       - name: Scan Python for medium/high-severity security issues
-        run: uvx bandit==1.9.4 -q -r src -ll
+        run: >-
+          uvx bandit==1.9.4 -q -ll -r
+          src
+          skills/repolocus-analyze-repo/scripts
       - name: Export runtime SBOM, including API dependencies
         run: >-
           uv export --frozen --no-dev --extra api --preview-features sbom-export

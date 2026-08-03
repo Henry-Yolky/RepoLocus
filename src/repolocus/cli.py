@@ -107,6 +107,21 @@ def _service(root: Path) -> RepoLocusService:
     return RepoLocusService(_settings(root))
 
 
+def _index_cache_permission_status(path: Path, platform_name: str) -> tuple[bool, str, bool]:
+    """Return ``ok``, detail, and whether cache permissions can be verified.
+
+    POSIX mode bits provide a direct, dependency-free check.  Python's standard
+    library does not expose an equivalent Windows ACL inspection API, so that
+    platform must remain an explicit, non-required unknown instead of being
+    reported as secure without evidence.
+    """
+
+    if platform_name == "nt":
+        return False, "unknown: Windows ACLs were not inspected", False
+    mode = path.stat().st_mode & 0o777
+    return mode & 0o077 == 0, oct(mode), True
+
+
 def _fail(exc: Exception, code: int = 1) -> None:
     error_console.print(
         "Error: " + escape_untrusted_display(str(exc)),
@@ -590,18 +605,18 @@ def doctor(
     index_cache = cache_root()
     index_cache_private = False
     index_cache_mode = "unavailable"
+    index_cache_permissions_required = True
     try:
         index_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name != "nt":
             index_cache.chmod(0o700)
         with tempfile.NamedTemporaryFile(dir=index_cache):
             pass
-        if os.name == "nt":
-            index_cache_private = True
-            index_cache_mode = "platform ACLs"
-        else:
-            index_cache_mode = oct(index_cache.stat().st_mode & 0o777)
-            index_cache_private = index_cache.stat().st_mode & 0o077 == 0
+        (
+            index_cache_private,
+            index_cache_mode,
+            index_cache_permissions_required,
+        ) = _index_cache_permission_status(index_cache, os.name)
         record("index_cache_write", True, str(index_cache))
     except OSError as exc:
         record("index_cache_write", False, str(exc))
@@ -621,6 +636,7 @@ def doctor(
             "index_cache_permissions",
             index_cache_private,
             index_cache_mode,
+            required=index_cache_permissions_required,
         )
         record("repository_execution", True, "scanner has no command-execution interface")
 

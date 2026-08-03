@@ -158,6 +158,60 @@ def test_remote_ollama_endpoint_is_not_classified_as_local() -> None:
     assert provider.is_local is False
 
 
+@pytest.mark.parametrize("family", ["ollama", "openai", "anthropic"])
+def test_remote_plain_http_provider_urls_are_rejected(family: str) -> None:
+    with pytest.raises(
+        ProviderConfigurationError,
+        match="must use HTTPS unless it targets a loopback address",
+    ):
+        _provider_for_url(family, "http://provider.example.invalid")
+
+
+@pytest.mark.parametrize("family", ["ollama", "openai", "anthropic"])
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://127.0.0.1:11434", "https://provider.example.invalid"],
+    ids=["loopback-http", "https"],
+)
+def test_loopback_http_and_https_provider_urls_are_allowed(
+    family: str,
+    base_url: str,
+) -> None:
+    provider = _provider_for_url(family, base_url)
+
+    assert provider.base_url == base_url
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://localhost:11434", "https://ollama.example.invalid"],
+    ids=["loopback", "remote"],
+)
+def test_ollama_redacts_prompts_before_sending(base_url: str) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"message": {"content": "Safe answer."}})
+
+    provider = OllamaProvider(
+        "model",
+        base_url=base_url,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert (
+        provider.generate('password = "system-secret"', 'api_key = "user-secret"') == "Safe answer."
+    )
+    payload = json.loads(captured[0].content)
+    assert payload["messages"] == [
+        {"role": "system", "content": 'password = "[REDACTED]"'},
+        {"role": "user", "content": 'api_key = "[REDACTED]"'},
+    ]
+    assert "system-secret" not in captured[0].content.decode()
+    assert "user-secret" not in captured[0].content.decode()
+
+
 def test_http_failure_is_clear_and_never_retried() -> None:
     requests = 0
 
@@ -182,3 +236,27 @@ def test_malformed_provider_response_has_clear_error() -> None:
 
     with pytest.raises(ProviderResponseError, match="missing message"):
         provider.generate("System", "Question")
+
+
+def _provider_for_url(
+    family: str,
+    base_url: str,
+) -> OllamaProvider | OpenAICompatibleProvider | AnthropicProvider:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, json={}))
+    if family == "ollama":
+        return OllamaProvider("model", base_url=base_url, transport=transport)
+    if family == "openai":
+        return OpenAICompatibleProvider(
+            "model",
+            base_url=base_url,
+            environ={"OPENAI_API_KEY": "test-key"},
+            transport=transport,
+        )
+    if family == "anthropic":
+        return AnthropicProvider(
+            "model",
+            base_url=base_url,
+            environ={"ANTHROPIC_API_KEY": "test-key"},
+            transport=transport,
+        )
+    raise AssertionError(f"unexpected provider family: {family}")
