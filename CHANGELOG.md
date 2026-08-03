@@ -16,6 +16,8 @@ Semantic Versioning while the project is in alpha.
 - Ollama, OpenAI-compatible, and Anthropic providers with redacted previews and explicit consent.
 - Root-confined FastAPI service, multi-stage Docker image, cross-platform CI, SBOM, vulnerability
   and license checks.
+- Local-only Codex Skill with guarded `doctor`, `scan`, `ask`, `map`, and `diagram` adapters.
+- Tag-gated release automation for PyPI Trusted Publishing and verifiable GitHub Release assets.
 - Reproducible retrieval evaluation and 1k/10k/100k synthetic scan benchmark harness.
 
 ### Security
@@ -23,8 +25,12 @@ Semantic Versioning while the project is in alpha.
 - Repository configuration cannot choose models, network endpoints, telemetry, or credentials.
 - Cloud preview and upload use one immutable evidence bundle.
 - Non-loopback Ollama endpoints require consent; API cloud use requires an operator flag.
-- Cache files use private permissions, untrusted display controls are escaped, and model output
-  with unsafe controls or unsupported links is withheld.
+- Remote provider endpoints require HTTPS, prompts are redacted immediately before transport,
+  and plain HTTP remains available only for loopback services.
+- The Codex Skill isolates runtime discovery and execution from the untrusted target repository.
+- POSIX cache files use private permissions; Windows ACL status is reported as unverified until
+  native inspection is available. Untrusted display controls are escaped, and model output with
+  unsafe controls or unsupported links is withheld.
 
 ### Known limitations
 

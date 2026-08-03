@@ -111,8 +111,8 @@ class OllamaProvider(_HTTPProvider):
             payload={
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "system", "content": redact_text(system_prompt)},
+                    {"role": "user", "content": redact_text(user_prompt)},
                 ],
                 "stream": False,
             },
@@ -263,7 +263,12 @@ def _normalise_base_url(value: str) -> str:
         raise ProviderConfigurationError("provider base URL must not contain credentials")
     if parsed.query or parsed.fragment:
         raise ProviderConfigurationError("provider base URL must not contain a query or fragment")
-    return value.rstrip("/")
+    normalised = value.rstrip("/")
+    if parsed.scheme == "http" and not is_loopback_url(normalised):
+        raise ProviderConfigurationError(
+            "provider base URL must use HTTPS unless it targets a loopback address"
+        )
+    return normalised
 
 
 def _append_endpoint(base_url: str, endpoint: str, *, accepted_suffix: str) -> str:

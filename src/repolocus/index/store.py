@@ -313,7 +313,7 @@ class RepositoryIndex:
 
     @staticmethod
     def _harden_path(path: Path, mode: int) -> None:
-        """Restrict plaintext index access on POSIX; Windows uses ACLs instead."""
+        """Restrict plaintext index access where POSIX mode bits are available."""
 
         if os.name == "nt":
             return

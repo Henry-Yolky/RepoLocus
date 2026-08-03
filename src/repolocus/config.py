@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from repolocus.security.network import is_loopback_url
+
 DEFAULT_MODEL = "local"
 MAX_CONFIG_BYTES = 1_000_000
 
@@ -213,6 +215,8 @@ def _validate_base_url(name: str, value: object) -> None:
         raise ConfigError(f"{name} must not contain credentials")
     if parsed.query or parsed.fragment:
         raise ConfigError(f"{name} must not contain a query or fragment")
+    if parsed.scheme == "http" and not is_loopback_url(value):
+        raise ConfigError(f"{name} must use HTTPS unless it targets a loopback address")
 
 
 def _ensure_repo_config_path(root: Path, config_path: Path) -> None:

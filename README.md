@@ -17,8 +17,22 @@ answer on top of the same evidence.
 
 RepoLocus requires Python 3.10 or newer.
 
+For a tagged version that is available on PyPI:
+
 ```bash
 pipx install repolocus
+```
+
+If that version has not been published to PyPI yet, install from a source checkout instead:
+
+```bash
+git clone https://github.com/Henry-Yolky/RepoLocus.git
+pipx install ./RepoLocus
+```
+
+Then run RepoLocus inside the repository you want to inspect:
+
+```bash
 cd your-repository
 repolocus scan
 repolocus map
@@ -90,20 +104,37 @@ ends it. Follow-up context is never written to the repository or consent state.
 ## Agent Skill
 
 The repository ships a local-only Codex Skill at
-[`skills/repolocus-analyze-repo`](skills/repolocus-analyze-repo). Its adapter exposes `doctor`,
+[`skills/repolocus-analyze-repo`](https://github.com/Henry-Yolky/RepoLocus/tree/main/skills/repolocus-analyze-repo).
+Its adapter exposes `doctor`,
 `scan`, `ask`, `map`, and `diagram` while forcing extractive local answers and sending generated
 documents to stdout instead of writing them into the target repository.
 
-From a source checkout, install RepoLocus and copy the Skill into Codex's skill directory:
+GitHub Releases provide the Skill separately as `repolocus-analyze-repo-VERSION.zip`. Extract that
+archive as `$CODEX_HOME/skills/repolocus-analyze-repo`, where `CODEX_HOME` defaults to
+`~/.codex`. From a source checkout, install RepoLocus and copy the Skill with:
 
 ```bash
 pipx install .
-mkdir -p ~/.codex/skills
-cp -R skills/repolocus-analyze-repo ~/.codex/skills/
+export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+mkdir -p "$CODEX_HOME/skills"
+cp -R skills/repolocus-analyze-repo "$CODEX_HOME/skills/"
 ```
 
-Then invoke it as `$repolocus-analyze-repo`. The Skill intentionally exposes no cloud-consent
-flags; an agent cannot silently send repository content to a remote provider through this path.
+PowerShell equivalent:
+
+```powershell
+pipx install .
+if (-not $env:CODEX_HOME) { $env:CODEX_HOME = Join-Path $HOME ".codex" }
+New-Item -ItemType Directory -Force (Join-Path $env:CODEX_HOME "skills") | Out-Null
+Copy-Item -Recurse -Force "skills/repolocus-analyze-repo" (Join-Path $env:CODEX_HOME "skills")
+```
+
+Restart Codex after copying the directory, or reload its Skill registry when the host provides
+that action. Then invoke the Skill as `$repolocus-analyze-repo`. It intentionally exposes no
+cloud-consent flags; an agent cannot silently send repository content to a remote provider
+through this path.
+
+## Self-hosted API
 
 Install the API extra with `pipx install 'repolocus[api]'`, then constrain the server to
 one repository tree:
@@ -136,15 +167,21 @@ The source mount is read-only and API cloud access remains disabled in this exam
   names, and likely credential-bearing files are excluded.
 - Canonical path checks prevent reads outside the requested repository root.
 - Indexes live in the operating-system user cache and consent records in the user state
-  directory, outside the scanned repository. Both are permission-hardened; telemetry is absent.
+  directory, outside the scanned repository. POSIX permissions are hardened. On Windows,
+  `doctor --security` reports ACL verification as unavailable until native ACL inspection is
+  implemented, instead of claiming an unverified success. Telemetry is absent.
 - Loopback Ollama is local by default. A non-loopback Ollama endpoint is treated like a cloud
   provider and requires per-call or remembered per-repository consent. Selected, redacted source
   fragments are shown by the CLI before every approved remote send.
+- Plain HTTP provider endpoints are limited to loopback addresses. Every non-loopback endpoint
+  requires HTTPS, and provider prompts are redacted again immediately before transport.
 - `map` and `diagram` are the only normal commands that write in the repository, and only to
   the output path requested by the user.
 
-See [PRIVACY.md](PRIVACY.md), [SECURITY.md](SECURITY.md), and
-[docs/architecture.md](docs/architecture.md) for the detailed model.
+See [PRIVACY.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/PRIVACY.md),
+[SECURITY.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/SECURITY.md), and
+[docs/architecture.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/docs/architecture.md)
+for the detailed model.
 
 ## Supported languages
 
@@ -165,7 +202,8 @@ roadmap.
 
 Provider strings use `family/model`, for example `ollama/qwen3-coder`,
 `openai/gpt-4.1-mini`, or `anthropic/claude-sonnet-4-5`. OpenAI-compatible gateways can be set
-with `REPOLOCUS_OPENAI_BASE_URL`. See [MODEL_SUPPORT.md](MODEL_SUPPORT.md).
+with `REPOLOCUS_OPENAI_BASE_URL`. See
+[MODEL_SUPPORT.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/MODEL_SUPPORT.md).
 
 ## Why this is not another coding agent
 
@@ -184,8 +222,12 @@ uv run python scripts/evaluate_retrieval.py evaluation/questions.json .
 uv build
 ```
 
-Architecture decisions live in [`docs/adr/`](docs/adr/). Contributions are welcome; start with
-[CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md), and the issue templates.
+Architecture decisions live in
+[`docs/adr/`](https://github.com/Henry-Yolky/RepoLocus/tree/main/docs/adr). Contributions are
+welcome; start with
+[CONTRIBUTING.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/CONTRIBUTING.md),
+[CHANGELOG.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/CHANGELOG.md), and the
+[issue templates](https://github.com/Henry-Yolky/RepoLocus/issues/new/choose).
 
 ## Roadmap and limits
 
@@ -193,14 +235,18 @@ The repository includes a reproducible synthetic scan harness under `benchmarks/
 source-citation regression set under `evaluation/`; neither substitutes for the planned
 multi-repository, 100-question release evaluation. The next milestones are Tree-sitter adapters,
 stronger graph resolution, a public-repository-only Web Demo, and an opt-in GitHub Action. The project will not
-claim a complete dynamic call graph from static source. See [ROADMAP.md](ROADMAP.md) for scope.
+claim a complete dynamic call graph from static source. See
+[ROADMAP.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/ROADMAP.md) for scope.
 
 On the recorded Jetson Orin NX synthetic fixture, 10,000 small Python files scanned in 7.54 s
 cold, 2.70 s warm, and 2.69 s after one file changed. These are scanner/index timings, not model
 latency, and are not a claim about arbitrary repositories. The exact fixture procedure and
-machine metadata are in [benchmarks/](benchmarks/README.md).
+machine metadata are in
+[benchmarks/](https://github.com/Henry-Yolky/RepoLocus/blob/main/benchmarks/README.md).
 
-RepoLocus is licensed under Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+RepoLocus is licensed under Apache-2.0. See
+[LICENSE](https://github.com/Henry-Yolky/RepoLocus/blob/main/LICENSE) and
+[NOTICE](https://github.com/Henry-Yolky/RepoLocus/blob/main/NOTICE).
 
 The installable distribution and command are both named `repolocus`; the product name is
 RepoLocus.

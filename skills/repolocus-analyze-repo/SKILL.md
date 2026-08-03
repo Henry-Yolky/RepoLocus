@@ -12,10 +12,11 @@ returned on stdout instead of written into the target repository.
 ## Prerequisites
 
 - Require a local repository path that the user placed in scope.
-- Run the adapter with Python 3.10 or newer:
+- Use Python 3.10 or newer whose resolved executable is outside the target repository. Never use
+  the target repository's `.venv`; the adapter rejects it. Run the adapter in isolated mode:
 
   ```bash
-  python <skill-dir>/scripts/run_repolocus.py --help
+  python -I <skill-dir>/scripts/run_repolocus.py --help
   ```
 
 - If the adapter cannot find RepoLocus, install the `repolocus` distribution or run the Skill
@@ -26,13 +27,13 @@ returned on stdout instead of written into the target repository.
 1. Run the security and runtime preflight:
 
    ```bash
-   python <skill-dir>/scripts/run_repolocus.py doctor <repository>
+   python -I <skill-dir>/scripts/run_repolocus.py doctor <repository>
    ```
 
 2. Build or refresh the external local index:
 
    ```bash
-   python <skill-dir>/scripts/run_repolocus.py scan <repository>
+   python -I <skill-dir>/scripts/run_repolocus.py scan <repository>
    ```
 
 3. Choose the smallest evidence operation that answers the request:
@@ -40,19 +41,19 @@ returned on stdout instead of written into the target repository.
    - Locate or explain code:
 
      ```bash
-     python <skill-dir>/scripts/run_repolocus.py ask "<question>" <repository>
+     python -I <skill-dir>/scripts/run_repolocus.py ask "<question>" <repository>
      ```
 
    - Summarize structure and reading order:
 
      ```bash
-     python <skill-dir>/scripts/run_repolocus.py map <repository>
+     python -I <skill-dir>/scripts/run_repolocus.py map <repository>
      ```
 
    - Explain static architecture relationships:
 
      ```bash
-     python <skill-dir>/scripts/run_repolocus.py diagram <repository>
+     python -I <skill-dir>/scripts/run_repolocus.py diagram <repository>
      ```
 
 4. Inspect the returned paths, line ranges, confidence, and excerpts. Open the cited files when
@@ -66,6 +67,8 @@ returned on stdout instead of written into the target repository.
 - Keep this Skill local-only. The adapter forces `model=local`, disables telemetry, and exposes no
   cloud-consent flags.
 - Do not execute repository commands, builds, tests, hooks, or code as part of RepoLocus analysis.
+- Keep the adapter interpreter outside the target repository. Let the adapter resolve the target
+  to an absolute path, sanitize runtime discovery, and launch RepoLocus from its trusted directory.
 - Prefer the adapter's stdout behavior for maps and diagrams; do not create `PROJECT_MAP.md` or
   `ARCHITECTURE.md` unless the user separately requests those writes.
 - Remember that `scan` writes only an index under the operating-system user cache, outside the

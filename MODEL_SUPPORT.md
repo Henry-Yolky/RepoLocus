@@ -3,7 +3,7 @@
 | Provider string | Network | Credential | Status |
 |---|---|---|---|
 | `local` or `extractive` | None | None | Supported; deterministic evidence output |
-| `ollama/MODEL` | Loopback by default; configurable | None | Supported; non-loopback requires explicit consent |
+| `ollama/MODEL` | Loopback by default; configurable | None | Supported; non-loopback requires HTTPS and explicit consent |
 | `openai/MODEL` | Cloud or compatible gateway | `OPENAI_API_KEY` | Supported; explicit consent |
 | `anthropic/MODEL` | Cloud | `ANTHROPIC_API_KEY` | Supported; explicit consent |
 
@@ -20,6 +20,10 @@ Environment configuration:
 - `REPOLOCUS_REQUEST_TIMEOUT`
 - `OPENAI_API_KEY`
 - `ANTHROPIC_API_KEY`
+
+Plain HTTP endpoints are accepted only on loopback addresses such as `localhost`, `127.0.0.1`,
+or `::1`. Every non-loopback Ollama, OpenAI-compatible, or Anthropic endpoint must use HTTPS.
+Prompts sent through HTTP providers are redacted immediately before transport.
 
 Model output is not treated as evidence. A citation must point into one of the retrieved source
 ranges or the narrative is withheld in favor of the deterministic evidence response.

@@ -12,10 +12,12 @@ read-only.
 |---|---|
 | Symlink or path traversal reads outside the repository | Canonical-root validation and no symlink following |
 | Build, hook, or README-triggered command execution | Scanner and providers expose no command execution interface |
+| Target-repository runtime or module shadowing through the Codex Skill | Target paths are canonicalized; target-local interpreters and executables are rejected; child Python runs isolated from a trusted directory |
 | Accidental key indexing | Sensitive-name rules, content secret detection, binary/size limits |
 | Prompt injection in source | Source is delimited as untrusted data and providers have no tools |
 | Unapproved cloud upload | Per-call flag or remembered repository/provider grant |
 | Excessive cloud disclosure | Retrieval limit, context budget, preview, and redaction |
+| Cleartext remote-provider traffic | HTTP is limited to loopback; non-loopback endpoints require HTTPS |
 | Fabricated source citations | Structured citation markers validated against retrieved ranges |
 | Mermaid links or directives | Deterministic restricted grammar; model output is never diagram source |
 | Index committed to Git | Cache defaults outside the repository; `.repolocus/` is ignored |
