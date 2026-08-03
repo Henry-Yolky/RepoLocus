@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -90,10 +91,48 @@ def test_privacy_store_remembers_per_repo_provider_outside_repo(tmp_path: Path) 
     assert store.is_allowed(repo, "openai/another-model") is True
     raw_state = state_path.read_text(encoding="utf-8")
     assert "gpt-test" not in raw_state
-    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 
     store.revoke(repo, "openai")
     assert store.status(repo) == {}
+
+
+def test_privacy_store_requests_restrictive_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_path = tmp_path / "state" / "privacy.json"
+    store = PrivacyStore(state_path)
+    chmod_calls: list[tuple[Path, int]] = []
+    original_chmod = Path.chmod
+
+    def record_chmod(path: Path, mode: int, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        chmod_calls.append((path, mode))
+        original_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", record_chmod)
+
+    store.grant(repo, "openai")
+
+    assert (state_path.parent, 0o700) in chmod_calls
+    assert (state_path, 0o600) in chmod_calls
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows permissions are represented by ACLs, not POSIX mode bits",
+)
+def test_privacy_store_enforces_posix_modes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_path = tmp_path / "state" / "privacy.json"
+    store = PrivacyStore(state_path)
+
+    store.grant(repo, "openai")
+
+    assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_path.with_suffix(".json.lock").stat().st_mode) == 0o600
 
 
 def test_privacy_store_revoke_all_is_repository_scoped(tmp_path: Path) -> None:

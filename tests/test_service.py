@@ -243,6 +243,30 @@ def test_model_output_with_terminal_controls_is_rejected(
     assert result is None
 
 
+def test_extractive_answer_escapes_untrusted_display_controls() -> None:
+    control = "\x1b]8;;https://attacker.invalid\x07"
+    evidence = Evidence(
+        path=f"src/demo/bad{control}.py",
+        start_line=1,
+        end_line=2,
+        content=f"return {control!r}",
+        score=10,
+        symbol=f"probe{control}",
+        reason="exact symbol match",
+    )
+
+    answer = DevPilotService(Settings(model="local"))._extractive_answer(
+        f"where is {control}?", [evidence]
+    )
+
+    assert "\x1b" not in answer.text
+    assert "\x07" not in answer.text
+    assert "\\u001b" in answer.text
+    assert "\\u0007" in answer.text
+    assert "%1B" in answer.text
+    assert "%07" in answer.text
+
+
 def test_empty_question_is_rejected(sample_repo: Path, isolated_user_dirs: Path) -> None:
     service = _service(sample_repo, isolated_user_dirs)
 
