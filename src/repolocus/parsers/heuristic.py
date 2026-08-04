@@ -483,9 +483,7 @@ def _markdown_symbols(path: str, text: str) -> list[Symbol]:
 
 
 _CFG_SECTION_RE = re.compile(r"^[ \t]*\[\[?\s*([^\]]+?)\s*\]\]?[ \t]*(?:[#;].*)?$")
-_CFG_KEY_RE = re.compile(
-    r'^[ \t]*(?:"(?P<quoted>[^"\n]+)"|(?P<plain>[A-Za-z_][\w.-]*))\s*[:=]'
-)
+_CFG_KEY_RE = re.compile(r'^[ \t]*(?:"(?P<quoted>[^"\n]+)"|(?P<plain>[A-Za-z_][\w.-]*))\s*[:=]')
 _CARGO_SECTION_RE = re.compile(r"^\s*\[([^]]+)]")
 _CARGO_DEP_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*=")
 _GOMOD_REQUIRE_RE = re.compile(r"^\s*(?:require\s+)?([\w./-]+)\s+v\d")
