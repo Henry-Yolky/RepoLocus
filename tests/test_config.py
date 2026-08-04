@@ -333,6 +333,19 @@ def test_repository_config_identity_checked_fallback_reads_one_snapshot(
     assert settings.max_file_bytes == 7000
 
 
+def test_repository_config_does_not_treat_ctrl_z_as_eof(tmp_path: Path) -> None:
+    (tmp_path / ".repolocus.toml").write_bytes(
+        b"max_file_bytes = 7000\r\n\x1aignored_if_read_in_text_mode"
+    )
+
+    with pytest.raises(ConfigError, match="invalid TOML"):
+        Settings.load(
+            tmp_path,
+            environ={},
+            user_config_path=tmp_path / "missing.toml",
+        )
+
+
 def test_repository_config_compares_path_and_handle_metadata_portably(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

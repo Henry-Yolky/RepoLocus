@@ -31,6 +31,8 @@ Semantic Versioning while the project is in alpha.
 - Stream provider responses under byte, media-type, HTTP phase-timeout, elapsed-deadline, and
   JSON-structure limits; read repository configuration once through a pinned, no-follow
   descriptor chain.
+- Force low-level scanner and repository-config reads into binary mode on Windows so raw-byte
+  size, hashes, secret checks, and Ctrl-Z handling remain consistent across platforms.
 
 ## [0.1.3] - 2026-08-04
 

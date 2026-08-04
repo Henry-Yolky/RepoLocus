@@ -124,14 +124,6 @@ def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
     return _same_content_state(first, second) and first.st_ctime_ns == second.st_ctime_ns
 
 
-def _same_portable_path_state(first: os.stat_result, second: os.stat_result) -> bool:
-    """Compare path metadata without treating Windows ctime as a change token."""
-
-    return _same_content_state(first, second) and (
-        _IS_WINDOWS or first.st_ctime_ns == second.st_ctime_ns
-    )
-
-
 def _is_stable_unpinned_directory(
     directory: Path,
     root: Path,
@@ -192,6 +184,7 @@ def _safe_read_at(
 
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
     target: str | Path = name if directory_fd is not None else directory / name
@@ -265,7 +258,7 @@ def _safe_read_at(
     if (
         not stat.S_ISREG(persisted.st_mode)
         or _is_reparse_point(persisted)
-        or not _same_portable_path_state(preclose_path, persisted)
+        or not _same_file_state(preclose_path, persisted)
     ):
         return None, None, "changed_during_scan"
     return accepted_payload, persisted, None
@@ -309,7 +302,7 @@ def _metadata_still_matches_at(
     return (
         stat.S_ISREG(current.st_mode)
         and not _is_reparse_point(current)
-        and _same_portable_path_state(expected, current)
+        and _same_file_state(expected, current)
     )
 
 
@@ -934,6 +927,10 @@ class RepositoryScanner:
                 stats.skip("binary")
                 warnings.append(f"non-UTF-8 file skipped: {display_path}")
                 continue
+            if _IS_WINDOWS:
+                # Binary descriptor reads preserve on-disk bytes for size and hashing;
+                # normalize the CRLF translation previously supplied by the CRT.
+                text = text.replace("\r\n", "\n")
             if is_generated_document(text, language):
                 stats.skip("generated")
                 continue

@@ -522,7 +522,7 @@ def _read_repository_config_bytes(root: Path, path: Path) -> bytes | None:
                 descriptors.append(directory_fd)
             name = relative.parts[-1]
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= nofollow | getattr(os, "O_NONBLOCK", 0)
+            flags |= nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
             descriptor = os.open(name, flags, dir_fd=directory_fd)
             file_opened = True
             descriptors.append(descriptor)
@@ -589,7 +589,11 @@ def _read_repository_config_bytes(root: Path, path: Path) -> bytes | None:
             resolved = candidate.resolve(strict=True)
             resolved.relative_to(root)
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            flags |= (
+                getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
             descriptor = os.open(candidate, flags)
             file_opened = True
             try:

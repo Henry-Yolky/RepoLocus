@@ -550,7 +550,7 @@ def test_safe_read_compares_metadata_from_matching_sources(
 
     payload, error = scanner_repository._safe_read(source, 100)
 
-    assert payload == b"VALUE = 1\n"
+    assert payload == source.read_bytes()
     assert error is None
 
     expected = source.lstat()
@@ -562,10 +562,21 @@ def test_safe_read_compares_metadata_from_matching_sources(
         directory_fd=None,
         root=tmp_path.resolve(),
     )
-    assert payload == b"VALUE = 1\n"
+    assert payload == source.read_bytes()
     assert reason is None
     assert returned_metadata is not None
     assert returned_metadata.st_ctime_ns == source.lstat().st_ctime_ns
+
+
+def test_safe_read_preserves_crlf_and_ctrl_z_bytes(tmp_path: Path) -> None:
+    raw = b"before\r\nafter\x1atail"
+    source = _write(tmp_path, "app.py", raw)
+    from repolocus.scanner import repository as scanner_repository
+
+    payload, error = scanner_repository._safe_read(source, 100)
+
+    assert payload == raw
+    assert error is None
 
 
 def test_safe_read_keeps_handle_and_path_content_states_linked(
@@ -597,7 +608,11 @@ def test_safe_read_keeps_handle_and_path_content_states_linked(
 
 @pytest.mark.parametrize(
     ("mtime_delta", "ctime_delta", "expected_error"),
-    [(0, 1, None), (1, 0, "changed_during_scan")],
+    [
+        (0, 0, None),
+        (0, 1, "changed_during_scan"),
+        (1, 0, "changed_during_scan"),
+    ],
 )
 def test_safe_read_revalidates_metadata_collected_after_close(
     tmp_path: Path,
@@ -649,52 +664,10 @@ def test_safe_read_revalidates_metadata_collected_after_close(
         assert returned_metadata is None
         assert reason == expected_error
     else:
-        assert payload == b"VALUE = 1\n"
+        assert payload == source.read_bytes()
         assert reason is None
         assert returned_metadata is not None
         assert returned_metadata.st_ctime_ns == expected.st_ctime_ns + ctime_delta
-
-
-@pytest.mark.parametrize(
-    ("is_windows", "mtime_delta", "expected_match"),
-    [(True, 0, True), (False, 0, False), (True, 1, False)],
-)
-def test_cache_revalidation_tolerates_only_windows_ctime_drift(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    is_windows: bool,
-    mtime_delta: int,
-    expected_match: bool,
-) -> None:
-    source = _write(tmp_path, "app.py", "VALUE = 1\n")
-    from repolocus.scanner import repository as scanner_repository
-
-    expected = source.lstat()
-    original_stat = scanner_repository.os.stat
-
-    def changed_stat(path: str | os.PathLike[str], *args, **kwargs):  # type: ignore[no-untyped-def]
-        metadata = original_stat(path, *args, **kwargs)
-        return SimpleNamespace(
-            st_mode=metadata.st_mode,
-            st_dev=metadata.st_dev,
-            st_ino=metadata.st_ino,
-            st_size=metadata.st_size,
-            st_mtime_ns=metadata.st_mtime_ns + mtime_delta,
-            st_ctime_ns=metadata.st_ctime_ns + 1,
-        )
-
-    monkeypatch.setattr(scanner_repository, "_IS_WINDOWS", is_windows)
-    monkeypatch.setattr(scanner_repository.os, "stat", changed_stat)
-
-    assert (
-        scanner_repository._metadata_still_matches_at(
-            source.name,
-            expected,
-            directory=tmp_path,
-            directory_fd=None,
-        )
-        is expected_match
-    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows file identity semantics")
@@ -866,6 +839,8 @@ def test_trusted_incremental_cache_skips_unchanged_file_reads(
     scanner = RepositoryScanner()
     first = scanner.scan(tmp_path)
     settled = source.lstat()
+    assert first.files[0].size_bytes == settled.st_size
+    assert first.files[0].sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
     assert first.files[0].mtime_ns == settled.st_mtime_ns
     assert first.files[0].ctime_ns == settled.st_ctime_ns
     from repolocus.scanner import repository as scanner_repository
