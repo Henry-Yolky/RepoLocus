@@ -131,7 +131,8 @@ def _safe_read_at(
         if (
             _is_reparse_point(current)
             or not _same_file_state(opened, finished)
-            or not _same_file_state(finished, current)
+            # Windows 3.12 exposes different ctime semantics for path stat and fstat.
+            or not _same_file_state(expected, current)
         ):
             return None, None, "changed_during_scan"
         return payload, finished, None

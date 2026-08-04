@@ -253,16 +253,48 @@ def test_windows_reparse_attribute_is_explicitly_recognized() -> None:
     )
 
 
+def test_safe_read_compares_metadata_from_matching_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(tmp_path, "app.py", "VALUE = 1\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    original_fstat = scanner_repository.os.fstat
+
+    def windows_like_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=metadata.st_ctime_ns + 1,
+        )
+
+    monkeypatch.setattr(scanner_repository.os, "fstat", windows_like_fstat)
+
+    payload, error = scanner_repository._safe_read(source, 100)
+
+    assert payload == b"VALUE = 1\n"
+    assert error is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows file identity semantics")
-def test_windows_regular_file_is_not_reported_as_changed(tmp_path: Path) -> None:
-    _write(tmp_path, "app.py", "VALUE = 1\n")
+def test_windows_path_and_handle_metadata_are_compared_consistently(tmp_path: Path) -> None:
+    _write(tmp_path, ".gitignore", "*.tmp\n")
+    source = _write(tmp_path, "nested/app.py", "VALUE = 1\n")
 
-    result = RepositoryScanner().scan(tmp_path)
+    initial = RepositoryScanner().scan(tmp_path)
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    updated = RepositoryScanner().scan(tmp_path)
 
-    assert [item.path for item in result.files] == ["app.py"]
-    assert result.stats.indexed_files == 1
-    assert result.stats.skipped.get("changed_during_scan", 0) == 0
-    assert result.temporarily_unreadable == ()
+    assert [item.path for item in initial.files] == [".gitignore", "nested/app.py"]
+    assert [item.path for item in updated.files] == [".gitignore", "nested/app.py"]
+    assert updated.files[1].text == "VALUE = 2\n"
+    for result in (initial, updated):
+        assert result.stats.skipped.get("changed_during_scan", 0) == 0
+        assert result.temporarily_unreadable == ()
 
 
 def test_sensitive_binary_oversize_and_likely_secret_files_are_filtered(tmp_path: Path) -> None:
