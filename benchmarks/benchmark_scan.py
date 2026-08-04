@@ -9,6 +9,7 @@ import os
 import platform
 import tempfile
 import time
+import tracemalloc
 from pathlib import Path
 
 from repolocus.config import Settings
@@ -27,11 +28,25 @@ def _populate(root: Path, count: int) -> None:
         )
 
 
-def _timed(service: RepoLocusService, repository: Path) -> tuple[float, dict[str, object]]:
+def _timed(service: RepoLocusService, repository: Path) -> tuple[float, int, dict[str, object]]:
+    tracemalloc.start()
     started = time.perf_counter()
-    operation = service.scan(repository)
-    elapsed = time.perf_counter() - started
-    return elapsed, operation.to_dict()
+    try:
+        operation = service.scan(repository)
+        elapsed = time.perf_counter() - started
+        _current, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return elapsed, peak_bytes, operation.to_dict()
+
+
+def _index_bytes(index_path: Path) -> int:
+    candidates = (
+        index_path,
+        Path(str(index_path) + "-wal"),
+        Path(str(index_path) + "-shm"),
+    )
+    return sum(candidate.stat().st_size for candidate in candidates if candidate.is_file())
 
 
 def main() -> int:
@@ -53,21 +68,30 @@ def main() -> int:
     os.environ["XDG_CACHE_HOME"] = str(cache)
     _populate(repository, arguments.files)
     service = RepoLocusService(Settings(model="local"))
-    cold_seconds, cold = _timed(service, repository)
-    warm_seconds, warm = _timed(service, repository)
+    cold_seconds, cold_peak_bytes, cold = _timed(service, repository)
+    warm_seconds, warm_peak_bytes, warm = _timed(service, repository)
     changed_file = repository / "src" / "group_000" / "module_000000.py"
     changed_file.write_text(
         changed_file.read_text(encoding="utf-8") + "\nCHANGED = True\n",
         encoding="utf-8",
     )
-    incremental_seconds, incremental = _timed(service, repository)
+    incremental_seconds, incremental_peak_bytes, incremental = _timed(service, repository)
+    source_bytes = sum(path.stat().st_size for path in repository.rglob("*") if path.is_file())
+    index_path = Path(str(incremental["index_path"]))
+    index_bytes = _index_bytes(index_path)
     report = {
         "files": arguments.files,
         "python": platform.python_version(),
         "platform": platform.platform(),
         "cold_seconds": round(cold_seconds, 6),
+        "cold_peak_python_bytes": cold_peak_bytes,
         "warm_seconds": round(warm_seconds, 6),
+        "warm_peak_python_bytes": warm_peak_bytes,
         "single_change_seconds": round(incremental_seconds, 6),
+        "single_change_peak_python_bytes": incremental_peak_bytes,
+        "source_bytes": source_bytes,
+        "index_bytes": index_bytes,
+        "index_amplification": round(index_bytes / source_bytes, 6) if source_bytes else 0.0,
         "cold": cold,
         "warm": warm,
         "single_change": incremental,

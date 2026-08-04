@@ -8,82 +8,42 @@ a shell, or any executable found in the indexed tree.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
 import threading
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from platformdirs import user_cache_path
 
-from repolocus.models import Chunk, Dependency, IndexUpdate, ScannedFile, ScanResult, Symbol
+from repolocus.models import (
+    Chunk,
+    Dependency,
+    IndexSnapshot,
+    IndexUpdate,
+    ScannedFile,
+    ScanResult,
+    Symbol,
+)
 
-SCHEMA_VERSION = 2
-INDEX_FORMAT_VERSION = "2"
+SCHEMA_VERSION = 3
+INDEX_FORMAT_VERSION = "3"
 # The product rename did not change the SQLite schema. Keep the original format
 # magic so existing valid indexes remain recognizable when explicitly opened.
 APPLICATION_ID = 0x4456504C  # "DVPL"
-_QUERY_TOKEN = re.compile(r"[^\W_]+(?:_[^\W_]+)*", re.UNICODE)
 _SAFE_SLUG = re.compile(r"[^A-Za-z0-9._-]+")
-_REQUIRED_TABLES = frozenset({"meta", "files", "symbols", "dependencies", "chunks", "chunks_fts"})
-_QUERY_STOPWORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "are",
-        "be",
-        "does",
-        "for",
-        "from",
-        "how",
-        "in",
-        "is",
-        "it",
-        "of",
-        "on",
-        "or",
-        "the",
-        "this",
-        "to",
-        "was",
-        "what",
-        "where",
-        "which",
-        "who",
-        "why",
-        "with",
-    }
+_V2_REQUIRED_TABLES = frozenset(
+    {"meta", "files", "symbols", "dependencies", "chunks", "chunks_fts"}
 )
-_QUERY_EXPANSIONS: dict[str, tuple[str, ...]] = {
-    "cloud": ("provider", "privacy", "consent"),
-    "configuration": ("config", "settings"),
-    "configurations": ("config", "settings"),
-    "api": ("create_app",),
-    "protected": ("protect", "security", "privacy", "consent"),
-    "protection": ("protect", "security", "privacy", "consent"),
-    "requests": ("request",),
-    "symlinks": ("symlink",),
-    "validated": ("validate",),
-    "validation": ("validate",),
-}
-_QUERY_PHRASE_EXPANSIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("配置", ("config", "settings")),
-    ("校验", ("validate",)),
-    ("验证", ("validate",)),
-    ("入口", ("main", "entry")),
-    ("请求", ("request",)),
-    ("隐私", ("privacy",)),
-    ("授权", ("consent",)),
-    ("同意", ("consent",)),
-    ("模型", ("model", "provider")),
-)
+_REQUIRED_TABLES = _V2_REQUIRED_TABLES | {"chunk_terms"}
 _OPEN_LOCKS_GUARD = threading.Lock()
 _OPEN_LOCKS: dict[str, threading.RLock] = {}
+_MAX_SNAPSHOT_WARNINGS = 256
 
 
 class IndexFormatError(RuntimeError):
@@ -92,6 +52,10 @@ class IndexFormatError(RuntimeError):
 
 class IndexClosedError(RuntimeError):
     """An operation was attempted after an index was closed."""
+
+
+class StaleScanError(RuntimeError):
+    """A scan was based on an index generation that is no longer current."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,46 +140,24 @@ def index_path_for(root: Path, cache_dir: Path | None = None) -> Path:
     return database
 
 
-def _query_tokens(query: str, *, maximum: int = 32) -> tuple[str, ...]:
-    if not isinstance(query, str):
-        return ()
-    seen: set[str] = set()
-    tokens: list[str] = []
-    candidates: list[str] = []
-    for match in _QUERY_TOKEN.finditer(query):
-        token = match.group(0)[:128]
-        folded = token.casefold()
-        if not token or folded in _QUERY_STOPWORDS:
-            continue
-        candidates.append(token)
-        candidates.extend(_QUERY_EXPANSIONS.get(folded, ()))
-        if folded.endswith("ed") and len(folded) >= 6:
-            candidates.extend((folded[:-2], folded[:-1]))
-        elif folded.endswith("s") and len(folded) >= 5:
-            candidates.append(folded[:-1])
-    folded_query = query.casefold()
-    for phrase, expansions in _QUERY_PHRASE_EXPANSIONS:
-        if phrase in folded_query:
-            candidates.extend(expansions)
-    for token in candidates:
-        folded = token.casefold()
-        if folded in seen:
-            continue
-        seen.add(folded)
-        tokens.append(token)
-        if len(tokens) >= maximum:
-            break
-    return tuple(tokens)
+def _query_tokens(
+    query: str,
+    synonyms: Mapping[str, Sequence[str]] | None = None,
+    *,
+    maximum: int = 64,
+) -> tuple[str, ...]:
+    # Lazy imports avoid index <-> retrieval package initialization cycles.
+    from repolocus.retrieval.terms import query_terms
+
+    return query_terms(query, synonyms, maximum=maximum)
 
 
 def _literal_query_tokens(query: str) -> frozenset[str]:
-    """Return user-written tokens only, excluding semantic query expansions."""
+    """Return user-written terms only, excluding configured synonyms."""
 
-    return frozenset(
-        match.group(0)[:128].casefold()
-        for match in _QUERY_TOKEN.finditer(query)
-        if match.group(0) and match.group(0).casefold() not in _QUERY_STOPWORDS
-    )
+    from repolocus.retrieval.terms import literal_query_terms
+
+    return frozenset(literal_query_terms(query))
 
 
 def _validate_relative_path(value: str) -> None:
@@ -234,6 +176,10 @@ def _validate_scanned_file(file: ScannedFile) -> None:
         raise ValueError(f"negative file metadata for {file.path}")
     if file.mtime_ns < 0 or file.ctime_ns < 0:
         raise ValueError(f"negative file timestamp for {file.path}")
+    if file.provenance not in {"source", "generated"}:
+        raise ValueError(f"invalid provenance for {file.path}")
+    if file.stale:
+        raise ValueError(f"fresh scan input cannot already be stale: {file.path}")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", file.sha256):
         raise ValueError(f"invalid SHA256 for {file.path}")
     for symbol in file.symbols:
@@ -265,6 +211,85 @@ def _validate_scanned_file(file: ScannedFile) -> None:
         source_region = "".join(source_lines[chunk.start_line - 1 : chunk.end_line])
         if chunk.content not in source_region:
             raise ValueError(f"chunk content is not present in source range for {file.path}")
+
+
+def _validate_scan_path(value: str) -> None:
+    if value == ".":
+        return
+    _validate_relative_path(value)
+
+
+def _covered_by_incomplete_path(path: str, prefixes: Sequence[str]) -> bool:
+    return any(
+        prefix == "." or path == prefix or path.startswith(prefix + "/") for prefix in prefixes
+    )
+
+
+def _snapshot_scan_metadata(
+    scan: ScanResult,
+) -> tuple[tuple[tuple[str, int], ...], tuple[str, ...]]:
+    skipped: list[tuple[str, int]] = []
+    for reason, count in sorted(scan.stats.skipped.items()):
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or len(reason) > 128
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            raise ValueError("scan skipped counters must use short names and non-negative integers")
+        skipped.append((reason, count))
+    warnings: list[str] = []
+    for warning in scan.warnings[:_MAX_SNAPSHOT_WARNINGS]:
+        if not isinstance(warning, str):
+            raise ValueError("scan warnings must be strings")
+        warnings.append(warning[:4096])
+    omitted = len(scan.warnings) - len(warnings)
+    if omitted > 0:
+        warnings.append(f"{omitted} additional scan warning(s) omitted from snapshot metadata")
+    return tuple(skipped), tuple(warnings)
+
+
+def _decode_snapshot_state(
+    metadata: Mapping[str, str],
+) -> tuple[tuple[tuple[str, int], ...], tuple[str, ...], tuple[str, ...]]:
+    try:
+        skipped_value = json.loads(metadata.get("last_scan_skipped", "{}"))
+        warnings_value = json.loads(metadata.get("last_scan_warnings", "[]"))
+        incomplete_value = json.loads(metadata.get("last_scan_incomplete", "[]"))
+    except json.JSONDecodeError as exc:
+        raise IndexFormatError("index snapshot metadata contains invalid JSON") from exc
+    if not isinstance(skipped_value, dict) or not isinstance(warnings_value, list):
+        raise IndexFormatError("index snapshot metadata has invalid scan summaries")
+    if not isinstance(incomplete_value, list):
+        raise IndexFormatError("index snapshot metadata has invalid incomplete paths")
+    skipped: list[tuple[str, int]] = []
+    for reason, count in sorted(skipped_value.items()):
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or len(reason) > 128
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            raise IndexFormatError("index snapshot metadata has invalid skipped counters")
+        skipped.append((reason, count))
+    if len(warnings_value) > _MAX_SNAPSHOT_WARNINGS + 1 or any(
+        not isinstance(warning, str) or len(warning) > 4096 for warning in warnings_value
+    ):
+        raise IndexFormatError("index snapshot metadata has invalid warnings")
+    incomplete: list[str] = []
+    for path in incomplete_value:
+        if not isinstance(path, str):
+            raise IndexFormatError("index snapshot metadata has invalid incomplete paths")
+        try:
+            _validate_scan_path(path)
+        except ValueError as exc:
+            raise IndexFormatError("index snapshot metadata has invalid incomplete paths") from exc
+        incomplete.append(path)
+    return tuple(skipped), tuple(warnings_value), tuple(incomplete)
 
 
 def _effective_chunks(file: ScannedFile) -> tuple[Chunk, ...]:
@@ -389,7 +414,14 @@ class RepositoryIndex:
                     raise IndexFormatError(
                         f"database at {self._database_path} is not a RepoLocus index"
                     )
-                if version != SCHEMA_VERSION:
+                if version == 2:
+                    if not _V2_REQUIRED_TABLES.issubset(tables):
+                        missing = ", ".join(sorted(_V2_REQUIRED_TABLES - tables))
+                        raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
+                    self._migrate_v2_to_v3()
+                    version = SCHEMA_VERSION
+                    tables.add("chunk_terms")
+                elif version != SCHEMA_VERSION:
                     raise IndexFormatError(
                         f"unsupported index schema {version}; expected {SCHEMA_VERSION}"
                     )
@@ -405,6 +437,114 @@ class RepositoryIndex:
                 raise IndexFormatError("index format version is incompatible")
         except sqlite3.Error as exc:
             raise IndexFormatError(f"invalid SQLite index at {self._database_path}: {exc}") from exc
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Add provenance, freshness, and CAS state without discarding v2 facts."""
+
+        try:
+            with self._transaction():
+                # Another process may have completed the migration while this
+                # connection waited for BEGIN IMMEDIATE.
+                current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+                if current_version == SCHEMA_VERSION:
+                    return
+                if current_version != 2:
+                    raise IndexFormatError(
+                        f"unsupported index schema {current_version}; expected 2"
+                    )
+                self._connection.execute(
+                    "ALTER TABLE files ADD COLUMN provenance TEXT NOT NULL DEFAULT 'source' "
+                    "CHECK (provenance IN ('source', 'generated'))"
+                )
+                self._connection.execute(
+                    "ALTER TABLE files ADD COLUMN stale INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (stale IN (0, 1))"
+                )
+                from repolocus.scanner.filters import is_generated_document
+
+                generated_paths = [
+                    str(row["path"])
+                    for row in self._connection.execute(
+                        "SELECT path, text FROM files WHERE lower(language) = 'markdown'"
+                    )
+                    if is_generated_document(str(row["text"]), "markdown")
+                ]
+                self._connection.executemany(
+                    "UPDATE files SET provenance = 'generated' WHERE path = ?",
+                    ((path,) for path in generated_paths),
+                )
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES ('generation', '0')"
+                )
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS chunk_terms (
+                        term TEXT NOT NULL,
+                        chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                        PRIMARY KEY (term, chunk_id)
+                    ) WITHOUT ROWID
+                    """
+                )
+                self._connection.execute(
+                    "CREATE INDEX IF NOT EXISTS chunk_terms_chunk_idx ON chunk_terms(chunk_id)"
+                )
+                self._rebuild_chunk_terms()
+                self._connection.execute("DROP TRIGGER IF EXISTS chunks_after_insert")
+                self._connection.execute("DROP TRIGGER IF EXISTS chunks_after_delete")
+                self._connection.execute("DROP TRIGGER IF EXISTS chunks_after_update")
+                self._connection.execute("DROP TABLE chunks_fts")
+                self._connection.execute(
+                    """
+                    CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                        file_path,
+                        symbol,
+                        content,
+                        content = 'chunks',
+                        content_rowid = 'id',
+                        tokenize = 'unicode61 remove_diacritics 2'
+                    )
+                    """
+                )
+                self._create_fts_triggers()
+                self._connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+                self._connection.executemany(
+                    """
+                    INSERT INTO meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
+                        ("schema_version", str(SCHEMA_VERSION)),
+                        ("index_format_version", INDEX_FORMAT_VERSION),
+                    ),
+                )
+                self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except sqlite3.Error as exc:
+            raise IndexFormatError(f"could not migrate v2 index: {exc}") from exc
+
+    def _create_fts_triggers(self) -> None:
+        for statement in (
+            """
+            CREATE TRIGGER chunks_after_insert AFTER INSERT ON chunks BEGIN
+                INSERT INTO chunks_fts(rowid, file_path, symbol, content)
+                VALUES (new.id, new.file_path, new.symbol, new.content);
+            END
+            """,
+            """
+            CREATE TRIGGER chunks_after_delete AFTER DELETE ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, file_path, symbol, content)
+                VALUES ('delete', old.id, old.file_path, old.symbol, old.content);
+            END
+            """,
+            """
+            CREATE TRIGGER chunks_after_update AFTER UPDATE ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, file_path, symbol, content)
+                VALUES ('delete', old.id, old.file_path, old.symbol, old.content);
+                INSERT INTO chunks_fts(rowid, file_path, symbol, content)
+                VALUES (new.id, new.file_path, new.symbol, new.content);
+            END
+            """,
+        ):
+            self._connection.execute(statement)
 
     def _create_schema(self) -> None:
         statements = (
@@ -424,7 +564,9 @@ class RepositoryIndex:
                 text TEXT NOT NULL,
                 is_entry_point INTEGER NOT NULL CHECK (is_entry_point IN (0, 1)),
                 mtime_ns INTEGER NOT NULL CHECK (mtime_ns >= 0),
-                ctime_ns INTEGER NOT NULL CHECK (ctime_ns >= 0)
+                ctime_ns INTEGER NOT NULL CHECK (ctime_ns >= 0),
+                provenance TEXT NOT NULL CHECK (provenance IN ('source', 'generated')),
+                stale INTEGER NOT NULL CHECK (stale IN (0, 1))
             ) WITHOUT ROWID
             """,
             """
@@ -461,6 +603,14 @@ class RepositoryIndex:
                 UNIQUE (file_path, ordinal)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS chunk_terms (
+                term TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                PRIMARY KEY (term, chunk_id)
+            ) WITHOUT ROWID
+            """,
+            "CREATE INDEX IF NOT EXISTS chunk_terms_chunk_idx ON chunk_terms(chunk_id)",
             "CREATE INDEX IF NOT EXISTS symbols_file_idx ON symbols(file_path, start_line, name)",
             "CREATE INDEX IF NOT EXISTS symbols_name_idx ON symbols(name COLLATE NOCASE)",
             "CREATE INDEX IF NOT EXISTS dependencies_source_idx ON dependencies(source_path, line)",
@@ -469,27 +619,31 @@ class RepositoryIndex:
             "CREATE INDEX IF NOT EXISTS chunks_file_idx ON chunks(file_path, start_line, ordinal)",
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                path,
+                file_path,
                 symbol,
                 content,
+                content = 'chunks',
+                content_rowid = 'id',
                 tokenize = 'unicode61 remove_diacritics 2'
             )
             """,
             """
             CREATE TRIGGER IF NOT EXISTS chunks_after_insert AFTER INSERT ON chunks BEGIN
-                INSERT INTO chunks_fts(rowid, path, symbol, content)
+                INSERT INTO chunks_fts(rowid, file_path, symbol, content)
                 VALUES (new.id, new.file_path, new.symbol, new.content);
             END
             """,
             """
             CREATE TRIGGER IF NOT EXISTS chunks_after_delete AFTER DELETE ON chunks BEGIN
-                DELETE FROM chunks_fts WHERE rowid = old.id;
+                INSERT INTO chunks_fts(chunks_fts, rowid, file_path, symbol, content)
+                VALUES ('delete', old.id, old.file_path, old.symbol, old.content);
             END
             """,
             """
             CREATE TRIGGER IF NOT EXISTS chunks_after_update AFTER UPDATE ON chunks BEGIN
-                DELETE FROM chunks_fts WHERE rowid = old.id;
-                INSERT INTO chunks_fts(rowid, path, symbol, content)
+                INSERT INTO chunks_fts(chunks_fts, rowid, file_path, symbol, content)
+                VALUES ('delete', old.id, old.file_path, old.symbol, old.content);
+                INSERT INTO chunks_fts(rowid, file_path, symbol, content)
                 VALUES (new.id, new.file_path, new.symbol, new.content);
             END
             """,
@@ -506,6 +660,7 @@ class RepositoryIndex:
                         ("schema_version", str(SCHEMA_VERSION)),
                         ("index_format_version", INDEX_FORMAT_VERSION),
                         ("analysis_version", ""),
+                        ("generation", "0"),
                     ),
                 )
                 self._connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
@@ -523,8 +678,16 @@ class RepositoryIndex:
         if scan_root != self._root:
             raise ValueError(f"scan root {scan_root} does not match index root {self._root}")
         incoming: dict[str, ScannedFile] = {}
+        incomplete_paths = tuple(sorted(set(scan.temporarily_unreadable)))
+        skipped_summary, warning_summary = _snapshot_scan_metadata(scan)
         if not scan.analysis_version or len(scan.analysis_version) > 128:
             raise ValueError("scan analysis version must be a short non-empty string")
+        if scan.base_generation is not None and (
+            isinstance(scan.base_generation, bool) or scan.base_generation < 0
+        ):
+            raise ValueError("scan base generation must be a non-negative integer or None")
+        for path in incomplete_paths:
+            _validate_scan_path(path)
         for file in scan.files:
             _validate_scanned_file(file)
             if file.path in incoming:
@@ -535,19 +698,44 @@ class RepositoryIndex:
             # BEGIN IMMEDIATE precedes both the comparison and mutations.  Two
             # index instances in one process therefore cannot calculate deltas
             # from the same stale snapshot and race on inserts.
+            generation_row = self._connection.execute(
+                "SELECT value FROM meta WHERE key = 'generation'"
+            ).fetchone()
+            try:
+                current_generation = int(generation_row["value"]) if generation_row else 0
+            except (TypeError, ValueError) as exc:
+                raise IndexFormatError("index generation metadata is invalid") from exc
+            if current_generation < 0:
+                raise IndexFormatError("index generation metadata is invalid")
+            if scan.base_generation is not None and scan.base_generation != current_generation:
+                raise StaleScanError(
+                    f"scan generation {scan.base_generation} is stale; "
+                    f"current generation is {current_generation}"
+                )
             current = {
-                str(row["path"]): str(row["sha256"]).casefold()
-                for row in self._connection.execute("SELECT path, sha256 FROM files")
+                str(row["path"]): (
+                    str(row["sha256"]).casefold(),
+                    str(row["provenance"]),
+                )
+                for row in self._connection.execute("SELECT path, sha256, provenance FROM files")
             }
             incoming_paths = set(incoming)
             current_paths = set(current)
             analysis_changed = self.get_metadata().get("analysis_version") != scan.analysis_version
             added = sorted(incoming_paths - current_paths)
-            removed = sorted(current_paths - incoming_paths)
+            absent = current_paths - incoming_paths
+            retained_stale = sorted(
+                path for path in absent if _covered_by_incomplete_path(path, incomplete_paths)
+            )
+            removed = sorted(absent - set(retained_stale))
             changed = sorted(
                 path
                 for path in incoming_paths & current_paths
-                if analysis_changed or incoming[path].sha256.casefold() != current[path]
+                if (
+                    analysis_changed
+                    or incoming[path].sha256.casefold() != current[path][0]
+                    or incoming[path].provenance != current[path][1]
+                )
             )
             unchanged_paths = sorted((incoming_paths & current_paths) - set(changed))
             unchanged = len(unchanged_paths)
@@ -561,15 +749,18 @@ class RepositoryIndex:
             for path in unchanged_paths:
                 file = incoming[path]
                 self._connection.execute(
-                    "UPDATE files SET mtime_ns = ?, ctime_ns = ? WHERE path = ?",
+                    "UPDATE files SET mtime_ns = ?, ctime_ns = ?, stale = 0 WHERE path = ?",
                     (file.mtime_ns, file.ctime_ns, path),
                 )
+            for path in retained_stale:
+                self._connection.execute("UPDATE files SET stale = 1 WHERE path = ?", (path,))
             scan_digest = hashlib.sha256()
             for path in sorted(incoming):
                 scan_digest.update(path.encode("utf-8", errors="surrogatepass"))
                 scan_digest.update(b"\0")
                 scan_digest.update(incoming[path].sha256.casefold().encode("ascii"))
                 scan_digest.update(b"\0")
+            committed_generation = current_generation + 1
             metadata = {
                 "last_scan_digest": scan_digest.hexdigest(),
                 "last_scan_file_count": str(len(incoming)),
@@ -578,7 +769,14 @@ class RepositoryIndex:
                 "last_update_changed": str(len(changed)),
                 "last_update_unchanged": str(unchanged),
                 "last_update_removed": str(len(removed)),
+                "last_update_stale": str(len(retained_stale)),
+                "last_scan_skipped": json.dumps(
+                    dict(skipped_summary), ensure_ascii=False, sort_keys=True
+                ),
+                "last_scan_warnings": json.dumps(warning_summary, ensure_ascii=False),
+                "last_scan_incomplete": json.dumps(incomplete_paths, ensure_ascii=False),
                 "analysis_version": scan.analysis_version,
+                "generation": str(committed_generation),
             }
             self._connection.executemany(
                 """
@@ -594,6 +792,8 @@ class RepositoryIndex:
             unchanged=unchanged,
             removed=len(removed),
             chunks=inserted_chunks,
+            stale=len(retained_stale),
+            generation=committed_generation,
         )
 
     def _insert_file(self, file: ScannedFile) -> int:
@@ -601,8 +801,8 @@ class RepositoryIndex:
             """
             INSERT INTO files(
                 path, language, size_bytes, sha256, line_count, text, is_entry_point,
-                mtime_ns, ctime_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mtime_ns, ctime_ns, provenance, stale
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file.path,
@@ -614,6 +814,8 @@ class RepositoryIndex:
                 int(file.is_entry_point),
                 file.mtime_ns,
                 file.ctime_ns,
+                file.provenance,
+                int(file.stale),
             ),
         )
         self._connection.executemany(
@@ -665,7 +867,36 @@ class RepositoryIndex:
                 for ordinal, chunk in enumerate(chunks)
             ),
         )
+        chunk_rows = self._connection.execute(
+            """
+            SELECT id, file_path, symbol, content FROM chunks
+            WHERE file_path = ? ORDER BY ordinal
+            """,
+            (file.path,),
+        ).fetchall()
+        self._insert_chunk_terms(chunk_rows)
         return len(chunks)
+
+    def _insert_chunk_terms(self, chunk_rows: Sequence[sqlite3.Row]) -> None:
+        from repolocus.retrieval.terms import document_terms
+
+        for row in chunk_rows:
+            terms = document_terms(
+                str(row["file_path"]),
+                str(row["symbol"]),
+                str(row["content"]),
+            )
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO chunk_terms(term, chunk_id) VALUES (?, ?)",
+                ((term, int(row["id"])) for term in terms),
+            )
+
+    def _rebuild_chunk_terms(self) -> None:
+        self._connection.execute("DELETE FROM chunk_terms")
+        rows = self._connection.execute(
+            "SELECT id, file_path, symbol, content FROM chunks ORDER BY id"
+        ).fetchall()
+        self._insert_chunk_terms(rows)
 
     def get_metadata(self) -> dict[str, str]:
         self._ensure_open()
@@ -674,6 +905,49 @@ class RepositoryIndex:
                 str(row["key"]): str(row["value"])
                 for row in self._connection.execute("SELECT key, value FROM meta ORDER BY key")
             }
+
+    def generation(self) -> int:
+        """Return the current monotonic commit generation."""
+
+        value = self.get_metadata().get("generation", "0")
+        try:
+            generation = int(value)
+        except ValueError as exc:
+            raise IndexFormatError("index generation metadata is invalid") from exc
+        if generation < 0:
+            raise IndexFormatError("index generation metadata is invalid")
+        return generation
+
+    def snapshot(self) -> IndexSnapshot:
+        """Read cache facts and their CAS generation from one SQLite snapshot."""
+
+        self._ensure_open()
+        with self._lock:
+            self._connection.execute("BEGIN")
+            try:
+                metadata = self.get_metadata()
+                try:
+                    generation = int(metadata.get("generation", "0"))
+                except ValueError as exc:
+                    raise IndexFormatError("index generation metadata is invalid") from exc
+                if generation < 0:
+                    raise IndexFormatError("index generation metadata is invalid")
+                analysis_version = metadata.get("analysis_version", "")
+                skipped, warnings, incomplete = _decode_snapshot_state(metadata)
+                files = tuple(self.get_files())
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
+        return IndexSnapshot(
+            generation,
+            analysis_version,
+            files,
+            skipped,
+            warnings,
+            incomplete,
+        )
 
     def stats(self) -> dict[str, int]:
         self._ensure_open()
@@ -801,6 +1075,8 @@ class RepositoryIndex:
                 is_entry_point=bool(row["is_entry_point"]),
                 mtime_ns=int(row["mtime_ns"]),
                 ctime_ns=int(row["ctime_ns"]),
+                provenance=str(row["provenance"]),  # type: ignore[arg-type]
+                stale=bool(row["stale"]),
             )
             for row in file_rows
         ]
@@ -808,44 +1084,105 @@ class RepositoryIndex:
     def list_files(self) -> list[ScannedFile]:
         return self.get_files()
 
-    def search_chunks(self, query: str, limit: int = 32) -> list[IndexedChunkHit]:
-        """Run a punctuation-safe FTS5 query and return best BM25 chunks."""
+    def search_chunks(
+        self,
+        query: str,
+        limit: int = 32,
+        *,
+        synonyms: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[IndexedChunkHit]:
+        """Search FTS5 plus normalized CJK and source-identifier terms."""
 
         self._ensure_open()
         if limit <= 0:
             return []
-        tokens = _query_tokens(query)
+        tokens = _query_tokens(query, synonyms)
         if not tokens:
             return []
-        expression = " OR ".join(f'"{token}"' for token in tokens)
+        stripped_query = query.strip()
+        identifier_query = not any(character.isspace() for character in stripped_query) and (
+            "_" in stripped_query or re.search(r"[a-z0-9][A-Z]", stripped_query) is not None
+        )
+        fts_tokens = tokens[:1] if identifier_query else tokens
+        expression = " OR ".join(f'"{token}"' for token in fts_tokens)
+        minimum_term_matches = max(1, len(_literal_query_tokens(query)))
         with self._lock:
-            rows = self._connection.execute(
+            fts_rows = self._connection.execute(
                 """
                 SELECT c.*, bm25(chunks_fts, 2.0, 5.0, 1.0) AS fts_rank
                 FROM chunks_fts
                 JOIN chunks AS c ON c.id = chunks_fts.rowid
+                JOIN files AS f ON f.path = c.file_path
                 WHERE chunks_fts MATCH ?
+                  AND f.provenance = 'source'
+                  AND f.stale = 0
                 ORDER BY fts_rank, c.file_path, c.start_line, c.ordinal
                 LIMIT ?
                 """,
                 (expression, min(int(limit), 500)),
             ).fetchall()
-        return [
-            IndexedChunkHit(
+            placeholders = ", ".join("?" for _ in tokens)
+            # Only generated SQLite parameter markers are interpolated; every value stays bound.
+            term_query_template = """
+                SELECT c.*, count(*) AS term_matches
+                FROM chunk_terms AS t
+                JOIN chunks AS c ON c.id = t.chunk_id
+                JOIN files AS f ON f.path = c.file_path
+                WHERE t.term IN (%s)
+                  AND f.provenance = 'source'
+                  AND f.stale = 0
+                GROUP BY c.id
+                HAVING count(*) >= ?
+                ORDER BY term_matches DESC, c.file_path, c.start_line, c.ordinal
+                LIMIT ?
+                """
+            term_query = term_query_template % placeholders  # nosec B608
+            term_rows = self._connection.execute(
+                term_query,
+                (*tokens, minimum_term_matches, min(int(limit), 500)),
+            ).fetchall()
+        hits: dict[int, IndexedChunkHit] = {}
+        for row in fts_rows:
+            hit = IndexedChunkHit(
                 chunk_id=int(row["id"]),
                 chunk=self._row_to_chunk(row),
                 rank=float(row["fts_rank"]),
             )
-            for row in rows
-        ]
+            hits[hit.chunk_id] = hit
+        for row in term_rows:
+            chunk_id = int(row["id"])
+            term_rank = -float(row["term_matches"])
+            current = hits.get(chunk_id)
+            if current is None:
+                hits[chunk_id] = IndexedChunkHit(
+                    chunk_id=chunk_id,
+                    chunk=self._row_to_chunk(row),
+                    rank=term_rank,
+                )
+            else:
+                hits[chunk_id] = IndexedChunkHit(
+                    chunk_id=chunk_id,
+                    chunk=current.chunk,
+                    rank=min(current.rank, term_rank),
+                )
+        return sorted(
+            hits.values(),
+            key=lambda hit: (hit.rank, hit.chunk.path, hit.chunk.start_line, hit.chunk_id),
+        )[: min(int(limit), 500)]
 
-    def find_symbol_chunks(self, query: str, limit: int = 32) -> list[SymbolChunkHit]:
+    def find_symbol_chunks(
+        self,
+        query: str,
+        limit: int = 32,
+        *,
+        synonyms: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[SymbolChunkHit]:
         """Find chunks for exact or partial symbol-name matches."""
 
         self._ensure_open()
         if limit <= 0:
             return []
-        tokens = _query_tokens(query)
+        tokens = _query_tokens(query, synonyms)
         if not tokens:
             return []
         full = query.strip().casefold()
@@ -856,7 +1193,12 @@ class RepositoryIndex:
         expanded_partial_tokens = {token for token in expanded_tokens if len(token) >= 4}
         with self._lock:
             symbol_rows = self._connection.execute(
-                "SELECT * FROM symbols ORDER BY file_path, start_line, name, id"
+                """
+                SELECT s.* FROM symbols AS s
+                JOIN files AS f ON f.path = s.file_path
+                WHERE f.provenance = 'source' AND f.stale = 0
+                ORDER BY s.file_path, s.start_line, s.name, s.id
+                """
             ).fetchall()
             matches: list[tuple[int, str, sqlite3.Row]] = []
             for row in symbol_rows:
@@ -1017,14 +1359,25 @@ class RepositoryIndex:
             return []
         seeds = set(seed_paths)
         with self._lock:
-            path_rows = self._connection.execute("SELECT path FROM files ORDER BY path").fetchall()
+            path_rows = self._connection.execute(
+                """
+                SELECT path FROM files
+                WHERE provenance = 'source' AND stale = 0
+                ORDER BY path
+                """
+            ).fetchall()
             known_paths = {str(row["path"]).casefold(): str(row["path"]) for row in path_rows}
             alias_map: dict[str, set[str]] = defaultdict(set)
             for folded_path, canonical in known_paths.items():
                 for alias in self._path_aliases(folded_path):
                     alias_map[alias].add(canonical)
             dependency_rows = self._connection.execute(
-                "SELECT * FROM dependencies ORDER BY source_path, line, target, id"
+                """
+                SELECT d.* FROM dependencies AS d
+                JOIN files AS f ON f.path = d.source_path
+                WHERE f.provenance = 'source' AND f.stale = 0
+                ORDER BY d.source_path, d.line, d.target, d.id
+                """
             ).fetchall()
             neighbor_info: dict[str, tuple[str, str]] = {}
             for row in dependency_rows:

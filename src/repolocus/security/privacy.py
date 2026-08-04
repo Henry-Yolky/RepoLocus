@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import tempfile
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .display import has_unsafe_display_controls
 from .redaction import redact_secrets_with_count
@@ -27,6 +29,52 @@ class PrivacyStoreError(RuntimeError):
 
 class ConsentRequiredError(PermissionError):
     """Raised when a cloud provider has not received explicit consent."""
+
+
+def canonical_endpoint(endpoint: str) -> str:
+    """Return the privacy identity for one exact HTTP provider endpoint.
+
+    Consent keys intentionally include the scheme, canonical host, effective
+    port, and request path.  Queries, fragments, and embedded credentials are
+    rejected so the returned value is also safe to display and persist.
+    """
+
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ValueError("provider endpoint must be a non-empty URL")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in endpoint):
+        raise ValueError("provider endpoint must not contain control characters")
+    try:
+        parsed = urlsplit(endpoint.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("provider endpoint contains an invalid port") from exc
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("provider endpoint must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("provider endpoint must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("provider endpoint must not contain a query or fragment")
+
+    host = parsed.hostname.rstrip(".").casefold()
+    if not host:
+        raise ValueError("provider endpoint contains an invalid hostname")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError("provider endpoint contains an invalid hostname") from exc
+        rendered_host = host
+    else:
+        host = address.compressed
+        rendered_host = f"[{host}]" if address.version == 6 else host
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if "\\" in path:
+        raise ValueError("provider endpoint path must not contain backslashes")
+    return f"{scheme}://{rendered_host}:{effective_port}{path}"
 
 
 def provider_family(model_or_provider: str) -> str:
@@ -97,17 +145,43 @@ class PrivacyStore:
         entry = state["repositories"].get(_repository_id(root_path), {})
         if entry.get("path") != str(root_path):
             return {}
-        grants = entry.get("providers", {})
-        if not isinstance(grants, dict):
+        providers = entry.get("providers", {})
+        if not isinstance(providers, dict):
             raise PrivacyStoreError("privacy state contains an invalid providers table")
-        return {str(provider): True for provider in sorted(grants)}
+        return {
+            str(provider): True
+            for provider, endpoints in sorted(providers.items())
+            if isinstance(endpoints, dict) and endpoints
+        }
 
-    def grant(self, root: Path | str, provider: str) -> None:
-        """Remember consent for one cloud provider and repository."""
+    def grant_details(self, root: Path | str) -> dict[str, tuple[str, ...]]:
+        """Return canonical endpoint identities for remembered provider grants."""
+
+        root_path = self._root(root)
+        self._ensure_outside_repository(root_path)
+        with self._locked_state():
+            state = self._read()
+        entry = state["repositories"].get(_repository_id(root_path), {})
+        if entry.get("path") != str(root_path):
+            return {}
+        providers = entry.get("providers", {})
+        if not isinstance(providers, dict):
+            raise PrivacyStoreError("privacy state contains an invalid providers table")
+        return {
+            str(provider): tuple(sorted(str(endpoint) for endpoint in endpoints))
+            for provider, endpoints in sorted(providers.items())
+            if isinstance(endpoints, dict) and endpoints
+        }
+
+    def grant(self, root: Path | str, provider: str, endpoint: str | None = None) -> None:
+        """Remember consent for one provider endpoint and repository."""
 
         family = provider_family(provider)
         if is_local_provider(family):
             return
+        if endpoint is None:
+            raise PrivacyStoreError("a canonical endpoint is required for remembered cloud consent")
+        endpoint_identity = canonical_endpoint(endpoint)
         root_path = self._root(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
@@ -117,7 +191,10 @@ class PrivacyStore:
             )
             repository["path"] = str(root_path)
             providers = repository.setdefault("providers", {})
-            providers[family] = {"granted_at": datetime.now(timezone.utc).isoformat()}
+            endpoints = providers.setdefault(family, {})
+            if not isinstance(endpoints, dict):
+                raise PrivacyStoreError("privacy state contains an invalid endpoint grants table")
+            endpoints[endpoint_identity] = {"granted_at": datetime.now(timezone.utc).isoformat()}
             self._write(state)
 
     def revoke(self, root: Path | str, provider: str | None = None) -> None:
@@ -141,13 +218,34 @@ class PrivacyStore:
                             state["repositories"].pop(repository_id, None)
             self._write(state)
 
-    def is_allowed(self, root: Path | str, provider: str) -> bool:
+    def is_allowed(
+        self,
+        root: Path | str,
+        provider: str,
+        endpoint: str | None = None,
+    ) -> bool:
         """Return whether local use or remembered cloud consent permits use."""
 
         family = provider_family(provider)
         if is_local_provider(family):
             return True
-        return self.status(root).get(family, False)
+        if endpoint is None:
+            return False
+        endpoint_identity = canonical_endpoint(endpoint)
+        root_path = self._root(root)
+        self._ensure_outside_repository(root_path)
+        with self._locked_state():
+            state = self._read()
+        entry = state["repositories"].get(_repository_id(root_path), {})
+        if entry.get("path") != str(root_path):
+            return False
+        providers = entry.get("providers", {})
+        if not isinstance(providers, dict):
+            raise PrivacyStoreError("privacy state contains an invalid providers table")
+        endpoints = providers.get(family, {})
+        if not isinstance(endpoints, dict):
+            raise PrivacyStoreError("privacy state contains an invalid endpoint grants table")
+        return endpoint_identity in endpoints
 
     @staticmethod
     def _root(root: Path | str) -> Path:
@@ -199,16 +297,56 @@ class PrivacyStore:
     def _read(self) -> dict[str, Any]:
         path = self.path.expanduser()
         if not path.exists():
-            return {"version": 1, "repositories": {}}
+            return {"version": 2, "repositories": {}}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PrivacyStoreError(f"cannot read privacy state {path}: {exc}") from exc
-        if not isinstance(data, dict) or data.get("version") != 1:
+        if not isinstance(data, dict) or data.get("version") not in {1, 2}:
             raise PrivacyStoreError("privacy state has an unsupported format")
         repositories = data.get("repositories")
         if not isinstance(repositories, dict):
             raise PrivacyStoreError("privacy state contains an invalid repositories table")
+        for repository in repositories.values():
+            if not isinstance(repository, dict):
+                raise PrivacyStoreError("privacy state contains an invalid repository entry")
+            providers = repository.get("providers", {})
+            if not isinstance(providers, dict):
+                raise PrivacyStoreError("privacy state contains an invalid providers table")
+        if data.get("version") == 1:
+            # Family-only grants cannot be safely attached to the endpoint that
+            # happens to be configured during an upgrade.  Migrate fail-closed;
+            # the next explicit grant writes a v2 endpoint-bound record.
+            return {
+                "version": 2,
+                "repositories": {
+                    repository_id: {
+                        "path": repository.get("path", ""),
+                        "providers": {},
+                    }
+                    for repository_id, repository in repositories.items()
+                },
+            }
+        for repository in repositories.values():
+            providers = repository.get("providers", {})
+            for endpoints in providers.values():
+                if not isinstance(endpoints, dict):
+                    raise PrivacyStoreError(
+                        "privacy state contains an invalid endpoint grants table"
+                    )
+                for endpoint, grant in endpoints.items():
+                    if not isinstance(endpoint, str) or not isinstance(grant, dict):
+                        raise PrivacyStoreError("privacy state contains an invalid endpoint grant")
+                    try:
+                        canonical = canonical_endpoint(endpoint)
+                    except ValueError as exc:
+                        raise PrivacyStoreError(
+                            "privacy state contains an invalid endpoint identity"
+                        ) from exc
+                    if canonical != endpoint:
+                        raise PrivacyStoreError(
+                            "privacy state contains a non-canonical endpoint identity"
+                        )
         return data
 
     def _write(self, state: Mapping[str, Any]) -> None:
@@ -248,10 +386,11 @@ def require_provider_consent(
     store: PrivacyStore,
     *,
     allow_once: bool = False,
+    endpoint: str | None = None,
 ) -> None:
     """Enforce cloud consent at the service/CLI boundary."""
 
-    if is_local_provider(provider) or allow_once or store.is_allowed(root, provider):
+    if is_local_provider(provider) or allow_once or store.is_allowed(root, provider, endpoint):
         return
     family = provider_family(provider)
     raise ConsentRequiredError(
@@ -268,13 +407,25 @@ class CloudSendPreview:
     fragment_count: int
     estimated_tokens: int
     redaction_count: int = 0
+    model: str = ""
+    endpoint: str | None = None
+    payload_bytes: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider.strip():
             raise ValueError("preview provider must not be empty")
         if any(not isinstance(path, str) or not path for path in self.paths):
             raise ValueError("preview paths must be non-empty strings")
-        for name in ("fragment_count", "estimated_tokens", "redaction_count"):
+        if not isinstance(self.model, str):
+            raise ValueError("preview model must be a string")
+        if self.endpoint is not None and canonical_endpoint(self.endpoint) != self.endpoint:
+            raise ValueError("preview endpoint must be canonical")
+        for name in (
+            "fragment_count",
+            "estimated_tokens",
+            "redaction_count",
+            "payload_bytes",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"preview {name} must be a non-negative integer")
@@ -293,6 +444,9 @@ class CloudSendPreview:
             "fragment_count": self.fragment_count,
             "estimated_tokens": self.estimated_tokens,
             "redaction_count": self.redaction_count,
+            "model": self.model,
+            "endpoint": self.endpoint,
+            "payload_bytes": self.payload_bytes,
         }
 
 

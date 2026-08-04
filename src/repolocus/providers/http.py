@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -19,6 +21,82 @@ from .base import (
     ProviderRequestError,
     ProviderResponseError,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequestPlan:
+    """Credential-free, immutable HTTP body prepared before cloud approval."""
+
+    provider: str
+    model: str
+    endpoint: str
+    body: bytes
+
+
+def build_provider_request_plan(
+    provider: str,
+    model: str,
+    *,
+    base_url: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_output_tokens: int = 2048,
+) -> ProviderRequestPlan:
+    """Build the exact redacted JSON body later sent by an HTTP provider."""
+
+    _validate_prompts(system_prompt, user_prompt)
+    family = provider.strip().casefold()
+    clean_model = model.strip()
+    if not clean_model:
+        raise ProviderConfigurationError("model name must not be empty")
+    normalised_base = _normalise_base_url(base_url)
+    redacted_system = redact_text(system_prompt)
+    redacted_user = redact_text(user_prompt)
+    if family == "ollama":
+        endpoint = _append_endpoint(normalised_base, "/api/chat", accepted_suffix="/api/chat")
+        payload: Mapping[str, Any] = {
+            "model": clean_model,
+            "messages": [
+                {"role": "system", "content": redacted_system},
+                {"role": "user", "content": redacted_user},
+            ],
+            "stream": False,
+        }
+    elif family == "openai":
+        _validate_max_output_tokens(max_output_tokens)
+        endpoint = _append_endpoint(
+            normalised_base,
+            "/chat/completions",
+            accepted_suffix="/chat/completions",
+        )
+        payload = {
+            "model": clean_model,
+            "messages": [
+                {"role": "system", "content": redacted_system},
+                {"role": "user", "content": redacted_user},
+            ],
+            "max_tokens": int(max_output_tokens),
+            "temperature": 0,
+        }
+    elif family == "anthropic":
+        _validate_max_output_tokens(max_output_tokens)
+        endpoint = _append_endpoint(normalised_base, "/v1/messages", accepted_suffix="/v1/messages")
+        payload = {
+            "model": clean_model,
+            "system": redacted_system,
+            "messages": [{"role": "user", "content": redacted_user}],
+            "max_tokens": int(max_output_tokens),
+            "temperature": 0,
+        }
+    else:
+        raise ProviderConfigurationError(f"unsupported HTTP provider {provider!r}")
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return ProviderRequestPlan(family, clean_model, endpoint, body)
 
 
 class _HTTPProvider(ModelProvider):
@@ -49,7 +127,7 @@ class _HTTPProvider(ModelProvider):
         endpoint: str,
         *,
         headers: Mapping[str, str],
-        payload: Mapping[str, Any],
+        body: bytes,
     ) -> Mapping[str, Any]:
         try:
             with httpx.Client(
@@ -57,7 +135,7 @@ class _HTTPProvider(ModelProvider):
                 transport=self._transport,
                 trust_env=not is_loopback_url(self.base_url),
             ) as client:
-                response = client.post(endpoint, headers=headers, json=payload)
+                response = client.post(endpoint, headers=headers, content=body)
         except httpx.TimeoutException as exc:
             raise ProviderRequestError(
                 f"{self.name} request timed out after {self.timeout:g} seconds; it was not retried"
@@ -104,23 +182,33 @@ class OllamaProvider(_HTTPProvider):
         self.is_local = is_loopback_url(self.base_url)
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        _validate_prompts(system_prompt, user_prompt)
+        plan = build_provider_request_plan(
+            "ollama",
+            self.model,
+            base_url=self.base_url,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        return self.generate_prepared(plan)
+
+    def generate_prepared(self, plan: ProviderRequestPlan) -> str:
+        self._validate_plan(plan, "ollama", "/api/chat")
         data = self._post_json(
-            _append_endpoint(self.base_url, "/api/chat", accepted_suffix="/api/chat"),
+            plan.endpoint,
             headers={"Content-Type": "application/json"},
-            payload={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": redact_text(system_prompt)},
-                    {"role": "user", "content": redact_text(user_prompt)},
-                ],
-                "stream": False,
-            },
+            body=plan.body,
         )
         message = data.get("message")
         if not isinstance(message, Mapping):
             raise ProviderResponseError("ollama response is missing message")
         return _required_content(message.get("content"), "ollama")
+
+    def _validate_plan(self, plan: ProviderRequestPlan, family: str, suffix: str) -> None:
+        expected = _append_endpoint(self.base_url, suffix, accepted_suffix=suffix)
+        if plan.provider != family or plan.model != self.model or plan.endpoint != expected:
+            raise ProviderConfigurationError(
+                "prepared provider request does not match this provider"
+            )
 
 
 class OpenAICompatibleProvider(_HTTPProvider):
@@ -156,26 +244,33 @@ class OpenAICompatibleProvider(_HTTPProvider):
         self.max_output_tokens = int(max_output_tokens)
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        _validate_prompts(system_prompt, user_prompt)
+        plan = build_provider_request_plan(
+            "openai",
+            self.model,
+            base_url=self.base_url,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=self.max_output_tokens,
+        )
+        return self.generate_prepared(plan)
+
+    def generate_prepared(self, plan: ProviderRequestPlan) -> str:
+        expected = _append_endpoint(
+            self.base_url,
+            "/chat/completions",
+            accepted_suffix="/chat/completions",
+        )
+        if plan.provider != "openai" or plan.model != self.model or plan.endpoint != expected:
+            raise ProviderConfigurationError(
+                "prepared provider request does not match this provider"
+            )
         data = self._post_json(
-            _append_endpoint(
-                self.base_url,
-                "/chat/completions",
-                accepted_suffix="/chat/completions",
-            ),
+            plan.endpoint,
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
-            payload={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": redact_text(system_prompt)},
-                    {"role": "user", "content": redact_text(user_prompt)},
-                ],
-                "max_tokens": self.max_output_tokens,
-                "temperature": 0,
-            },
+            body=plan.body,
         )
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -219,21 +314,30 @@ class AnthropicProvider(_HTTPProvider):
         self.max_output_tokens = int(max_output_tokens)
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        _validate_prompts(system_prompt, user_prompt)
+        plan = build_provider_request_plan(
+            "anthropic",
+            self.model,
+            base_url=self.base_url,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=self.max_output_tokens,
+        )
+        return self.generate_prepared(plan)
+
+    def generate_prepared(self, plan: ProviderRequestPlan) -> str:
+        expected = _append_endpoint(self.base_url, "/v1/messages", accepted_suffix="/v1/messages")
+        if plan.provider != "anthropic" or plan.model != self.model or plan.endpoint != expected:
+            raise ProviderConfigurationError(
+                "prepared provider request does not match this provider"
+            )
         data = self._post_json(
-            _append_endpoint(self.base_url, "/v1/messages", accepted_suffix="/v1/messages"),
+            plan.endpoint,
             headers={
                 "x-api-key": self._api_key,
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json",
             },
-            payload={
-                "model": self.model,
-                "system": redact_text(system_prompt),
-                "messages": [{"role": "user", "content": redact_text(user_prompt)}],
-                "max_tokens": self.max_output_tokens,
-                "temperature": 0,
-            },
+            body=plan.body,
         )
         blocks = data.get("content")
         if not isinstance(blocks, list) or not blocks:
@@ -280,6 +384,11 @@ def _append_endpoint(base_url: str, endpoint: str, *, accepted_suffix: str) -> s
 def _validate_prompts(system_prompt: str, user_prompt: str) -> None:
     if not isinstance(system_prompt, str) or not isinstance(user_prompt, str):
         raise TypeError("system_prompt and user_prompt must be strings")
+
+
+def _validate_max_output_tokens(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ProviderConfigurationError("max_output_tokens must be greater than zero")
 
 
 def _required_content(value: object, provider: str) -> str:

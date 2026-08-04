@@ -15,6 +15,7 @@ from repolocus.index import (
     IndexClosedError,
     IndexFormatError,
     RepositoryIndex,
+    StaleScanError,
     cache_root,
     index_path_for,
 )
@@ -294,3 +295,159 @@ def test_out_of_range_parser_facts_are_rejected(tmp_path: Path) -> None:
         pytest.raises(ValueError, match="chunk line range"),
     ):
         index.update(_scan(repository, invalid))
+
+
+def test_incomplete_scan_retains_old_facts_as_stale_until_refreshed(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = tmp_path / "cache"
+    source = _file("src/keep.py", "KEEP_ME = True\n")
+
+    with RepositoryIndex.open(repository, cache) as index:
+        first = index.update(_scan(repository, source))
+        incomplete = ScanResult(
+            repository,
+            [],
+            ScanStats(),
+            temporarily_unreadable=("src",),
+            base_generation=first.generation,
+        )
+        retained = index.update(incomplete)
+
+        assert retained.removed == 0
+        assert retained.stale == 1
+        assert index.get_files()[0].stale is True
+        assert index.search_chunks("KEEP_ME") == []
+
+        refreshed = index.update(
+            ScanResult(
+                repository,
+                [source],
+                ScanStats(),
+                base_generation=retained.generation,
+            )
+        )
+        assert refreshed.unchanged == 1
+        assert refreshed.stale == 0
+        assert index.get_files()[0].stale is False
+        assert index.search_chunks("KEEP_ME")[0].chunk.path == "src/keep.py"
+
+        deleted = index.update(
+            ScanResult(
+                repository,
+                [],
+                ScanStats(),
+                base_generation=refreshed.generation,
+            )
+        )
+        assert deleted.removed == 1
+        assert index.get_files() == []
+
+
+def test_generation_cas_rejects_an_older_scan_result(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = tmp_path / "cache"
+    old = _file("state.py", "VALUE = 'old'\n")
+    new = _file("state.py", "VALUE = 'new'\n")
+
+    with (
+        RepositoryIndex.open(repository, cache) as first,
+        RepositoryIndex.open(repository, cache) as second,
+    ):
+        first_snapshot = first.snapshot()
+        second_snapshot = second.snapshot()
+        committed = second.update(
+            ScanResult(
+                repository,
+                [new],
+                ScanStats(),
+                base_generation=second_snapshot.generation,
+            )
+        )
+
+        with pytest.raises(StaleScanError, match="is stale"):
+            first.update(
+                ScanResult(
+                    repository,
+                    [old],
+                    ScanStats(),
+                    base_generation=first_snapshot.generation,
+                )
+            )
+
+        assert first.get_files()[0].text == new.text
+        assert first.generation() == committed.generation
+
+
+def test_generated_provenance_round_trips_but_is_not_retrieved_by_default(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    generated = replace(
+        _file("PROJECT_MAP.md", "UNIQUE_GENERATED_ASSERTION\n"),
+        language="markdown",
+        provenance="generated",
+    )
+
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        index.update(_scan(repository, generated))
+
+        stored = index.get_files()[0]
+        assert stored.provenance == "generated"
+        assert index.search_chunks("UNIQUE_GENERATED_ASSERTION") == []
+        assert index.find_symbol_chunks("UNIQUE_GENERATED_ASSERTION") == []
+
+
+def test_v2_index_is_migrated_without_losing_existing_facts(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = tmp_path / "cache"
+    source = _file("one.py", "VALUE = 1\n")
+    generated = replace(
+        _file(
+            "PROJECT_MAP.md",
+            "# Project Map\n\n<!-- Generator: RepoLocus 0.1.2; deterministic source map. -->\n",
+        ),
+        language="markdown",
+    )
+    prose = replace(
+        _file(
+            "notes.md",
+            "Ordinary prose mentions <!-- Generator: RepoLocus but is not a marker.\n",
+        ),
+        language="markdown",
+    )
+    with RepositoryIndex.open(repository, cache) as index:
+        database = index.db_path
+        index.update(_scan(repository, source, generated, prose))
+
+    connection = sqlite3.connect(database)
+    connection.execute("ALTER TABLE files DROP COLUMN stale")
+    connection.execute("ALTER TABLE files DROP COLUMN provenance")
+    connection.execute("DROP TABLE chunk_terms")
+    connection.execute("DELETE FROM meta WHERE key = 'generation'")
+    connection.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+    connection.execute("UPDATE meta SET value = '2' WHERE key = 'index_format_version'")
+    connection.execute("PRAGMA user_version = 2")
+    connection.commit()
+    connection.close()
+
+    with RepositoryIndex.open(repository, cache) as migrated:
+        files = {file.path: file for file in migrated.get_files()}
+
+        assert files["one.py"].text == source.text
+        assert files["one.py"].provenance == "source"
+        assert files["one.py"].stale is False
+        assert files["PROJECT_MAP.md"].provenance == "generated"
+        assert files["notes.md"].provenance == "source"
+        assert migrated.generation() == 0
+        assert migrated.get_metadata()["schema_version"] == "3"
+        assert migrated.search_chunks("VALUE")[0].chunk.path == "one.py"
+        indexes = {
+            str(row[1]) for row in migrated._connection.execute("PRAGMA index_list('chunk_terms')")
+        }
+        assert "chunk_terms_chunk_idx" in indexes
+        migrated._migrate_v2_to_v3()  # Models a waiter after another migration.
+        assert migrated.get_files()

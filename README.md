@@ -55,15 +55,21 @@ The default `local` answer mode does not make a network request. A local model i
 repolocus ask "How does a request reach the core loop?" --model ollama/qwen3-coder
 ```
 
-Every remote CLI call first prints the exact redacted source fragments selected for that send,
-including calls covered by a remembered grant. Use `--allow-cloud` for one call, or add
-`--remember-consent` to remember that provider for the current repository:
+Every remote CLI call first prints the model, canonical destination endpoint, exact serialized
+payload size, and redacted source fragments selected for that send, including calls covered by a
+remembered grant. Use `--allow-cloud` for one call, or add `--remember-consent` to remember that
+provider endpoint for the current repository:
 
 ```bash
 export OPENAI_API_KEY=...
 repolocus ask "Where is configuration validated?" \
   --model openai/gpt-4.1-mini --allow-cloud
 ```
+
+Remembered-consent format v2 binds a grant to the canonical repository, provider, scheme, host,
+effective port, and complete request path. Changing a compatible-provider endpoint therefore
+requires fresh consent. Legacy v1 family-only grants are intentionally ignored after upgrade and
+must be granted again.
 
 ## What it produces
 
@@ -75,12 +81,20 @@ repolocus ask "Where is configuration validated?" \
 - source links and `Confirmed`, `Inferred`, or `Needs review` labels.
 
 `repolocus diagram` writes `ARCHITECTURE.md`. The Mermaid source is constructed from a small,
-validated AST-like subset, not accepted directly from a model. A source-evidence table remains
-next to the graph.
+validated AST-like subset, not accepted directly from a model. The evidence tables keep a
+representative source for each node and one concrete import witness for every rendered edge.
 
-`repolocus ask` combines exact symbols, SQLite FTS5, and dependency-neighbor evidence. If no
-model is selected, the answer is an extractive evidence bundle. If a model is selected, its
-citations are checked against the retrieved file and line ranges before display.
+`repolocus ask` combines exact symbols, SQLite FTS5/BM25, a deterministic term index, and
+dependency-neighbor evidence. The term index splits camelCase, snake_case, and path components,
+and adds bigrams and trigrams for contiguous CJK text. Users can add explicit retrieval synonyms
+with bounded JSON in `REPOLOCUS_QUERY_SYNONYMS`, for example
+`{"configuration":["config","settings"]}`; repository-controlled configuration cannot set them.
+
+If no model is selected, the answer is an extractive evidence bundle. For a model answer, every
+material claim must be followed immediately by an `Evidence quote` containing an exact source
+substring and the same citation. Validation checks only that the citation address is inside the
+retrieved evidence and that the quote occurs there; it does not prove that the quote semantically
+supports the claim. A model answer that passes these checks is still labeled `needs_review`.
 
 ## Commands
 
@@ -90,7 +104,7 @@ citations are checked against the retrieved file and line ranges before display.
 | `repolocus map [PATH]` | Generate `PROJECT_MAP.md` or print it with `--stdout` |
 | `repolocus ask QUESTION [PATH]` | Retrieve source-backed evidence and optionally use a model |
 | `repolocus diagram [PATH]` | Generate validated Mermaid in `ARCHITECTURE.md` |
-| `repolocus privacy status` | Show remembered per-repository provider consent |
+| `repolocus privacy status` | Show remembered per-repository/provider/endpoint consent |
 | `repolocus privacy preview QUESTION` | Show fragments a question would send |
 | `repolocus privacy revoke` | Forget cloud-provider consent |
 | `repolocus doctor --security` | Check runtime, FTS5, cache permissions, and local-model reachability |
@@ -98,8 +112,14 @@ citations are checked against the retrieved file and line ranges before display.
 | `repolocus serve` | Start the optional self-hosted FastAPI service |
 
 Every command accepts `--help`. Use `--json` on automation-friendly commands where available.
+`map`, `diagram`, and `ask` default to `--refresh auto`: they query the last compatible committed
+snapshot and scan only when one is unavailable. Use `--refresh always` to scan before the
+operation, or `--refresh never` to forbid scanning and fail if no compatible snapshot exists.
+
 Add `--follow-up` to `ask` for a non-persistent in-memory question session; entering a blank line
-ends it. Follow-up context is never written to the repository or consent state.
+ends it. The first answer pins an index generation, and every follow-up uses that exact generation
+with refresh disabled. The session fails closed if another scan advances the generation.
+Follow-up context is never written to the repository or consent state.
 
 ## Agent Skill
 
@@ -132,7 +152,9 @@ Copy-Item -Recurse -Force "skills/repolocus-analyze-repo" (Join-Path $env:CODEX_
 Restart Codex after copying the directory, or reload its Skill registry when the host provides
 that action. Then invoke the Skill as `$repolocus-analyze-repo`. It intentionally exposes no
 cloud-consent flags; an agent cannot silently send repository content to a remote provider
-through this path.
+through this path. The Skill archive contains the adapter, not a RepoLocus runtime. A compatible
+installed runtime or pre-synchronized trusted source checkout must already exist; adapter
+operations stay offline and fail closed instead of downloading or synchronizing dependencies.
 
 ## Self-hosted API
 
@@ -143,9 +165,21 @@ one repository tree:
 repolocus serve --root /path/to/allowed/repositories
 ```
 
-The default bind address is loopback and cloud requests are disabled. A non-loopback bind
-requires `--allow-remote`; put an authentication and authorization gateway in front of it.
-Cloud-backed API questions additionally require the operator-only `--allow-cloud-api` flag.
+The default bind address is loopback and cloud requests are disabled. On each start RepoLocus uses
+a random Bearer token, printed once to stderr; set `REPOLOCUS_API_TOKEN` to supply a stable token.
+Every request requires `Authorization: Bearer TOKEN` and an allowed `Host` header. Request bodies
+and concurrent work are bounded, and `/v1/` responses use `Cache-Control: no-store`.
+
+Cloud-backed API questions additionally require the operator-only `--allow-cloud-api` flag and a
+two-stage request. `POST /v1/ask/preview` returns a short-lived, single-use `preview_id`; approving
+it with `POST /v1/ask/previews/{preview_id}/approve` sends the exact frozen evidence and serialized
+request body from that preview without rescanning. API clients cannot create persistent cloud
+grants, even when the operator enables cloud requests.
+
+A non-loopback bind requires all of `--allow-remote`, at least one `--allowed-host`, and a TLS
+certificate/key pair supplied with `--ssl-certfile` and `--ssl-keyfile`. The built-in preview store
+is process-local, so the two-stage flow assumes the single-worker server started by `repolocus
+serve`.
 
 The Docker image is dependency-locked and also defaults to container loopback. For a local-only
 published port, explicitly bind Uvicorn inside the container while limiting the host publish to
@@ -153,8 +187,12 @@ published port, explicitly bind Uvicorn inside the container while limiting the 
 
 ```bash
 docker build -t repolocus .
-docker run --rm -p 127.0.0.1:8765:8765 -v "$PWD:/workspace:ro" repolocus \
-  serve --root /workspace --host 0.0.0.0 --allow-remote
+docker run --rm -p 127.0.0.1:8765:8765 \
+  -e REPOLOCUS_API_TOKEN="$REPOLOCUS_API_TOKEN" \
+  -v "$PWD:/workspace:ro" -v "/path/to/tls:/run/repolocus-tls:ro" repolocus \
+  serve --root /workspace --host 0.0.0.0 --allow-remote --allowed-host localhost \
+  --ssl-certfile /run/repolocus-tls/server.crt \
+  --ssl-keyfile /run/repolocus-tls/server.key
 ```
 
 The source mount is read-only and API cloud access remains disabled in this example.
@@ -171,8 +209,9 @@ The source mount is read-only and API cloud access remains disabled in this exam
   `doctor --security` reports ACL verification as unavailable until native ACL inspection is
   implemented, instead of claiming an unverified success. Telemetry is absent.
 - Loopback Ollama is local by default. A non-loopback Ollama endpoint is treated like a cloud
-  provider and requires per-call or remembered per-repository consent. Selected, redacted source
-  fragments are shown by the CLI before every approved remote send.
+  provider and requires per-call or remembered per-repository-and-endpoint consent. Selected,
+  redacted source fragments and the exact destination and payload size are shown by the CLI before
+  every approved remote send.
 - Plain HTTP provider endpoints are limited to loopback addresses. Every non-loopback endpoint
   requires HTTPS, and provider prompts are redacted again immediately before transport.
 - `map` and `diagram` are the only normal commands that write in the repository, and only to
@@ -221,6 +260,12 @@ uv run pytest --cov=repolocus --cov-report=term-missing
 uv run python scripts/evaluate_retrieval.py evaluation/questions.json .
 uv build
 ```
+
+The retrieval report includes per-case recall@k, reciprocal rank, nDCG@k, expected-path coverage,
+and citation recall, plus aggregate macro recall, MRR, mean nDCG, any/all-path rates,
+no-answer precision and accuracy, and per-language breakdowns. The CLI can enforce minimum
+any-path hit rate, macro recall, and MRR. These metrics describe the checked-in regression cases,
+not the planned release-scale evaluation.
 
 Architecture decisions live in
 [`docs/adr/`](https://github.com/Henry-Yolky/RepoLocus/tree/main/docs/adr). Contributions are

@@ -3,6 +3,47 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and versions use
 Semantic Versioning while the project is in alpha.
 
+## [0.1.3] - 2026-08-04
+
+### Added
+
+- Added a deterministic lexical term index that splits camel/snake identifiers and paths, emits
+  CJK bigrams/trigrams, and accepts bounded user-owned synonyms through
+  `REPOLOCUS_QUERY_SYNONYMS`.
+- Expanded retrieval evaluation with recall@k, MRR, nDCG@k, any/all-path coverage, citation
+  recall, no-answer precision/accuracy, per-language summaries, and rank/recall thresholds.
+
+### Changed
+
+- `map`, `diagram`, and `ask` now default to compatible committed snapshots with explicit
+  `auto|always|never` refresh modes. CLI follow-ups pin the initial index generation and fail
+  closed if it changes.
+- Index rows now track `source`/`generated` provenance and stale state; retrieval excludes
+  generated and stale facts, while generation compare-and-swap prevents an old scan from
+  overwriting a newer commit.
+- Model output now pairs every material claim with the same citation and an exact source quote.
+  Validation checks citation addresses and quote substrings only, and accepted output remains
+  `needs_review`.
+- Mermaid output now records one concrete import witness for every rendered edge.
+- The Codex Skill now requires a preinstalled compatible runtime or pre-synchronized trusted
+  checkout and runs offline/no-sync, failing closed rather than installing dependencies.
+- Windows scans now use path-backed identity metadata so ordinary files are not falsely reported
+  as having changed between directory enumeration and opening.
+
+### Security
+
+- Bound remembered cloud consent to the canonical repository, provider, scheme, host, effective
+  port, and complete request path. Legacy v1 family-only grants now fail closed and require fresh
+  consent.
+- Added model, canonical endpoint, and exact serialized payload byte counts to cloud previews;
+  providers send the same immutable request body that was previewed.
+- Added default random Bearer authentication, Host validation, request-body and concurrency
+  limits, and `Cache-Control: no-store` to the self-hosted API.
+- Added a short-lived, single-use `preview_id -> approve` cloud API flow that sends the frozen
+  evidence snapshot without rescanning. API clients cannot create persistent cloud grants.
+- Required non-loopback API listeners to provide explicit remote opt-in, an allowed Host, and TLS
+  certificate/key files.
+
 ## [0.1.2] - 2026-08-04
 
 ### Changed

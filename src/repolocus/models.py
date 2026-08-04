@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 Confidence = Literal["confirmed", "inferred", "needs_review"]
+Provenance = Literal["source", "generated"]
 ANALYSIS_VERSION = "2"
 
 
@@ -74,6 +75,8 @@ class ScannedFile:
     is_entry_point: bool = False
     mtime_ns: int = 0
     ctime_ns: int = 0
+    provenance: Provenance = "source"
+    stale: bool = False
 
 
 @dataclass(slots=True)
@@ -99,6 +102,8 @@ class ScanResult:
     stats: ScanStats
     warnings: list[str] = field(default_factory=list)
     analysis_version: str = ANALYSIS_VERSION
+    temporarily_unreadable: tuple[str, ...] = ()
+    base_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +133,20 @@ class IndexUpdate:
     unchanged: int
     removed: int
     chunks: int
+    stale: int = 0
+    generation: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class IndexSnapshot:
+    """One transactionally consistent index state used to seed a scan."""
+
+    generation: int
+    analysis_version: str
+    files: tuple[ScannedFile, ...]
+    skipped: tuple[tuple[str, int], ...] = ()
+    warnings: tuple[str, ...] = ()
+    temporarily_unreadable: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

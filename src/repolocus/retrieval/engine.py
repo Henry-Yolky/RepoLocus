@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from repolocus.index.store import RepositoryIndex
@@ -18,8 +19,14 @@ class _Candidate:
 class RetrievalEngine:
     """Combine FTS5, symbol matching, and direct dependency neighbors."""
 
-    def __init__(self, index: RepositoryIndex) -> None:
+    def __init__(
+        self,
+        index: RepositoryIndex,
+        *,
+        synonyms: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         self._index = index
+        self._synonyms = synonyms
 
     def search(self, query: str, limit: int = 8) -> list[Evidence]:
         """Return ranked excerpts with one-based source line ranges.
@@ -31,8 +38,16 @@ class RetrievalEngine:
         if limit <= 0 or not isinstance(query, str) or not query.strip():
             return []
         candidate_limit = min(max(limit * 8, 32), 500)
-        fts_hits = self._index.search_chunks(query, candidate_limit)
-        symbol_hits = self._index.find_symbol_chunks(query, candidate_limit)
+        fts_hits = self._index.search_chunks(
+            query,
+            candidate_limit,
+            synonyms=self._synonyms,
+        )
+        symbol_hits = self._index.find_symbol_chunks(
+            query,
+            candidate_limit,
+            synonyms=self._synonyms,
+        )
         if not fts_hits and not symbol_hits:
             return []
 

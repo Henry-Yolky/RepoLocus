@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 _TRUSTED_WORKING_DIRECTORY = Path(__file__).resolve().parent
 _PYTHON_IMPORT_ENVIRONMENT = (
@@ -31,10 +35,65 @@ _UV_ENVIRONMENT = (
     "VIRTUAL_ENV",
 )
 _COVERAGE_ENVIRONMENT = ("COVERAGE_FILE", "COVERAGE_PROCESS_START")
+_PASSTHROUGH_ENVIRONMENT = (
+    "APPDATA",
+    "COMSPEC",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+)
+_PATH_ENVIRONMENT = frozenset(
+    {
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    }
+)
+_MINIMUM_RUNTIME_VERSION = (0, 1, 2)
+_MAXIMUM_RUNTIME_VERSION = (0, 2, 0)
+_RUNTIME_REQUIREMENT = ">=0.1.2,<0.2.0"
+_VERSION = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+_RUNTIME_PROBE = (
+    "import importlib.metadata as metadata, importlib.util as util, json; "
+    "spec = util.find_spec('repolocus'); "
+    "origin = spec.origin if spec and spec.origin else ''; "
+    "\ntry:\n version = metadata.version('repolocus')\n"
+    "except metadata.PackageNotFoundError:\n version = ''\n"
+    "print(json.dumps({'origin': origin, 'version': version}))"
+)
 
 
 class AdapterError(RuntimeError):
     """Raised when the RepoLocus runtime cannot be located."""
+
+
+class RuntimeCommand(NamedTuple):
+    """A RepoLocus module whose origin and version were checked without importing it."""
+
+    prefix: tuple[str, ...]
+    origin: Path
+    version: str
+    source: str
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -78,7 +137,13 @@ def _trusted_roots(repository: Path, interpreter: Path) -> tuple[Path, ...]:
     candidates = [interpreter.parent, _source_checkout()]
     account_home = _account_home()
     if account_home is not None:
-        candidates.append(account_home / ".local" / "bin")
+        candidates.extend(
+            (
+                account_home / ".local" / "bin",
+                account_home / ".local" / "share" / "pipx" / "venvs" / "repolocus",
+                account_home / ".local" / "pipx" / "venvs" / "repolocus",
+            )
+        )
 
     roots: list[Path] = []
     for candidate in candidates:
@@ -125,6 +190,7 @@ def _resolved_executable(
     path_value: str,
     untrusted_roots: tuple[Path, ...],
     trusted_roots: tuple[Path, ...],
+    require_trusted_root: bool = False,
 ) -> Path | None:
     requested_path = Path(command).expanduser()
     expanded = str(requested_path)
@@ -138,6 +204,8 @@ def _resolved_executable(
             return None
         from_trusted_root = any(_is_within(resolved, root) for root in trusted_roots)
         if not requested_path.is_absolute() and not from_trusted_root:
+            return None
+        if require_trusted_root and not from_trusted_root:
             return None
         if _path_is_trusted(resolved, untrusted_roots=untrusted_roots, trusted_roots=trusted_roots):
             return resolved
@@ -156,6 +224,8 @@ def _resolved_executable(
         if resolved in seen:
             continue
         seen.add(resolved)
+        if require_trusted_root and not any(_is_within(resolved, root) for root in trusted_roots):
+            continue
         if _path_is_trusted(resolved, untrusted_roots=untrusted_roots, trusted_roots=trusted_roots):
             return resolved
     return None
@@ -183,53 +253,319 @@ def _safe_path(
     return os.pathsep.join(entries)
 
 
+def _safe_passthrough_path(value: str, untrusted_roots: tuple[Path, ...]) -> str | None:
+    """Keep a user-directory setting only when it is absolute and outside the target."""
+
+    raw = Path(value).expanduser()
+    if not raw.is_absolute():
+        return None
+    try:
+        resolved = raw.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if any(_is_within(resolved, root) for root in untrusted_roots):
+        return None
+    return str(resolved)
+
+
 def _execution_environment(
     *,
     invocation_cwd: Path,
     untrusted_roots: tuple[Path, ...],
     trusted_roots: tuple[Path, ...],
 ) -> dict[str, str]:
-    environment = dict(os.environ)
-    for name in (*_PYTHON_IMPORT_ENVIRONMENT, *_UV_ENVIRONMENT, *_COVERAGE_ENVIRONMENT):
-        environment.pop(name, None)
-    for name in tuple(environment):
-        if name.startswith("COV_CORE_"):
-            environment.pop(name)
+    # Start empty rather than trying to enumerate every possible credential,
+    # proxy, shell hook, cloud setting, or language-specific injection knob.
+    environment: dict[str, str] = {}
+    for name in _PASSTHROUGH_ENVIRONMENT:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        if name in _PATH_ENVIRONMENT:
+            value = _safe_passthrough_path(value, untrusted_roots)
+            if value is None:
+                continue
+        environment[name] = value
+
+    account_home = _account_home()
+    if account_home is not None and not any(
+        _is_within(account_home, root) for root in untrusted_roots
+    ):
+        environment["USERPROFILE" if os.name == "nt" else "HOME"] = str(account_home)
     environment["PATH"] = _safe_path(
-        environment.get("PATH", os.defpath),
+        os.environ.get("PATH", os.defpath),
         invocation_cwd=invocation_cwd,
         untrusted_roots=untrusted_roots,
         trusted_roots=trusted_roots,
     )
     environment["PYTHONSAFEPATH"] = "1"
+    environment["PYTHONUTF8"] = "1"
     environment["REPOLOCUS_MODEL"] = "local"
     environment["REPOLOCUS_TELEMETRY"] = "false"
+    environment["UV_LOCKED"] = "1"
+    environment["UV_NO_ENV_FILE"] = "1"
+    environment["UV_NO_PROGRESS"] = "1"
+    environment["UV_NO_SYNC"] = "1"
+    environment["UV_OFFLINE"] = "1"
     return environment
 
 
-def _isolated_module_origin(environment: dict[str, str], interpreter: Path) -> Path | None:
-    probe = (
-        "import importlib.util; "
-        "spec = importlib.util.find_spec('repolocus'); "
-        "print(spec.origin if spec and spec.origin else '')"
-    )
+def _runtime_version(value: str) -> tuple[int, int, int] | None:
+    match = _VERSION.fullmatch(value.strip())
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _probe_runtime(
+    python_prefix: list[str],
+    *,
+    environment: dict[str, str],
+    untrusted_roots: tuple[Path, ...],
+    trusted_roots: tuple[Path, ...],
+    source: str,
+    expected_origin_root: Path | None = None,
+) -> RuntimeCommand:
+    """Resolve module metadata in isolated mode before executing RepoLocus itself."""
+
     try:
         completed = subprocess.run(
-            [str(interpreter), "-I", "-c", probe],
+            [*python_prefix, "-c", _RUNTIME_PROBE],
             cwd=_TRUSTED_WORKING_DIRECTORY,
             env=environment,
             check=False,
             capture_output=True,
             text=True,
         )
-    except OSError:
-        return None
-    if completed.returncode != 0 or not completed.stdout.strip():
-        return None
+    except OSError as exc:
+        raise AdapterError(f"could not probe the {source} RepoLocus runtime: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "failed"
+        raise AdapterError(f"could not probe the {source} RepoLocus runtime: {detail}")
     try:
-        return Path(completed.stdout.strip()).resolve()
-    except (OSError, RuntimeError):
-        return None
+        payload = json.loads(completed.stdout)
+        origin_text = payload["origin"]
+        version = payload["version"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise AdapterError(
+            f"the {source} RepoLocus runtime returned invalid probe metadata"
+        ) from exc
+    if not isinstance(origin_text, str) or not origin_text:
+        raise AdapterError(f"RepoLocus is not importable from the {source} runtime")
+    if not isinstance(version, str) or not version:
+        raise AdapterError(f"the {source} RepoLocus runtime has no distribution version metadata")
+    parsed_version = _runtime_version(version)
+    if (
+        parsed_version is None
+        or parsed_version < _MINIMUM_RUNTIME_VERSION
+        or parsed_version >= _MAXIMUM_RUNTIME_VERSION
+    ):
+        raise AdapterError(
+            f"the {source} RepoLocus runtime is version {version!r}; "
+            f"this Skill requires {_RUNTIME_REQUIREMENT}"
+        )
+    try:
+        origin = Path(origin_text).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AdapterError(f"cannot resolve the {source} RepoLocus module origin") from exc
+    if origin.parent.name != "repolocus" or origin.name not in {"__init__.py", "__init__.pyc"}:
+        raise AdapterError(f"unexpected RepoLocus module origin from {source}: {origin}")
+    if not _path_is_trusted(
+        origin,
+        untrusted_roots=untrusted_roots,
+        trusted_roots=trusted_roots,
+    ):
+        raise AdapterError(f"RepoLocus module origin is inside an untrusted directory: {origin}")
+    if expected_origin_root is not None and not _is_within(origin, expected_origin_root):
+        raise AdapterError(
+            f"the {source} runtime resolved RepoLocus outside {expected_origin_root}: {origin}"
+        )
+    return RuntimeCommand(
+        prefix=tuple([*python_prefix, "-m", "repolocus"]),
+        origin=origin,
+        version=version,
+        source=source,
+    )
+
+
+def _launcher_interpreter(
+    launcher: Path,
+    *,
+    path_value: str,
+    untrusted_roots: tuple[Path, ...],
+    trusted_roots: tuple[Path, ...],
+) -> Path | None:
+    """Resolve a Python interpreter from a console launcher without executing it."""
+
+    candidates: list[Path] = []
+    if os.name == "nt":
+        candidates.extend((launcher.parent / "python.exe", launcher.parent / "python3.exe"))
+    else:
+        try:
+            first_line = launcher.open("rb").readline(4096).decode("utf-8", errors="strict").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not first_line.startswith("#!"):
+            return None
+        try:
+            words = shlex.split(first_line[2:].strip())
+        except ValueError:
+            return None
+        if not words:
+            return None
+        requested = Path(words[0]).name.casefold()
+        if requested == "env":
+            if len(words) != 2:
+                return None
+            resolved = _resolved_executable(
+                words[1],
+                path_value=path_value,
+                untrusted_roots=untrusted_roots,
+                trusted_roots=trusted_roots,
+                require_trusted_root=True,
+            )
+            if resolved is not None:
+                candidates.append(resolved)
+        else:
+            candidates.append(Path(words[0]))
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_file() or not _path_is_trusted(
+            resolved,
+            untrusted_roots=untrusted_roots,
+            trusted_roots=trusted_roots,
+        ):
+            continue
+        return resolved
+    return None
+
+
+def _source_runtime_prefix(uv: Path, source_checkout: Path) -> list[str]:
+    return [
+        str(uv),
+        "run",
+        "--project",
+        str(source_checkout),
+        "--offline",
+        "--no-sync",
+        "--locked",
+        "--no-env-file",
+        "--no-progress",
+        "python",
+        "-I",
+    ]
+
+
+def _runtime_command(
+    explicit_binary: str | None,
+    *,
+    environment: dict[str, str],
+    interpreter: Path,
+    untrusted_roots: tuple[Path, ...],
+    trusted_roots: tuple[Path, ...],
+) -> RuntimeCommand:
+    requested = explicit_binary or os.environ.get("REPOLOCUS_BIN")
+    if requested:
+        launcher = _resolved_executable(
+            requested,
+            path_value=environment["PATH"],
+            untrusted_roots=untrusted_roots,
+            trusted_roots=trusted_roots,
+        )
+        if launcher is None:
+            raise AdapterError(
+                f"RepoLocus executable not found outside the target repository: {requested}"
+            )
+        requested_interpreter = _launcher_interpreter(
+            launcher,
+            path_value=environment["PATH"],
+            untrusted_roots=untrusted_roots,
+            trusted_roots=trusted_roots,
+        )
+        if requested_interpreter is None:
+            raise AdapterError(
+                f"cannot validate a Python module origin for RepoLocus executable: {launcher}"
+            )
+        return _probe_runtime(
+            [str(requested_interpreter), "-I"],
+            environment=environment,
+            untrusted_roots=untrusted_roots,
+            trusted_roots=trusted_roots,
+            source="explicit executable",
+        )
+
+    failures: list[str] = []
+    try:
+        return _probe_runtime(
+            [str(interpreter), "-I"],
+            environment=environment,
+            untrusted_roots=untrusted_roots,
+            trusted_roots=trusted_roots,
+            source="adapter interpreter",
+        )
+    except AdapterError as exc:
+        failures.append(str(exc))
+
+    installed = _resolved_executable(
+        "repolocus",
+        path_value=environment["PATH"],
+        untrusted_roots=untrusted_roots,
+        trusted_roots=trusted_roots,
+        require_trusted_root=True,
+    )
+    if installed is not None:
+        installed_interpreter = _launcher_interpreter(
+            installed,
+            path_value=environment["PATH"],
+            untrusted_roots=untrusted_roots,
+            trusted_roots=trusted_roots,
+        )
+        if installed_interpreter is not None:
+            try:
+                return _probe_runtime(
+                    [str(installed_interpreter), "-I"],
+                    environment=environment,
+                    untrusted_roots=untrusted_roots,
+                    trusted_roots=trusted_roots,
+                    source="installed executable",
+                )
+            except AdapterError as exc:
+                failures.append(str(exc))
+        else:
+            failures.append(f"cannot validate a Python interpreter for {installed}")
+
+    source_checkout = _source_checkout()
+    uv = _resolved_executable(
+        "uv",
+        path_value=environment["PATH"],
+        untrusted_roots=untrusted_roots,
+        trusted_roots=trusted_roots,
+        require_trusted_root=True,
+    )
+    if source_checkout is not None and source_checkout in trusted_roots and uv is not None:
+        try:
+            return _probe_runtime(
+                _source_runtime_prefix(uv, source_checkout),
+                environment=environment,
+                untrusted_roots=untrusted_roots,
+                trusted_roots=trusted_roots,
+                source="offline source checkout",
+                expected_origin_root=source_checkout / "src",
+            )
+        except AdapterError as exc:
+            failures.append(str(exc))
+
+    detail = "; ".join(failures[-3:])
+    suffix = f" Details: {detail}" if detail else ""
+    raise AdapterError(
+        "RepoLocus is unavailable. Install a compatible runtime "
+        f"({_RUNTIME_REQUIREMENT}) or pre-sync the trusted source checkout; the Skill never "
+        f"downloads or syncs dependencies.{suffix}"
+    )
 
 
 def _command_prefix(
@@ -240,56 +576,14 @@ def _command_prefix(
     untrusted_roots: tuple[Path, ...],
     trusted_roots: tuple[Path, ...],
 ) -> list[str]:
-    requested = explicit_binary or os.environ.get("REPOLOCUS_BIN")
-    if requested:
-        resolved = _resolved_executable(
-            requested,
-            path_value=environment["PATH"],
-            untrusted_roots=untrusted_roots,
-            trusted_roots=trusted_roots,
-        )
-        if resolved is not None:
-            return [str(resolved)]
-        raise AdapterError(
-            f"RepoLocus executable not found outside the target repository: {requested}"
-        )
-
-    installed = _resolved_executable(
-        "repolocus",
-        path_value=environment["PATH"],
+    runtime = _runtime_command(
+        explicit_binary,
+        environment=environment,
+        interpreter=interpreter,
         untrusted_roots=untrusted_roots,
         trusted_roots=trusted_roots,
     )
-    if installed is not None:
-        return [str(installed)]
-
-    module_origin = _isolated_module_origin(environment, interpreter)
-    if module_origin is not None and _path_is_trusted(
-        module_origin, untrusted_roots=untrusted_roots, trusted_roots=trusted_roots
-    ):
-        return [str(interpreter), "-I", "-m", "repolocus"]
-
-    source_checkout = _source_checkout()
-    uv = _resolved_executable(
-        "uv",
-        path_value=environment["PATH"],
-        untrusted_roots=untrusted_roots,
-        trusted_roots=trusted_roots,
-    )
-    if source_checkout is not None and source_checkout in trusted_roots and uv is not None:
-        return [
-            str(uv),
-            "run",
-            "--project",
-            str(source_checkout),
-            "--locked",
-            "repolocus",
-        ]
-
-    raise AdapterError(
-        "RepoLocus is unavailable; install it with 'pipx install repolocus' or run this "
-        "Skill from a RepoLocus source checkout with uv installed"
-    )
+    return list(runtime.prefix)
 
 
 def _limit(value: str) -> int:
@@ -342,9 +636,62 @@ def _operation_arguments(arguments: argparse.Namespace, repository: Path) -> lis
     raise AssertionError(f"unsupported operation: {arguments.operation}")
 
 
+def _bootstrap_doctor_failure(
+    repository: Path,
+    interpreter: Path,
+    error: AdapterError,
+) -> dict[str, object]:
+    """Return useful diagnostics even when RepoLocus itself cannot start."""
+
+    checks = [
+        {
+            "name": "bootstrap_python",
+            "ok": sys.version_info >= (3, 10),
+            "detail": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "required": True,
+        },
+        {
+            "name": "bootstrap_repository",
+            "ok": repository.is_dir(),
+            "detail": str(repository),
+            "required": True,
+        },
+        {
+            "name": "bootstrap_interpreter",
+            "ok": interpreter.is_file(),
+            "detail": str(interpreter),
+            "required": True,
+        },
+        {
+            "name": "bootstrap_runtime",
+            "ok": False,
+            "detail": str(error),
+            "required": True,
+        },
+        {
+            "name": "bootstrap_offline",
+            "ok": True,
+            "detail": "runtime discovery uses offline, no-sync mode",
+            "required": True,
+        },
+    ]
+    return {"ok": False, "bootstrap": True, "checks": checks}
+
+
+def _diagnostic_path(value: str | os.PathLike[str], fallback: str) -> Path:
+    """Build a display-only absolute path without resolving filesystem links."""
+
+    try:
+        return Path(os.path.abspath(Path(value).expanduser()))
+    except (OSError, RuntimeError, ValueError):
+        return Path(fallback)
+
+
 def main() -> int:
     parser = _parser()
     arguments = parser.parse_args()
+    repository = _diagnostic_path(arguments.repository, ".")
+    interpreter = _diagnostic_path(sys.executable, "python")
     try:
         repository = Path(arguments.repository).expanduser().resolve()
         invocation_cwd = Path.cwd().resolve()
@@ -356,15 +703,20 @@ def main() -> int:
             untrusted_roots=untrusted_roots,
             trusted_roots=trusted_roots,
         )
-        command = _command_prefix(
+        runtime = _runtime_command(
             arguments.binary,
             environment=environment,
             interpreter=interpreter,
             untrusted_roots=untrusted_roots,
             trusted_roots=trusted_roots,
-        ) + _operation_arguments(arguments, repository)
-    except AdapterError as exc:
-        parser.error(str(exc))
+        )
+        command = list(runtime.prefix) + _operation_arguments(arguments, repository)
+    except (OSError, RuntimeError, ValueError) as exc:
+        error = exc if isinstance(exc, AdapterError) else AdapterError(f"Bootstrap failed: {exc}")
+        if arguments.operation == "doctor":
+            print(json.dumps(_bootstrap_doctor_failure(repository, interpreter, error)))
+            return 1
+        parser.error(str(error))
 
     try:
         completed = subprocess.run(

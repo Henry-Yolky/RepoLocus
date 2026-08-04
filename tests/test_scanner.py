@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from repolocus.models import Chunk
+from repolocus.models import Chunk, ScannedFile
 from repolocus.parsers import ParseResult, ParserRegistry
 from repolocus.scanner import (
     RepositoryScanner,
@@ -155,6 +157,173 @@ def test_symlink_root_and_non_directory_root_are_rejected(tmp_path: Path) -> Non
         RepositoryScanner().scan(tmp_path / "missing")
 
 
+def test_repolocus_and_legacy_generated_markdown_are_excluded(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "PROJECT_MAP.md",
+        "# Project Map\n\n"
+        "<!-- Generator: RepoLocus 0.1.2; deterministic source map. -->\n"
+        "self-derived claim\n",
+    )
+    _write(
+        tmp_path,
+        "ARCHITECTURE.md",
+        "# Architecture\n\n<!-- Generator: RepoLocus; deterministic static graph. -->\n",
+    )
+    _write(
+        tmp_path,
+        "OLD_MAP.md",
+        "<!-- Generator: DevPilot 0.1.0; deterministic source map. -->\n",
+    )
+    _write(
+        tmp_path,
+        "notes.md",
+        "# Notes\n\nThis document discusses Generator: RepoLocus in ordinary prose.\n",
+    )
+
+    result = RepositoryScanner().scan(tmp_path)
+
+    assert [file.path for file in result.files] == ["notes.md"]
+    assert result.files[0].provenance == "source"
+    assert result.stats.skipped["generated"] == 3
+
+
+def test_secret_detection_is_reapplied_before_cached_fact_reuse(tmp_path: Path) -> None:
+    text = 'api_key = "sk-abcdefghijklmnopqrstuvwxyz1234"\n'
+    source = _write(tmp_path, "settings.py", text)
+    metadata = source.stat()
+    cached = ScannedFile(
+        path="settings.py",
+        language="python",
+        size_bytes=len(text.encode()),
+        sha256=hashlib.sha256(text.encode()).hexdigest(),
+        line_count=1,
+        text=text,
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+    )
+
+    result = RepositoryScanner().scan(tmp_path, cached_files={cached.path: cached})
+
+    assert result.files == []
+    assert result.stats.skipped == {"likely_secret": 1}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd/openat is POSIX-only")
+def test_directory_swap_to_outside_symlink_is_never_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    nested = repository / "nested"
+    nested.mkdir(parents=True)
+    _write(repository, "nested/value.py", "VALUE = 'inside'\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, "value.py", "VALUE = 'stolen-outside'\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    original_open_directory = scanner_repository._open_directory_at
+    swapped = False
+
+    def swap_before_open(
+        name: str, expected: os.stat_result, directory_fd: int
+    ) -> tuple[int | None, str | None]:
+        nonlocal swapped
+        if name == "nested" and not swapped:
+            swapped = True
+            nested.rename(repository / "original-nested")
+            nested.symlink_to(outside, target_is_directory=True)
+        return original_open_directory(name, expected, directory_fd)
+
+    monkeypatch.setattr(scanner_repository, "_open_directory_at", swap_before_open)
+
+    result = RepositoryScanner().scan(repository)
+
+    assert result.files == []
+    assert result.temporarily_unreadable == ("nested",)
+    assert all("stolen-outside" not in warning for warning in result.warnings)
+
+
+def test_windows_reparse_attribute_is_explicitly_recognized() -> None:
+    from repolocus.scanner.repository import _is_reparse_point
+
+    assert _is_reparse_point(SimpleNamespace(st_file_attributes=0x400))  # type: ignore[arg-type]
+    assert not _is_reparse_point(  # type: ignore[arg-type]
+        SimpleNamespace(st_file_attributes=0)
+    )
+
+
+def test_safe_read_compares_metadata_from_matching_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(tmp_path, "app.py", "VALUE = 1\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    original_fstat = scanner_repository.os.fstat
+
+    def windows_like_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=metadata.st_ctime_ns + 1,
+        )
+
+    monkeypatch.setattr(scanner_repository.os, "fstat", windows_like_fstat)
+
+    payload, error = scanner_repository._safe_read(source, 100)
+
+    assert payload == b"VALUE = 1\n"
+    assert error is None
+
+
+def test_safe_read_keeps_handle_and_path_content_states_linked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(tmp_path, "app.py", "VALUE = 1\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    original_fstat = scanner_repository.os.fstat
+
+    def mismatched_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_size=metadata.st_size + 1,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=metadata.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(scanner_repository.os, "fstat", mismatched_fstat)
+
+    payload, error = scanner_repository._safe_read(source, 100)
+
+    assert payload is None
+    assert error == "changed_during_scan"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file identity semantics")
+def test_windows_path_and_handle_metadata_are_compared_consistently(tmp_path: Path) -> None:
+    _write(tmp_path, ".gitignore", "*.tmp\n")
+    source = _write(tmp_path, "nested/app.py", "VALUE = 1\n")
+
+    initial = RepositoryScanner().scan(tmp_path)
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    updated = RepositoryScanner().scan(tmp_path)
+
+    assert [item.path for item in initial.files] == [".gitignore", "nested/app.py"]
+    assert [item.path for item in updated.files] == [".gitignore", "nested/app.py"]
+    assert updated.files[1].text == "VALUE = 2\n"
+    for result in (initial, updated):
+        assert result.stats.skipped.get("changed_during_scan", 0) == 0
+        assert result.temporarily_unreadable == ()
+
+
 def test_sensitive_binary_oversize_and_likely_secret_files_are_filtered(tmp_path: Path) -> None:
     _write(tmp_path, ".env", "PASSWORD=correct-horse-battery-staple\n")
     _write(tmp_path, "id_rsa", "not actually a key\n")
@@ -217,13 +386,15 @@ def test_additional_cloud_and_database_credentials_are_detected(source: str) -> 
     assert contains_likely_secret(source)
 
 
-def test_invalid_gitignore_is_reported_without_aborting_scan(tmp_path: Path) -> None:
+def test_invalid_gitignore_fails_closed_without_scanning_siblings(tmp_path: Path) -> None:
     _write(tmp_path, ".gitignore", "!\n")
     _write(tmp_path, "safe.py", "def safe():\n    return True\n")
 
     result = RepositoryScanner().scan(tmp_path)
 
-    assert "safe.py" in {file.path for file in result.files}
+    assert result.files == []
+    assert result.temporarily_unreadable == (".",)
+    assert result.stats.skipped == {"unreadable_ignore": 1}
     assert any("invalid ignore file" in warning for warning in result.warnings)
 
 
@@ -243,6 +414,7 @@ def test_parse_plugin_failure_isolated_to_one_file(tmp_path: Path) -> None:
     assert result.files == []
     assert result.stats.skipped["parse_error"] == 1
     assert result.warnings == ["parse failed (RuntimeError) for file: bad.py"]
+    assert result.temporarily_unreadable == ("bad.py",)
 
 
 def test_parser_cannot_fabricate_source_ranges_or_content(tmp_path: Path) -> None:

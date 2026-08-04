@@ -18,6 +18,31 @@ def test_defaults_are_local_first_and_telemetry_is_off(tmp_path: Path) -> None:
     assert settings.telemetry is False
     assert settings.max_file_bytes == 1_000_000
     assert settings.context_char_budget == 24_000
+    assert settings.query_synonym_map == {}
+
+
+def test_query_synonyms_are_user_configurable_json(tmp_path: Path) -> None:
+    settings = Settings.load(
+        tmp_path,
+        environ={
+            "REPOLOCUS_QUERY_SYNONYMS": '{"configuration":["config","settings"],"配置":["config"]}'
+        },
+        user_config_path=tmp_path / "missing.toml",
+    )
+
+    assert settings.query_synonym_map == {
+        "configuration": ("config", "settings"),
+        "配置": ("config",),
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["[]", '{"term":[]}', '{"term":"not-a-list"}', '{"term":["\u001b"]}'],
+)
+def test_invalid_query_synonyms_are_rejected(value: str) -> None:
+    with pytest.raises(ConfigError, match=r"query_synonyms|synonym"):
+        Settings(query_synonyms=value)
 
 
 def test_pre_rename_environment_and_repository_config_are_not_loaded(tmp_path: Path) -> None:
