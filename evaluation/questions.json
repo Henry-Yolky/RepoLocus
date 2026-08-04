@@ -46,5 +46,15 @@
   {
     "question": "Where does clean refuse unsafe cache contents?",
     "expected_paths": ["src/repolocus/cli.py"]
+  },
+  {
+    "question": "配置在哪里校验",
+    "language": "zh",
+    "expected_paths": ["tests/test_terms.py"]
+  },
+  {
+    "question": "？？？",
+    "language": "no-answer",
+    "expected_paths": []
   }
 ]

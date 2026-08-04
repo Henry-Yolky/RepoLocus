@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from repolocus.security.display import has_unsafe_display_controls
 from repolocus.security.network import is_loopback_url
 
 DEFAULT_MODEL = "local"
@@ -38,6 +39,7 @@ _DEFAULTS: dict[str, object] = {
     "max_output_tokens": 2048,
     "max_file_bytes": 1_000_000,
     "context_char_budget": 24_000,
+    "query_synonyms": "{}",
 }
 
 _ALIASES = {
@@ -55,6 +57,7 @@ _ENV_KEYS = {
     "REPOLOCUS_MAX_OUTPUT_TOKENS": "max_output_tokens",
     "REPOLOCUS_MAX_FILE_BYTES": "max_file_bytes",
     "REPOLOCUS_CONTEXT_CHAR_BUDGET": "context_char_budget",
+    "REPOLOCUS_QUERY_SYNONYMS": "query_synonyms",
 }
 
 _SECRET_KEY_RE = re.compile(
@@ -98,6 +101,7 @@ class Settings:
     max_output_tokens: int = 2048
     max_file_bytes: int = 1_000_000
     context_char_budget: int = 24_000
+    query_synonyms: str = "{}"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
@@ -119,12 +123,19 @@ class Settings:
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ConfigError(f"{field_name} must be a positive integer")
+        _parse_query_synonyms(self.query_synonyms)
 
     @property
     def telemetry_enabled(self) -> bool:
         """Compatibility alias with an explicit boolean name."""
 
         return self.telemetry
+
+    @property
+    def query_synonym_map(self) -> dict[str, tuple[str, ...]]:
+        """Return validated, user-controlled retrieval synonyms."""
+
+        return _parse_query_synonyms(self.query_synonyms)
 
     @classmethod
     def load(
@@ -303,9 +314,55 @@ def _coerce_value(key: str, value: object, source: str) -> object:
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{source}: {key} must be an integer") from exc
         return parsed_int
+    if key == "query_synonyms":
+        if isinstance(value, Mapping):
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        elif isinstance(value, str):
+            encoded = value.strip()
+        else:
+            raise ConfigError(f"{source}: query_synonyms must be a JSON object or TOML table")
+        _parse_query_synonyms(encoded, source=source)
+        return encoded
     if not isinstance(value, str):
         raise ConfigError(f"{source}: {key} must be a string")
     return value.strip()
+
+
+def _parse_query_synonyms(
+    value: str,
+    *,
+    source: str = "query_synonyms",
+) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 32_768:
+        raise ConfigError(f"{source}: query_synonyms must be a JSON object under 32768 bytes")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{source}: query_synonyms must be valid JSON") from exc
+    if not isinstance(parsed, dict) or len(parsed) > 128:
+        raise ConfigError(f"{source}: query_synonyms must contain at most 128 terms")
+    normalized: dict[str, tuple[str, ...]] = {}
+    for raw_term, raw_expansions in parsed.items():
+        if not isinstance(raw_term, str) or not raw_term.strip() or len(raw_term) > 128:
+            raise ConfigError(f"{source}: synonym terms must be non-empty strings")
+        if has_unsafe_display_controls(raw_term):
+            raise ConfigError(f"{source}: synonym terms must not contain display controls")
+        if not isinstance(raw_expansions, list) or not 1 <= len(raw_expansions) <= 16:
+            raise ConfigError(f"{source}: each synonym term must map to 1-16 strings")
+        expansions: list[str] = []
+        for expansion in raw_expansions:
+            if (
+                not isinstance(expansion, str)
+                or not expansion.strip()
+                or len(expansion) > 128
+                or has_unsafe_display_controls(expansion)
+            ):
+                raise ConfigError(f"{source}: synonym expansions must be safe strings")
+            normalized_expansion = expansion.strip().casefold()
+            if normalized_expansion not in expansions:
+                expansions.append(normalized_expansion)
+        normalized[raw_term.strip().casefold()] = tuple(expansions)
+    return normalized
 
 
 def _read_config(path: Path, *, source: str) -> Mapping[str, Any]:

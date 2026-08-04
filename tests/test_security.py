@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -14,10 +15,14 @@ from repolocus.security import (
     PrivacyStore,
     PrivacyStoreError,
     build_cloud_send_preview,
+    canonical_endpoint,
     ensure_within_root,
     redact_secrets,
     require_provider_consent,
 )
+
+OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
 
 
 def test_canonical_path_check_accepts_descendants(tmp_path: Path) -> None:
@@ -86,10 +91,21 @@ def test_privacy_store_remembers_per_repo_provider_outside_repo(tmp_path: Path) 
     assert store.is_allowed(repo, "ollama/qwen3-coder") is True
     assert store.is_allowed(repo, "openai/gpt-test") is False
 
-    store.grant(repo, "openai/gpt-test")
+    store.grant(repo, "openai/gpt-test", OPENAI_ENDPOINT)
 
     assert store.status(repo) == {"openai": True}
-    assert store.is_allowed(repo, "openai/another-model") is True
+    assert store.grant_details(repo) == {
+        "openai": ("https://api.openai.com:443/v1/chat/completions",)
+    }
+    assert store.is_allowed(repo, "openai/another-model", OPENAI_ENDPOINT) is True
+    assert (
+        store.is_allowed(
+            repo,
+            "openai/another-model",
+            "https://compatible.example.invalid/v1/chat/completions",
+        )
+        is False
+    )
     raw_state = state_path.read_text(encoding="utf-8")
     assert "gpt-test" not in raw_state
 
@@ -102,7 +118,7 @@ def test_pre_rename_consent_is_not_inherited(tmp_path: Path, isolated_user_dirs:
     repo.mkdir()
     legacy_path = Path(user_state_dir("devpilot", appauthor=False)) / "privacy.json"
     current_path = Path(user_state_dir("repolocus", appauthor=False)) / "privacy.json"
-    PrivacyStore(legacy_path).grant(repo, "openai")
+    PrivacyStore(legacy_path).grant(repo, "openai", OPENAI_ENDPOINT)
 
     current_store = PrivacyStore()
 
@@ -127,7 +143,7 @@ def test_privacy_store_requests_restrictive_permissions(
 
     monkeypatch.setattr(Path, "chmod", record_chmod)
 
-    store.grant(repo, "openai")
+    store.grant(repo, "openai", OPENAI_ENDPOINT)
 
     assert (state_path.parent, 0o700) in chmod_calls
     assert (state_path, 0o600) in chmod_calls
@@ -143,7 +159,7 @@ def test_privacy_store_enforces_posix_modes(tmp_path: Path) -> None:
     state_path = tmp_path / "state" / "privacy.json"
     store = PrivacyStore(state_path)
 
-    store.grant(repo, "openai")
+    store.grant(repo, "openai", OPENAI_ENDPOINT)
 
     assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
@@ -156,9 +172,9 @@ def test_privacy_store_revoke_all_is_repository_scoped(tmp_path: Path) -> None:
     repo_a.mkdir()
     repo_b.mkdir()
     store = PrivacyStore(tmp_path / "state" / "privacy.json")
-    store.grant(repo_a, "openai")
-    store.grant(repo_a, "anthropic")
-    store.grant(repo_b, "openai")
+    store.grant(repo_a, "openai", OPENAI_ENDPOINT)
+    store.grant(repo_a, "anthropic", ANTHROPIC_ENDPOINT)
+    store.grant(repo_b, "openai", OPENAI_ENDPOINT)
 
     store.revoke(repo_a)
 
@@ -170,7 +186,7 @@ def test_privacy_store_refuses_state_inside_repository(tmp_path: Path) -> None:
     store = PrivacyStore(tmp_path / ".repolocus-privacy.json")
 
     with pytest.raises(PrivacyStoreError, match="outside the repository"):
-        store.grant(tmp_path, "openai")
+        store.grant(tmp_path, "openai", OPENAI_ENDPOINT)
 
 
 def test_privacy_store_does_not_silently_replace_corrupt_state(tmp_path: Path) -> None:
@@ -190,8 +206,61 @@ def test_cloud_consent_guard_distinguishes_local_and_cloud(tmp_path: Path) -> No
 
     require_provider_consent(repo, "ollama/model", store)
     with pytest.raises(ConsentRequiredError, match="explicit consent"):
-        require_provider_consent(repo, "anthropic/model", store)
-    require_provider_consent(repo, "anthropic/model", store, allow_once=True)
+        require_provider_consent(
+            repo,
+            "anthropic/model",
+            store,
+            endpoint=ANTHROPIC_ENDPOINT,
+        )
+    require_provider_consent(
+        repo,
+        "anthropic/model",
+        store,
+        allow_once=True,
+        endpoint=ANTHROPIC_ENDPOINT,
+    )
+
+
+def test_canonical_endpoint_binds_scheme_host_port_and_path() -> None:
+    assert (
+        canonical_endpoint("HTTPS://API.OPENAI.COM/v1/chat/completions")
+        == "https://api.openai.com:443/v1/chat/completions"
+    )
+    assert canonical_endpoint("https://[::1]/v1") == "https://[::1]:443/v1"
+    assert canonical_endpoint("https://api.openai.com:8443/v1") != canonical_endpoint(
+        "https://api.openai.com/v1"
+    )
+
+
+def test_canonical_endpoint_rejects_empty_hostname_after_normalization() -> None:
+    with pytest.raises(ValueError, match="invalid hostname"):
+        canonical_endpoint("https://./v1/chat")
+
+
+def test_family_only_v1_grants_are_migrated_fail_closed(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_path = tmp_path / "privacy.json"
+    repository_id = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repositories": {
+                    repository_id: {
+                        "path": str(repo.resolve()),
+                        "providers": {"openai": {"granted_at": "2026-01-01T00:00:00Z"}},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = PrivacyStore(state_path)
+
+    assert store.status(repo) == {}
+    assert store.is_allowed(repo, "openai", OPENAI_ENDPOINT) is False
 
 
 def test_cloud_send_preview_is_content_free_and_counts_redaction() -> None:

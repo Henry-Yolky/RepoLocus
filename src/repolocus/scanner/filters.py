@@ -52,6 +52,21 @@ LANGUAGE_EXTENSIONS: dict[str, str] = {
     ".sum": "config",
 }
 
+_GENERATED_MARKER = re.compile(
+    r"^[ \t]*<!--[ \t]*Generator:[ \t]*(?:RepoLocus|DevPilot)"
+    r"(?:[ \t]+[^;<>\r\n]+)?;[ \t]*deterministic[ \t]+"
+    r"(?:source[ \t]+map|static[ \t]+graph)\.[ \t]*-->[ \t]*$"
+)
+
+
+def is_generated_document(text: str, language: str) -> bool:
+    """Recognize only exact RepoLocus headers near a Markdown document start."""
+
+    if language != "markdown":
+        return False
+    return any(_GENERATED_MARKER.fullmatch(line) for line in text[:4096].splitlines()[:16])
+
+
 CONFIG_FILENAMES = frozenset(
     {
         ".editorconfig",

@@ -96,9 +96,17 @@ def test_remembered_cloud_grant_still_prints_exact_preview(
         name = "openai"
 
         def generate(self, system_prompt: str, user_prompt: str) -> str:
-            return "Configuration is loaded here [[src/demo/config.py:1]]."
+            return (
+                "Configuration is loaded here [[src/demo/config.py:1]].\n"
+                'Evidence quote: "def load_config(path: str) -> dict:" '
+                "[[src/demo/config.py:1]]"
+            )
 
-    PrivacyStore().grant(sample_repo, "openai")
+    PrivacyStore().grant(
+        sample_repo,
+        "openai",
+        "https://api.openai.com/v1/chat/completions",
+    )
     monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
 
     result = runner.invoke(
@@ -198,6 +206,14 @@ def test_generated_output_refuses_escape_and_unrecognized_overwrite(
     assert escape.exit_code == 1
     assert "escapes repository root" in escape.output
 
+    existing.write_text(
+        "User notes mentioning Generator: RepoLocus are not generated output.\n",
+        encoding="utf-8",
+    )
+    prose_marker = runner.invoke(app, ["map", str(sample_repo)])
+    assert prose_marker.exit_code == 1
+    assert "not recognized as generated" in prose_marker.output
+
 
 def test_generated_output_migrates_the_pre_rename_marker(
     sample_repo: Path, isolated_user_dirs: Path
@@ -296,6 +312,73 @@ def test_serve_requires_opt_in_for_non_loopback_host(
 
     assert result.exit_code == 1
     assert "--allow-remote" in result.output
+
+
+def test_serve_requires_tls_and_allowed_host_for_non_loopback(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+) -> None:
+    without_tls = runner.invoke(
+        app,
+        [
+            "serve",
+            "--root",
+            str(sample_repo),
+            "--host",
+            "0.0.0.0",
+            "--allow-remote",
+            "--allowed-host",
+            "repolocus.example",
+        ],
+    )
+
+    assert without_tls.exit_code == 1
+    assert "requires TLS" in without_tls.output
+
+
+def test_serve_passes_tls_auth_and_host_controls(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    certificate = tmp_path / "server.crt"
+    key = tmp_path / "server.key"
+    certificate.write_text("test certificate", encoding="utf-8")
+    key.write_text("test key", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(application, **kwargs: object) -> None:  # type: ignore[no-untyped-def]
+        captured["application"] = application
+        captured.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    token = "a" * 32
+    result = runner.invoke(
+        app,
+        [
+            "serve",
+            "--root",
+            str(sample_repo),
+            "--host",
+            "0.0.0.0",
+            "--allow-remote",
+            "--allowed-host",
+            "repolocus.example",
+            "--ssl-certfile",
+            str(certificate),
+            "--ssl-keyfile",
+            str(key),
+            "--api-token",
+            token,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "0.0.0.0"
+    assert captured["ssl_certfile"] == str(certificate)
+    assert captured["ssl_keyfile"] == str(key)
+    assert captured["application"].state.api_token == token  # type: ignore[union-attr]
 
 
 def test_follow_up_session_is_in_memory_and_source_backed(

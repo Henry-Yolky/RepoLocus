@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -47,6 +48,12 @@ app.add_typer(privacy_app, name="privacy")
 console = Console()
 error_console = Console(stderr=True)
 
+_GENERATED_OUTPUT_MARKER = re.compile(
+    r"^[ \t]*<!--[ \t]*Generator:[ \t]*(?:RepoLocus|DevPilot)"
+    r"(?:[ \t]+[^;<>\r\n]+)?;[ \t]*deterministic[ \t]+"
+    r"(?:source[ \t]+map|static[ \t]+graph)\.[ \t]*-->[ \t]*$"
+)
+
 RepoArgument = Annotated[
     Path,
     typer.Argument(
@@ -54,7 +61,7 @@ RepoArgument = Annotated[
         exists=True,
         file_okay=False,
         dir_okay=True,
-        resolve_path=True,
+        resolve_path=False,
     ),
 ]
 
@@ -141,7 +148,7 @@ def _generated_file(root: Path, requested: Path, content: str, force: bool) -> P
             raise ValueError(f"refusing to replace non-regular output: {destination}")
         prior = destination.read_text(encoding="utf-8", errors="replace")[:4096]
         generated = any(
-            marker in prior for marker in ("Generator: RepoLocus", "Generator: DevPilot")
+            _GENERATED_OUTPUT_MARKER.fullmatch(line) for line in prior.splitlines()[:16]
         )
         if not (force or generated):
             raise ValueError(
@@ -271,11 +278,15 @@ def map_command(
     force: Annotated[
         bool, typer.Option("--force", help="Replace a non-generated output file.")
     ] = False,
+    refresh: Annotated[
+        str,
+        typer.Option("--refresh", help="Index refresh mode: auto, always, or never."),
+    ] = "auto",
 ) -> None:
     """Generate a stable, source-linked PROJECT_MAP.md."""
 
     try:
-        document, operation = _service(path).map(path)
+        document, operation = _service(path).map(path, refresh=refresh)  # type: ignore[arg-type]
         if stdout:
             sys.stdout.write(document)
             return
@@ -302,11 +313,18 @@ def diagram(
     force: Annotated[
         bool, typer.Option("--force", help="Replace a non-generated output file.")
     ] = False,
+    refresh: Annotated[
+        str,
+        typer.Option("--refresh", help="Index refresh mode: auto, always, or never."),
+    ] = "auto",
 ) -> None:
     """Generate a deterministic, validated Mermaid architecture graph."""
 
     try:
-        document, operation = _service(path).diagram(path)
+        document, operation = _service(path).diagram(  # type: ignore[arg-type]
+            path,
+            refresh=refresh,
+        )
         if stdout:
             sys.stdout.write(document)
             return
@@ -347,6 +365,10 @@ def ask(
             help="Keep an in-memory question session until an empty line; incompatible with JSON.",
         ),
     ] = False,
+    refresh: Annotated[
+        str,
+        typer.Option("--refresh", help="Index refresh mode: auto, always, or never."),
+    ] = "auto",
 ) -> None:
     """Answer with retrieved, line-addressable source evidence."""
 
@@ -363,8 +385,11 @@ def ask(
                 error_console.print(
                     "Cloud send preview: "
                     f"provider={escape_untrusted_display(send_preview.provider)}, "
+                    f"model={escape_untrusted_display(send_preview.model)}, "
+                    f"endpoint={escape_untrusted_display(send_preview.endpoint or 'none')}, "
                     f"fragments={send_preview.fragment_count}, "
-                    f"estimated_tokens={send_preview.estimated_tokens}",
+                    f"estimated_tokens={send_preview.estimated_tokens}, "
+                    f"payload_bytes={send_preview.payload_bytes}",
                     markup=False,
                     highlight=False,
                 )
@@ -378,6 +403,7 @@ def ask(
             allow_cloud=allow_cloud,
             remember_consent=remember_consent,
             preview_callback=show_preview,
+            refresh=refresh,  # type: ignore[arg-type]
         )
     except PrivacyRequiredError as exc:
         payload = exc.preview.to_dict() | {"fragments": _preview_fragments(exc.evidence)}
@@ -387,8 +413,11 @@ def ask(
         error_console.print("[yellow]Cloud send preview[/yellow]")
         error_console.print(
             f"Provider: {escape_untrusted_display(str(payload['provider']))}; "
+            f"model: {escape_untrusted_display(str(payload['model']))}; "
+            f"endpoint: {escape_untrusted_display(str(payload['endpoint']))}; "
             f"fragments: {payload['fragment_count']}; "
             f"estimated tokens: {payload['estimated_tokens']}; "
+            f"payload bytes: {payload['payload_bytes']}; "
             f"redactions: {payload['redaction_count']}",
             markup=False,
             highlight=False,
@@ -408,6 +437,7 @@ def ask(
                 ],
                 "preview": preview_data.to_dict(),
                 "root": str(operation.result.root),
+                "generation": operation.update.generation,
             }
         )
         return
@@ -417,6 +447,7 @@ def ask(
         return
 
     history = [question]
+    session_generation = operation.update.generation
     while True:
         next_question = console.input("\nFollow-up (blank to finish): ").strip()
         if not next_question:
@@ -432,6 +463,8 @@ def ask(
                 allow_cloud=allow_cloud,
                 remember_consent=remember_consent,
                 preview_callback=show_preview,
+                refresh="never",
+                expected_generation=session_generation,
             )
         except PrivacyRequiredError as exc:
             error_console.print("Cloud send preview", markup=False)
@@ -453,8 +486,15 @@ def privacy_status(
 
     try:
         root = path.resolve(strict=True)
-        grants = PrivacyStore().status(root)
-        data = {"repository": str(root), "telemetry": False, "grants": grants}
+        store = PrivacyStore()
+        grants = store.status(root)
+        grant_targets = store.grant_details(root)
+        data = {
+            "repository": str(root),
+            "telemetry": False,
+            "grants": grants,
+            "grant_targets": grant_targets,
+        }
     except (OSError, ValueError, RuntimeError) as exc:
         _fail(exc)
     if json_output:
@@ -473,6 +513,12 @@ def privacy_status(
                 markup=False,
                 highlight=False,
             )
+            for endpoint in grant_targets.get(provider, ()):
+                console.print(
+                    f"  {escape_untrusted_display(endpoint)}",
+                    markup=False,
+                    highlight=False,
+                )
     else:
         console.print("Remembered cloud providers: none")
 
@@ -501,7 +547,12 @@ def privacy_preview(
         highlight=False,
     )
     console.print(
+        f"Model: {escape_untrusted_display(str(data['model']))}; "
+        f"endpoint: {escape_untrusted_display(str(data['endpoint']))}"
+    )
+    console.print(
         f"Fragments: {data['fragment_count']}; estimated tokens: {data['estimated_tokens']}; "
+        f"payload bytes: {data['payload_bytes']}; "
         f"redactions: {data['redaction_count']}"
     )
     _print_preview_fragments(evidence)
@@ -517,7 +568,17 @@ def privacy_grant(
 
     try:
         root = path.resolve(strict=True)
-        PrivacyStore().grant(root, provider)
+        selected_provider = provider.strip()
+        if selected_provider.casefold() == "ollama-remote":
+            consent_model = "ollama/consent"
+        elif "/" in selected_provider or ":" in selected_provider:
+            consent_model = selected_provider
+        else:
+            consent_model = f"{selected_provider}/consent"
+        service = _service(root)
+        scope = service.consent_scope(consent_model)
+        endpoint = service.consent_endpoint(consent_model)
+        PrivacyStore().grant(root, scope, endpoint)
     except (OSError, ValueError, RuntimeError) as exc:
         _fail(exc)
     console.print(
@@ -723,6 +784,34 @@ def serve(
         bool,
         typer.Option("--allow-cloud-api", help="Permit API clients to request cloud models."),
     ] = False,
+    api_token: Annotated[
+        str | None,
+        typer.Option(
+            "--api-token",
+            envvar="REPOLOCUS_API_TOKEN",
+            help="Bearer token; defaults to a random token printed once at startup.",
+        ),
+    ] = None,
+    allowed_host: Annotated[
+        list[str] | None,
+        typer.Option("--allowed-host", help="Accepted HTTP Host value; repeat as needed."),
+    ] = None,
+    ssl_certfile: Annotated[
+        Path | None,
+        typer.Option("--ssl-certfile", exists=True, file_okay=True, dir_okay=False),
+    ] = None,
+    ssl_keyfile: Annotated[
+        Path | None,
+        typer.Option("--ssl-keyfile", exists=True, file_okay=True, dir_okay=False),
+    ] = None,
+    max_request_body_bytes: Annotated[
+        int,
+        typer.Option("--max-request-body-bytes", min=1024),
+    ] = 65_536,
+    max_concurrent_requests: Annotated[
+        int,
+        typer.Option("--max-concurrent-requests", min=1, max=128),
+    ] = 4,
 ) -> None:
     """Start the optional self-hosted HTTP API."""
 
@@ -732,16 +821,45 @@ def serve(
         from repolocus.api import create_app
     except ImportError:
         _fail(RuntimeError("API dependencies are missing; install repolocus[api]"))
-    if not _is_loopback_host(host) and not allow_remote:
+    remote = not _is_loopback_host(host)
+    if remote and not allow_remote:
         _fail(RuntimeError("non-loopback binding requires --allow-remote"))
+    if (ssl_certfile is None) != (ssl_keyfile is None):
+        _fail(RuntimeError("--ssl-certfile and --ssl-keyfile must be provided together"))
+    if remote and (ssl_certfile is None or ssl_keyfile is None):
+        _fail(RuntimeError("non-loopback binding requires TLS certificate and key files"))
+    configured_hosts = tuple(allowed_host or ())
+    if remote and not configured_hosts:
+        _fail(RuntimeError("non-loopback binding requires at least one --allowed-host"))
+    if not configured_hosts:
+        configured_hosts = ("localhost", "127.0.0.1", "::1", host)
+    token = api_token.strip() if api_token is not None else secrets.token_urlsafe(32)
+    if len(token) < 24 or any(
+        ord(character) < 0x21 or ord(character) > 0x7E for character in token
+    ):
+        _fail(RuntimeError("API token must contain at least 24 printable non-space characters"))
     try:
         api_root = root.expanduser().resolve(strict=True)
         if not api_root.is_dir():
             raise ValueError(f"API root is not a directory: {api_root}")
     except (OSError, ValueError) as exc:
         _fail(exc)
-    uvicorn.run(
-        create_app(api_root, allow_cloud_requests=allow_cloud_api),
-        host=host,
-        port=port,
+    if api_token is None:
+        error_console.print(
+            f"Generated API Bearer token: {token}",
+            markup=False,
+            highlight=False,
+        )
+    application = create_app(
+        api_root,
+        allow_cloud_requests=allow_cloud_api,
+        api_token=token,
+        allowed_hosts=configured_hosts,
+        max_request_body_bytes=max_request_body_bytes,
+        max_concurrent_requests=max_concurrent_requests,
     )
+    uvicorn_options: dict[str, object] = {"host": host, "port": port}
+    if ssl_certfile is not None and ssl_keyfile is not None:
+        uvicorn_options["ssl_certfile"] = str(ssl_certfile)
+        uvicorn_options["ssl_keyfile"] = str(ssl_keyfile)
+    uvicorn.run(application, **uvicorn_options)

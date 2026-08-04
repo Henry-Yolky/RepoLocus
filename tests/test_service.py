@@ -1,18 +1,43 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from repolocus.config import Settings
 from repolocus.core import PrivacyRequiredError, RepoLocusService
-from repolocus.models import Evidence
+from repolocus.index import RepositoryIndex, StaleScanError
+from repolocus.models import Evidence, ScannedFile, ScanResult, ScanStats
+from repolocus.scanner import RepositoryScanner
 from repolocus.security import CloudSendPreview, PrivacyStore
 
 
 def _service(root: Path, state: Path, *, model: str = "local") -> RepoLocusService:
     settings = Settings(model=model)
     return RepoLocusService(settings, privacy=PrivacyStore(state / "privacy.json"))
+
+
+class RecordingScanner(RepositoryScanner):
+    def __init__(self, *, analysis_version: str = "service-test") -> None:
+        super().__init__(analysis_version=analysis_version)
+        self.calls: list[tuple[int | None, tuple[str, ...]]] = []
+
+    def scan(
+        self,
+        root: Path | str,
+        *,
+        cached_files: Mapping[str, ScannedFile] | None = None,
+        base_generation: int | None = None,
+    ) -> ScanResult:
+        self.calls.append((base_generation, tuple(sorted((cached_files or {}).keys()))))
+        return super().scan(
+            root,
+            cached_files=cached_files,
+            base_generation=base_generation,
+        )
 
 
 def test_end_to_end_local_workflow_is_incremental(
@@ -55,6 +80,219 @@ def test_changed_file_updates_only_changed_content(
     assert update.update.added == 0
 
 
+def test_scan_seeds_cache_and_cas_from_one_index_snapshot(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+
+    first = service.scan(sample_repo)
+    second = service.scan(sample_repo)
+
+    assert scanner.calls[0] == (0, ())
+    assert scanner.calls[1][0] == first.update.generation
+    assert "src/demo/config.py" in scanner.calls[1][1]
+    assert second.update.generation == first.update.generation + 1
+    assert second.update.unchanged == first.result.stats.indexed_files
+
+
+def test_scan_retries_an_unpinned_stale_generation(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+    original_update = RepositoryIndex.update
+    first_call = True
+
+    def commit_then_report_stale(index: RepositoryIndex, result: ScanResult):
+        nonlocal first_call
+        update = original_update(index, result)
+        if first_call:
+            first_call = False
+            raise StaleScanError("simulated competing scan")
+        return update
+
+    monkeypatch.setattr(RepositoryIndex, "update", commit_then_report_stale)
+
+    operation = service.scan(sample_repo)
+
+    assert len(scanner.calls) == 2
+    assert scanner.calls[0][0] == 0
+    assert scanner.calls[1][0] == 1
+    assert operation.update.generation == 2
+
+
+def test_refresh_modes_are_shared_by_generation_and_question_workflows(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+
+    with pytest.raises(RuntimeError, match="no valid index snapshot"):
+        service.map(sample_repo, refresh="never")
+    assert scanner.calls == []
+
+    _project_map, auto = service.map(sample_repo, refresh="auto")
+    generation = auto.update.generation
+    assert len(scanner.calls) == 1
+
+    service.diagram(sample_repo, refresh="never", expected_generation=generation)
+    service.evidence(
+        "Where is load_config defined?",
+        sample_repo,
+        refresh="never",
+        expected_generation=generation,
+    )
+    service.preview(
+        "Where is load_config defined?",
+        sample_repo,
+        refresh="never",
+        expected_generation=generation,
+    )
+    service.prepare_ask(
+        "Where is load_config defined?",
+        sample_repo,
+        refresh="never",
+        expected_generation=generation,
+    )
+    service.ask(
+        "Where is load_config defined?",
+        sample_repo,
+        refresh="never",
+        expected_generation=generation,
+    )
+    assert len(scanner.calls) == 1
+
+    _refreshed_map, refreshed = service.map(sample_repo, refresh="always")
+    assert len(scanner.calls) == 2
+    assert refreshed.update.generation == generation + 1
+
+    with pytest.raises(StaleScanError, match="expected index generation"):
+        service.ask(
+            "Where is load_config defined?",
+            sample_repo,
+            refresh="never",
+            expected_generation=generation,
+        )
+    with pytest.raises(ValueError, match="refresh must be one of"):
+        service.map(sample_repo, refresh="sometimes")  # type: ignore[arg-type]
+
+
+def test_never_rejects_an_incompatible_snapshot_and_auto_rebuilds_it(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    original = _service(sample_repo, isolated_user_dirs)
+    original.scan(sample_repo)
+    scanner = RecordingScanner(analysis_version="future-parser")
+    upgraded = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+
+    with pytest.raises(RuntimeError, match="no valid index snapshot"):
+        upgraded.map(sample_repo, refresh="never")
+
+    _document, operation = upgraded.map(sample_repo, refresh="auto")
+
+    assert len(scanner.calls) == 1
+    assert scanner.calls[0][1] == ()
+    assert operation.result.analysis_version == scanner.analysis_version
+
+
+def test_snapshot_operation_contains_only_fresh_source_files(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs)
+    service.scan(sample_repo)
+
+    with RepositoryIndex.open(sample_repo) as index:
+        snapshot = index.snapshot()
+        reclassified = [
+            replace(file, provenance="generated") if file.path == "README.md" else file
+            for file in snapshot.files
+        ]
+        first = index.update(
+            ScanResult(
+                sample_repo,
+                reclassified,
+                ScanStats(),
+                analysis_version=snapshot.analysis_version,
+                base_generation=snapshot.generation,
+            )
+        )
+        second = index.update(
+            ScanResult(
+                sample_repo,
+                [file for file in reclassified if file.path != "pyproject.toml"],
+                ScanStats(),
+                analysis_version=snapshot.analysis_version,
+                temporarily_unreadable=("pyproject.toml",),
+                base_generation=first.generation,
+            )
+        )
+
+    _document, operation = service.map(
+        sample_repo,
+        refresh="never",
+        expected_generation=second.generation,
+    )
+    paths = {file.path for file in operation.result.files}
+
+    assert "README.md" not in paths
+    assert "pyproject.toml" not in paths
+    assert paths
+    assert all(file.provenance == "source" and not file.stale for file in operation.result.files)
+    assert operation.result.stats.indexed_files == len(paths)
+    assert operation.result.temporarily_unreadable == ("pyproject.toml",)
+    assert operation.update.stale == 1
+    assert any("excludes 1 stale file" in warning for warning in operation.result.warnings)
+
+
+def test_service_rejects_a_symlink_repository_root(
+    sample_repo: Path, isolated_user_dirs: Path, tmp_path: Path
+) -> None:
+    linked = tmp_path / "linked-repository"
+    linked.symlink_to(sample_repo, target_is_directory=True)
+    service = _service(sample_repo, isolated_user_dirs)
+
+    with pytest.raises(ValueError, match="symbolic link or reparse point"):
+        service.scan(linked)
+
+
+def test_empty_committed_snapshot_is_valid_for_auto_refresh(
+    tmp_path: Path, isolated_user_dirs: Path
+) -> None:
+    repository = tmp_path / "empty"
+    repository.mkdir()
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+
+    first = service.scan(repository)
+    _document, cached = service.map(repository, refresh="auto")
+
+    assert len(scanner.calls) == 1
+    assert first.update.generation == cached.update.generation
+
+
 def test_cloud_call_is_stopped_before_provider_creation(
     sample_repo: Path, isolated_user_dirs: Path
 ) -> None:
@@ -64,6 +302,9 @@ def test_cloud_call_is_stopped_before_provider_creation(
         service.ask("Where is load_config defined?", sample_repo)
 
     assert raised.value.preview.provider == "openai"
+    assert raised.value.preview.model == "openai/test-model"
+    assert raised.value.preview.endpoint == "https://api.openai.com:443/v1/chat/completions"
+    assert raised.value.preview.payload_bytes > 0
     assert "src/demo/config.py" in raised.value.preview.paths
     assert not service.privacy.is_allowed(sample_repo, "openai")
 
@@ -82,6 +323,33 @@ def test_remote_ollama_requires_cloud_consent(sample_repo: Path, isolated_user_d
         service.ask("Where is load_config defined?", sample_repo)
 
     assert raised.value.preview.provider == "ollama-remote"
+    assert raised.value.preview.endpoint == "https://ollama.example.invalid:443/api/chat"
+
+
+def test_remembered_consent_does_not_follow_changed_compatible_endpoint(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+) -> None:
+    privacy = PrivacyStore(isolated_user_dirs / "privacy.json")
+    privacy.grant(
+        sample_repo,
+        "openai",
+        "https://api.openai.com/v1/chat/completions",
+    )
+    service = RepoLocusService(
+        Settings(
+            model="openai/test-model",
+            openai_base_url="https://compatible.example.invalid/v1",
+        ),
+        privacy=privacy,
+    )
+
+    with pytest.raises(PrivacyRequiredError) as raised:
+        service.ask("Where is load_config defined?", sample_repo)
+
+    assert raised.value.preview.endpoint == (
+        "https://compatible.example.invalid:443/v1/chat/completions"
+    )
 
 
 def test_cloud_send_uses_the_exact_evidence_shown_in_preview(
@@ -96,7 +364,11 @@ def test_cloud_send_uses_the_exact_evidence_shown_in_preview(
 
         def generate(self, system_prompt: str, user_prompt: str) -> str:
             captured["prompt"] = user_prompt
-            return "The function is defined here [[src/demo/config.py:1]]."
+            return (
+                "The function is defined here [[src/demo/config.py:1]].\n"
+                'Evidence quote: "def load_config(path: str) -> dict:" '
+                "[[src/demo/config.py:1]]"
+            )
 
     monkeypatch.setattr(
         "repolocus.core.service.create_provider",
@@ -131,13 +403,17 @@ def test_model_citation_validation_accepts_only_retrieved_ranges(
     evidence = [Evidence("src/demo/config.py", 1, 3, "def load_config(): ...", 1.0, "load_config")]
 
     accepted = service._validate_model_text(
-        "Configuration is loaded here [[src/demo/config.py:1-2]].", evidence
+        "Configuration is loaded here [[src/demo/config.py:1-2]].\n"
+        'Evidence quote: "def load_config(): ..." [[src/demo/config.py:1-2]]',
+        evidence,
     )
     wrong_line = service._validate_model_text("Unsupported [[src/demo/config.py:9-12]].", evidence)
     wrong_file = service._validate_model_text("Fabricated [[src/demo/missing.py:1]].", evidence)
 
     assert accepted == (
-        "Configuration is loaded here [src/demo/config.py:1-2](src/demo/config.py#L1)."
+        "Configuration is loaded here [src/demo/config.py:1-2](src/demo/config.py#L1).\n"
+        'Evidence quote: "def load_config(): ..." '
+        "[src/demo/config.py:1-2](src/demo/config.py#L1)"
     )
     assert wrong_line is None
     assert wrong_file is None
@@ -176,10 +452,31 @@ def test_context_escapes_source_delimiters_and_limits_citable_ranges(
     bounded, _ = service._bounded_evidence(evidence)
     context, _ = service._context(evidence)
 
-    assert "&lt;/source&gt;" in context
+    records = [json.loads(line) for line in context.splitlines()]
+    assert records[0]["content"].startswith("</source>\nline 2")
+    assert len(records) == 1
     assert len(context) <= settings.context_char_budget
     assert bounded[0].end_line < 100
     assert service._validate_model_text("Claim here [[src/large.py:100]].", bounded) is None
+
+
+def test_json_context_and_exact_quote_preserve_source_markup(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs)
+    evidence = [Evidence("template.html", 1, 1, "<tag>a & b</tag>\n", 1.0)]
+
+    context, _ = service._context(evidence)
+    record = json.loads(context)
+    validated = service._validate_model_text(
+        "The template contains this element [[template.html:1]].\n"
+        'Evidence quote: "<tag>a & b</tag>" [[template.html:1]]',
+        evidence,
+    )
+
+    assert record["content"] == "<tag>a & b</tag>\n"
+    assert validated is not None
+    assert "&lt;tag&gt;a &amp; b&lt;/tag&gt;" in validated
 
 
 def test_model_output_requires_each_claim_to_have_a_citation(
@@ -222,7 +519,9 @@ def test_exact_insufficient_evidence_sentence_is_allowed_without_a_citation(
     evidence = [Evidence("src/demo/config.py", 1, 3, "def load_config(): ...", 1.0)]
 
     result = service._validate_model_text(
-        "Insufficient evidence. Configuration is here [[src/demo/config.py:1]].",
+        "Insufficient evidence.\n"
+        "Configuration is here [[src/demo/config.py:1]].\n"
+        'Evidence quote: "def load_config(): ..." [[src/demo/config.py:1]]',
         evidence,
     )
 

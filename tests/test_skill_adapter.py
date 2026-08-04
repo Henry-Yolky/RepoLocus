@@ -7,7 +7,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -175,6 +175,23 @@ def test_skill_adapter_ignores_path_hijack_under_parent_cwd(
     assert json.loads(result.stdout)["root"] == str(sample_repo.resolve())
 
 
+def test_skill_adapter_does_not_trust_an_unrelated_path_runtime(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    stale_directory = sample_repo.parent / "stale-runtime"
+    _write_path_hijack(stale_directory)
+    environment = dict(os.environ)
+    environment["PATH"] = os.pathsep.join(
+        (str(stale_directory), environment.get("PATH", os.defpath))
+    )
+
+    result = _run_adapter("scan", str(sample_repo), environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert "PATH_HIJACKED" not in result.stdout
+    assert json.loads(result.stdout)["root"] == str(sample_repo.resolve())
+
+
 def test_skill_adapter_rejects_python_interpreter_inside_target(
     sample_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -225,3 +242,167 @@ def test_skill_adapter_keeps_absolute_user_bin_while_sanitizing_environment(
     assert all(name not in environment for name in adapter._UV_ENVIRONMENT)
     assert "COVERAGE_PROCESS_START" not in environment
     assert "COV_CORE_SOURCE" not in environment
+
+
+def test_skill_adapter_uses_an_environment_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _load_adapter()
+    invocation_cwd = tmp_path / "work"
+    target = tmp_path / "target"
+    user_cache = tmp_path / "user-cache"
+    invocation_cwd.mkdir()
+    target.mkdir()
+    user_cache.mkdir()
+    monkeypatch.chdir(invocation_cwd)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(user_cache))
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    forbidden = (
+        "ALL_PROXY",
+        "ANTHROPIC_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "OPENAI_API_KEY",
+        "SSH_AUTH_SOCK",
+    )
+    for name in forbidden:
+        monkeypatch.setenv(name, "must-not-leak")
+
+    interpreter = adapter._trusted_interpreter(target.resolve())
+    trusted_roots = adapter._trusted_roots(target.resolve(), interpreter)
+    environment = adapter._execution_environment(
+        invocation_cwd=invocation_cwd.resolve(),
+        untrusted_roots=(target.resolve(), invocation_cwd.resolve()),
+        trusted_roots=trusted_roots,
+    )
+
+    assert environment["LANG"] == "C.UTF-8"
+    assert environment["XDG_CACHE_HOME"] == str(user_cache.resolve())
+    assert environment["REPOLOCUS_MODEL"] == "local"
+    assert environment["UV_OFFLINE"] == "1"
+    assert environment["UV_NO_SYNC"] == "1"
+    assert all(name not in environment for name in forbidden)
+    assert all("must-not-leak" not in value for value in environment.values())
+
+
+def test_source_checkout_runtime_is_forced_offline_and_no_sync(tmp_path: Path) -> None:
+    adapter = _load_adapter()
+    prefix = adapter._source_runtime_prefix(tmp_path / "uv", tmp_path / "source")
+
+    assert "--offline" in prefix
+    assert "--no-sync" in prefix
+    assert "--locked" in prefix
+    assert "--no-env-file" in prefix
+    assert prefix[-2:] == ["python", "-I"]
+
+
+def test_runtime_probe_validates_module_origin_and_compatible_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _load_adapter()
+    runtime_root = tmp_path / "runtime"
+    origin = runtime_root / "repolocus" / "__init__.py"
+    origin.parent.mkdir(parents=True)
+    origin.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"origin": str(origin), "version": "0.1.2"}),
+            stderr="",
+        ),
+    )
+
+    runtime = adapter._probe_runtime(
+        [str(tmp_path / "python"), "-I"],
+        environment={},
+        untrusted_roots=(tmp_path / "target",),
+        trusted_roots=(runtime_root,),
+        source="test",
+        expected_origin_root=runtime_root,
+    )
+
+    assert runtime.origin == origin.resolve()
+    assert runtime.version == "0.1.2"
+    assert runtime.prefix[-2:] == ("-m", "repolocus")
+
+
+@pytest.mark.parametrize("version", ["0.1.1", "0.2.0", "not-a-version"])
+def test_runtime_probe_rejects_incompatible_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    adapter = _load_adapter()
+    runtime_root = tmp_path / "runtime"
+    origin = runtime_root / "repolocus" / "__init__.py"
+    origin.parent.mkdir(parents=True)
+    origin.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        adapter.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"origin": str(origin), "version": version}),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(adapter.AdapterError, match=r"requires >=0\.1\.2,<0\.2\.0"):
+        adapter._probe_runtime(
+            [str(tmp_path / "python"), "-I"],
+            environment={},
+            untrusted_roots=(tmp_path / "target",),
+            trusted_roots=(runtime_root,),
+            source="test",
+        )
+
+
+def test_bootstrap_doctor_reports_runtime_failure_without_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    adapter = _load_adapter()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def unavailable(*args: object, **kwargs: object) -> object:
+        raise adapter.AdapterError("compatible runtime missing")
+
+    monkeypatch.setattr(adapter, "_runtime_command", unavailable)
+    monkeypatch.setattr(adapter.sys, "argv", [str(ADAPTER), "doctor", str(repository)])
+
+    assert adapter.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["bootstrap"] is True
+    runtime = next(check for check in payload["checks"] if check["name"] == "bootstrap_runtime")
+    assert runtime["ok"] is False
+    assert "compatible runtime missing" in runtime["detail"]
+
+
+def test_bootstrap_doctor_reports_path_resolution_failure_as_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    adapter = _load_adapter()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def cannot_resolve(*args: object, **kwargs: object) -> object:
+        raise OSError("filesystem lookup failed")
+
+    monkeypatch.setattr(adapter.Path, "resolve", cannot_resolve)
+    monkeypatch.setattr(adapter.sys, "argv", [str(ADAPTER), "doctor", str(repository)])
+
+    assert adapter.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["bootstrap"] is True
+    runtime = next(check for check in payload["checks"] if check["name"] == "bootstrap_runtime")
+    assert runtime["ok"] is False
+    assert "filesystem lookup failed" in runtime["detail"]

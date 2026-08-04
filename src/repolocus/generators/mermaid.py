@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from pathlib import PurePosixPath
 from urllib.parse import quote
 
-from repolocus.models import ScannedFile, ScanResult
+from repolocus.models import Dependency, ScannedFile, ScanResult
 from repolocus.security.display import escape_untrusted_display
 
 _NODE_RE = re.compile(r'^\s{4}(n_[a-f0-9]{10})\["([^"\\]|\\.)*"\]$')
@@ -37,6 +37,25 @@ def _node_id(label: str) -> str:
 def _escape_label(label: str) -> str:
     escaped = html.escape(escape_untrusted_display(label), quote=False)
     return escaped.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def _markdown_cell(value: str) -> str:
+    """Escape repository-controlled text for a Markdown table cell."""
+
+    return (
+        html.escape(escape_untrusted_display(value), quote=False)
+        .replace("`", "'")
+        .replace("|", "¦")
+    )
+
+
+def _source_link(path: str, line: int) -> str:
+    escaped = quote(path, safe="/._-")
+    visible = html.escape(escape_untrusted_display(f"{path}:{line}"), quote=False)
+    visible = visible.replace("\\", "\\\\")
+    for marker in ("[", "]", "|"):
+        visible = visible.replace(marker, f"\\{marker}")
+    return f"[{visible}]({escaped}#L{line})"
 
 
 def validate_mermaid(source: str) -> tuple[bool, str]:
@@ -106,6 +125,19 @@ class MermaidGenerator:
         )
 
     def generate_source(self, result: ScanResult) -> str:
+        selected, ranked_edges = self._graph_facts(result)
+        lines = ["flowchart LR"]
+        for group in sorted(selected):
+            lines.append(f'    {_node_id(group)}["{_escape_label(group)}"]')
+        for source_group, target_group, _count, _dependency in ranked_edges:
+            lines.append(f"    {_node_id(source_group)} --> {_node_id(target_group)}")
+        return "\n".join(lines) + "\n"
+
+    def _graph_facts(
+        self, result: ScanResult
+    ) -> tuple[set[str], list[tuple[str, str, int, Dependency]]]:
+        """Return the selected nodes and an import witness for every emitted edge."""
+
         groups: dict[str, list[ScannedFile]] = defaultdict(list)
         for file in result.files:
             groups[_group(file.path)].append(file)
@@ -113,6 +145,7 @@ class MermaidGenerator:
         selected = set(ranked_groups)
         aliases = self._aliases(groups)
         edges: Counter[tuple[str, str]] = Counter()
+        witnesses: dict[tuple[str, str], Dependency] = {}
         for file in result.files:
             source_group = _group(file.path)
             if source_group not in selected:
@@ -120,15 +153,22 @@ class MermaidGenerator:
             for dep in file.dependencies:
                 target_group = self._resolve_target(dep.target, aliases)
                 if target_group and target_group in selected and target_group != source_group:
-                    edges[(source_group, target_group)] += 1
-        lines = ["flowchart LR"]
-        for group in sorted(selected):
-            lines.append(f'    {_node_id(group)}["{_escape_label(group)}"]')
-        for (source_group, target_group), _ in sorted(
-            edges.items(), key=lambda item: (-item[1], item[0])
-        )[: self.max_edges]:
-            lines.append(f"    {_node_id(source_group)} --> {_node_id(target_group)}")
-        return "\n".join(lines) + "\n"
+                    edge = (source_group, target_group)
+                    edges[edge] += 1
+                    witness = witnesses.get(edge)
+                    if witness is None or (dep.source_path, dep.line, dep.target) < (
+                        witness.source_path,
+                        witness.line,
+                        witness.target,
+                    ):
+                        witnesses[edge] = dep
+        ranked_edges = [
+            (source_group, target_group, count, witnesses[(source_group, target_group)])
+            for (source_group, target_group), count in sorted(
+                edges.items(), key=lambda item: (-item[1], item[0])
+            )[: self.max_edges]
+        ]
+        return selected, ranked_edges
 
     def _aliases(self, groups: dict[str, list[ScannedFile]]) -> dict[str, str]:
         aliases: dict[str, str] = {}
@@ -188,14 +228,25 @@ class MermaidGenerator:
             witnesses.setdefault(group, (file.path, line))
         if not witnesses:
             return "No source files were indexed."
-        lines = ["| Node | Representative source |", "|---|---|"]
+        lines = ["### Node evidence", "", "| Node | Representative source |", "|---|---|"]
         for group, (path, line) in sorted(witnesses.items()):
-            escaped = quote(path, safe="/._-")
-            visible = html.escape(escape_untrusted_display(f"{path}:{line}"), quote=False)
-            visible = visible.replace("\\", "\\\\")
-            for marker in ("[", "]", "|"):
-                visible = visible.replace(marker, f"\\{marker}")
-            safe_group = html.escape(escape_untrusted_display(group), quote=False)
-            safe_group = safe_group.replace("`", "'").replace("|", "¦")
-            lines.append(f"| `{safe_group}` | [{visible}]({escaped}#L{line}) |")
+            lines.append(f"| `{_markdown_cell(group)}` | {_source_link(path, line)} |")
+        _selected, ranked_edges = self._graph_facts(result)
+        lines.extend(
+            [
+                "",
+                "### Edge evidence",
+                "",
+                "| Edge | Import target | Import evidence | Observations |",
+                "|---|---|---|---:|",
+            ]
+        )
+        if not ranked_edges:
+            lines.append("| (no resolved cross-node edges) | — | — | 0 |")
+        for source_group, target_group, count, dependency in ranked_edges:
+            edge = f"{source_group} -> {target_group}"
+            lines.append(
+                f"| `{_markdown_cell(edge)}` | `{_markdown_cell(dependency.target)}` | "
+                f"{_source_link(dependency.source_path, dependency.line)} | {count} |"
+            )
         return "\n".join(lines)

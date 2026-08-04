@@ -44,20 +44,35 @@ repolocus ask "请求如何进入核心循环？" --model ollama/qwen3-coder
 会将它按远程供应商处理并要求授权。明文 HTTP 仅允许用于回环地址，所有非回环供应商
 端点都必须使用 HTTPS；提示词会在发送前再次脱敏。
 
-云模型调用前，RepoLocus 会展示将发送的源码片段、文件列表和估算 Token 数。可用
-`--allow-cloud` 仅授权本次调用，或同时使用 `--remember-consent` 为当前仓库记住该供应商。
-`repolocus ask ... --follow-up` 可在当前进程内继续追问；输入空行即结束，问答历史不会落盘。
+云模型调用前，RepoLocus 会展示模型、规范化目的端点、精确序列化 payload 字节数、源码
+片段、文件列表和估算 Token 数。可用 `--allow-cloud` 仅授权本次调用，或同时使用
+`--remember-consent` 为当前仓库记住该供应商端点。v2 授权会绑定规范仓库路径、供应商、
+scheme、host、有效端口和完整请求路径；compatible endpoint 变化后必须重新授权。升级前的
+v1 供应商级授权会按 fail-closed 原则失效，需要重新 grant。
+`map`、`diagram` 和 `ask` 默认使用 `--refresh auto`：优先读取最近一次兼容的已提交 snapshot，
+仅在不存在兼容 snapshot 时扫描。`--refresh always` 会先扫描，`--refresh never` 禁止扫描并在
+没有兼容 snapshot 时失败。
+
+`repolocus ask ... --follow-up` 可在当前进程内继续追问；首次回答会固定 index generation，
+后续问题关闭 refresh 并要求同一 generation，若其他扫描推进 generation 则 fail closed。输入
+空行即结束，问答历史不会落盘。
 
 ## 已实现能力
 
 - 安全扫描：遵循 `.gitignore`，排除二进制、大文件、密钥文件、构建产物和符号链接；
 - 增量索引：仓库外 SQLite/FTS5 缓存，按文件哈希更新；
 - 项目地图：固定章节、源码链接和 `Confirmed` / `Inferred` / `Needs review` 标签；
-- 证据问答：符号、全文与依赖邻居混合检索，模型引用需经过校验；
-- 架构图：确定性生成 Mermaid，并附节点到源码的证据表；
+- 证据问答：符号、FTS5/BM25、term 索引与依赖邻居混合检索；term 索引拆分
+  camelCase、snake_case 和路径，并为连续 CJK 文本建立 bigram/trigram；用户可通过
+  `REPOLOCUS_QUERY_SYNONYMS` 的 JSON 显式增加同义词，仓库配置无权设置；
+- 模型校验：每个实质 claim 后必须紧跟相同 citation 和源码原文子串的 `Evidence quote`；
+  校验只确认地址和原文子串，不判断语义支持关系，通过后 confidence 仍为 `needs_review`；
+- 架构图：确定性生成 Mermaid，并为每个节点附代表源码、为每条边附一条具体 import 证据；
 - 模型适配：无模型提取式回答、Ollama、OpenAI-compatible、Anthropic；
-- 隐私控制：默认关闭遥测，云端逐次授权或按仓库记忆授权，可预览与撤回；
+- 隐私控制：默认关闭遥测，云端逐次授权或按仓库和端点记忆授权，可预览与撤回；
 - 自托管 API：安装 `api` 可选依赖后运行 `repolocus serve`。
+- 评测：输出 recall@k、MRR、nDCG@k、any/all-path、citation recall、no-answer
+  precision/accuracy 及按语言汇总；当前仍只是小型 regression set。
 
 ## Agent Skill
 
@@ -89,7 +104,9 @@ Copy-Item -Recurse -Force "skills/repolocus-analyze-repo" (Join-Path $env:CODEX_
 
 复制后请重启 Codex；如果宿主提供 Skill 注册表重载操作，也可以执行重载。之后以
 `$repolocus-analyze-repo` 调用。该 Skill 不暴露云端授权参数，Agent 不能通过这条路径
-静默把仓库内容发送给远程模型。
+静默把仓库内容发送给远程模型。Skill 压缩包只包含 adapter，不内置 RepoLocus runtime；
+必须预先提供兼容的已安装 runtime 或已同步的可信源码环境，adapter 全程 offline/no-sync，
+缺失或版本不兼容时直接 fail closed，不会自行下载依赖。
 
 ## 自托管 API
 
@@ -100,9 +117,19 @@ pipx install 'repolocus[api]'
 repolocus serve --root /path/to/allowed/repositories
 ```
 
-API 默认只监听回环地址、只允许访问 `--root` 指定目录之下的仓库，并禁用云模型。
-对外监听必须显式使用 `--allow-remote`，且应放在具备认证和授权的网关之后；服务端若要
-开放云模型，还需显式使用 `--allow-cloud-api`。
+API 默认只监听回环地址、只允许访问 `--root` 指定目录之下的仓库，并禁用云模型。每次
+启动会生成随机 Bearer token 并在 stderr 只显示一次；如需固定 token，可设置
+`REPOLOCUS_API_TOKEN`。所有请求都必须携带 `Authorization: Bearer TOKEN` 和允许的 `Host`；
+服务还会限制请求体大小与并发数，并为 `/v1/` 响应设置 `Cache-Control: no-store`。
+
+开放云模型还需服务端显式使用 `--allow-cloud-api`，客户端先调用
+`POST /v1/ask/preview` 获取短时、单次使用的 `preview_id`，再调用
+`POST /v1/ask/previews/{preview_id}/approve`。批准时发送的是预览阶段冻结的同一份证据与
+序列化请求体，不会重新扫描；API 客户端不能创建持久云授权。
+
+非回环监听必须同时提供 `--allow-remote`、至少一个 `--allowed-host`，以及
+`--ssl-certfile` / `--ssl-keyfile` TLS 证书和密钥。预览存储位于单进程内存中，因此该
+两阶段流程适用于 `repolocus serve` 默认启动的单 worker 服务。
 
 ## 明确边界
 
@@ -113,6 +140,11 @@ JavaScript、Go、Rust、Java、C/C++ 使用保守的启发式解析器；动态
 
 索引和授权记录均保存在仓库之外。POSIX 平台会收紧文件权限；Windows 上尚未实现原生
 ACL 检查，因此 `doctor --security` 会明确将 ACL 状态报告为“未验证”，不会声称检查成功。
+
+扫描器默认排除识别出的 RepoLocus 生成文档；索引仍为迁移或显式导入的记录保留
+`generated` provenance。不完整或暂时不可读的扫描会把旧 facts 保留为 `stale`。默认查询只使用 `source` 且非 `stale` 的已提交 snapshot，确认删除后
+才移除对应行。每次提交通过单调 generation 做 compare-and-swap，拒绝旧扫描覆盖新结果。
+这属于安全重读、内容哈希和 parser-fact 复用，不是 manifest-delta watcher。
 
 完整命令、架构、测试与开发说明以英文
 [README.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/README.md) 为准。隐私与安全

@@ -91,7 +91,7 @@ def test_path_boundary_rejects_a_regular_file_as_root(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "state",
     [
-        {"version": 2, "repositories": {}},
+        {"version": 3, "repositories": {}},
         {"version": 1, "repositories": []},
     ],
 )
@@ -110,7 +110,7 @@ def test_privacy_store_rejects_malformed_provider_table(tmp_path: Path) -> None:
     repository.mkdir()
     state_path = tmp_path / "privacy.json"
     store = PrivacyStore(state_path)
-    store.grant(repository, "openai")
+    store.grant(repository, "openai", "https://api.openai.com/v1/chat/completions")
     state = json.loads(state_path.read_text(encoding="utf-8"))
     only_repository = next(iter(state["repositories"].values()))
     only_repository["providers"] = ["openai"]
@@ -143,15 +143,14 @@ def test_scanner_detects_a_file_replaced_during_its_read(
     source.write_text("VALUE = 1\n", encoding="utf-8")
     from repolocus.scanner import repository as scanner_repository
 
-    original_safe_read = scanner_repository._safe_read
+    original_read_descriptor = scanner_repository._read_descriptor
 
-    def mutate_after_read(path: Path, limit: int) -> tuple[bytes | None, str | None]:
-        payload, error = original_safe_read(path, limit)
-        if path == source:
-            path.write_text("VALUE = 200\n", encoding="utf-8")
+    def mutate_after_read(descriptor: int, limit: int) -> tuple[bytes | None, str | None]:
+        payload, error = original_read_descriptor(descriptor, limit)
+        source.write_text("VALUE = 200\n", encoding="utf-8")
         return payload, error
 
-    monkeypatch.setattr(scanner_repository, "_safe_read", mutate_after_read)
+    monkeypatch.setattr(scanner_repository, "_read_descriptor", mutate_after_read)
 
     result = RepositoryScanner().scan(tmp_path)
 
@@ -160,13 +159,15 @@ def test_scanner_detects_a_file_replaced_during_its_read(
     assert result.warnings == ["file changed during scan: app.py"]
 
 
-def test_oversize_ignore_file_is_not_applied_and_is_reported(tmp_path: Path) -> None:
+def test_oversize_ignore_file_fails_closed_and_is_reported(tmp_path: Path) -> None:
     (tmp_path / ".gitignore").write_text("*.py\n", encoding="utf-8")
     (tmp_path / "kept.py").write_text("def kept():\n    return True\n", encoding="utf-8")
 
     result = RepositoryScanner(max_ignore_bytes=2).scan(tmp_path)
 
-    assert "kept.py" in {file.path for file in result.files}
+    assert result.files == []
+    assert result.temporarily_unreadable == (".",)
+    assert result.stats.skipped == {"unreadable_ignore": 1}
     assert any("could not load ignore file (oversize)" in warning for warning in result.warnings)
 
 
@@ -283,7 +284,11 @@ def test_cloud_model_success_can_remember_repository_scoped_consent(
         name = "openai"
 
         def generate(self, system_prompt: str, user_prompt: str) -> str:
-            return "Configuration is loaded here [[src/demo/config.py:1-2]]."
+            return (
+                "Configuration is loaded here [[src/demo/config.py:1-2]].\n"
+                'Evidence quote: "def load_config(path: str) -> dict:" '
+                "[[src/demo/config.py:1-2]]"
+            )
 
     monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
     privacy = PrivacyStore(isolated_user_dirs / "privacy.json")
@@ -297,7 +302,7 @@ def test_cloud_model_success_can_remember_repository_scoped_consent(
     )
 
     assert answer.provider == "openai"
-    assert answer.confidence == "inferred"
+    assert answer.confidence == "needs_review"
     assert "src/demo/config.py#L1" in answer.text
     assert privacy.status(sample_repo) == {"openai": True}
 
@@ -364,11 +369,19 @@ def test_remote_ollama_can_use_explicitly_remembered_remote_scope(
         name = "ollama"
 
         def generate(self, system_prompt: str, user_prompt: str) -> str:
-            return "Configuration is loaded here [[src/demo/config.py:1]]."
+            return (
+                "Configuration is loaded here [[src/demo/config.py:1]].\n"
+                'Evidence quote: "def load_config(path: str) -> dict:" '
+                "[[src/demo/config.py:1]]"
+            )
 
     monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
     privacy = PrivacyStore(isolated_user_dirs / "privacy.json")
-    privacy.grant(sample_repo, "ollama-remote")
+    privacy.grant(
+        sample_repo,
+        "ollama-remote",
+        "https://ollama.example.invalid/api/chat",
+    )
     service = RepoLocusService(
         Settings(
             model="ollama/test-model",
@@ -381,4 +394,4 @@ def test_remote_ollama_can_use_explicitly_remembered_remote_scope(
 
     assert preview.provider == "ollama-remote"
     assert answer.provider == "ollama"
-    assert answer.confidence == "inferred"
+    assert answer.confidence == "needs_review"

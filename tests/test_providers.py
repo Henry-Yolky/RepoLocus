@@ -14,6 +14,7 @@ from repolocus.providers import (
     ProviderConfigurationError,
     ProviderRequestError,
     ProviderResponseError,
+    build_provider_request_plan,
     create_provider,
 )
 
@@ -73,7 +74,16 @@ def test_openai_compatible_contract_and_cloud_redaction() -> None:
     assert provider.is_local is False
     assert len(captured) == 1
     request = captured[0]
+    plan = build_provider_request_plan(
+        "openai",
+        "gpt-test",
+        base_url="https://api.openai.com/v1",
+        system_prompt="System",
+        user_prompt='api_key = "secret-value"',
+        max_output_tokens=321,
+    )
     payload = json.loads(request.content)
+    assert request.content == plan.body
     assert request.url == "https://api.openai.com/v1/chat/completions"
     assert request.headers["authorization"] == "Bearer environment-only-key"
     assert payload["model"] == "gpt-test"

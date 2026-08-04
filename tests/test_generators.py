@@ -98,6 +98,36 @@ def test_mermaid_document_keeps_source_evidence() -> None:
     assert "[src/app/main.py:1](src/app/main.py#L1)" in document
 
 
+def test_every_mermaid_edge_has_import_evidence() -> None:
+    caller = ScannedFile(
+        path="src/api/routes.py",
+        language="Python",
+        size_bytes=34,
+        sha256="1" * 64,
+        line_count=2,
+        text="from worker.jobs import run\nrun()\n",
+        dependencies=(Dependency("src/api/routes.py", "worker.jobs", "import", 1),),
+    )
+    target = ScannedFile(
+        path="src/worker/jobs.py",
+        language="Python",
+        size_bytes=22,
+        sha256="2" * 64,
+        line_count=2,
+        text="def run():\n    pass\n",
+    )
+    result = ScanResult(Path("/tmp/edges"), [caller, target], ScanStats(indexed_files=2))
+
+    document = MermaidGenerator().generate(result)
+    source = MermaidGenerator().generate_source(result)
+
+    assert " --> " in source
+    assert "### Edge evidence" in document
+    assert "`api -&gt; worker`" in document
+    assert "`worker.jobs`" in document
+    assert "[src/api/routes.py:1](src/api/routes.py#L1)" in document
+
+
 def test_mermaid_validator_rejects_model_like_free_text() -> None:
     valid, reason = validate_mermaid("flowchart LR\n    A[hello]\n    click A evil\n")
 

@@ -10,7 +10,13 @@ from .base import (
     ProviderResponseError,
 )
 from .factory import ProviderFactory, create_provider
-from .http import AnthropicProvider, OllamaProvider, OpenAICompatibleProvider
+from .http import (
+    AnthropicProvider,
+    OllamaProvider,
+    OpenAICompatibleProvider,
+    ProviderRequestPlan,
+    build_provider_request_plan,
+)
 from .local import ExtractiveProvider
 
 __all__ = [
@@ -23,7 +29,9 @@ __all__ = [
     "ProviderError",
     "ProviderFactory",
     "ProviderRequestError",
+    "ProviderRequestPlan",
     "ProviderResponseError",
+    "build_provider_request_plan",
     "create_provider",
     "is_local_provider",
     "provider_family",

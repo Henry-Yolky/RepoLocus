@@ -8,6 +8,7 @@ from repolocus.scanner.filters import (
     detect_language,
     is_binary,
     is_default_ignored,
+    is_generated_document,
     is_sensitive_path,
     looks_like_secret,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "detect_language",
     "is_binary",
     "is_default_ignored",
+    "is_generated_document",
     "is_sensitive_path",
     "looks_like_secret",
 ]

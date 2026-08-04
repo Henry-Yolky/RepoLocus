@@ -99,11 +99,34 @@ def test_query_expansion_does_not_claim_an_exact_user_symbol(tmp_path: Path) -> 
     )
     with RepositoryIndex.open(repository, tmp_path / "cache") as index:
         index.update(ScanResult(repository, [source], ScanStats()))
-        results = RetrievalEngine(index).search("Where is configuration validated?", limit=5)
+        results = RetrievalEngine(
+            index,
+            synonyms={
+                "configuration": ("config", "settings"),
+                "validated": ("validate",),
+            },
+        ).search("Where is configuration validated?", limit=5)
 
     settings = next(result for result in results if result.symbol == "Settings")
     assert "query-expansion symbol match: Settings" in settings.reason
     assert "exact symbol match" not in settings.reason
+
+
+def test_cjk_subphrases_and_identifier_parts_are_searchable(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = _source(
+        "src/httpClient.py",
+        "def loadConfigValue():\n    # 配置在哪里校验\n    return True\n",
+        "loadConfigValue",
+    )
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        index.update(ScanResult(repository, [source], ScanStats()))
+        retrieval = RetrievalEngine(index)
+
+        assert retrieval.search("配置", limit=1)[0].path == "src/httpClient.py"
+        assert retrieval.search("校验", limit=1)[0].path == "src/httpClient.py"
+        assert retrieval.search("http client", limit=1)[0].path == "src/httpClient.py"
 
 
 def test_dependency_neighbors_expand_in_both_directions(
