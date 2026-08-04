@@ -52,13 +52,16 @@ def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
-def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
+def _same_content_state(first: os.stat_result, second: os.stat_result) -> bool:
     return (
         _same_identity(first, second)
         and first.st_size == second.st_size
         and first.st_mtime_ns == second.st_mtime_ns
-        and first.st_ctime_ns == second.st_ctime_ns
     )
+
+
+def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
+    return _same_content_state(first, second) and first.st_ctime_ns == second.st_ctime_ns
 
 
 def _read_descriptor(descriptor: int, limit: int) -> tuple[bytes | None, str | None]:
@@ -128,10 +131,11 @@ def _safe_read_at(
                 current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except OSError:
             return None, None, "changed_during_scan"
+        # Keep ctime comparisons within matching metadata sources on Windows 3.12.
         if (
             _is_reparse_point(current)
             or not _same_file_state(opened, finished)
-            # Windows 3.12 exposes different ctime semantics for path stat and fstat.
+            or not _same_content_state(finished, current)
             or not _same_file_state(expected, current)
         ):
             return None, None, "changed_during_scan"

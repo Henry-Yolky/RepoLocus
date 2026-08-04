@@ -280,6 +280,33 @@ def test_safe_read_compares_metadata_from_matching_sources(
     assert error is None
 
 
+def test_safe_read_keeps_handle_and_path_content_states_linked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(tmp_path, "app.py", "VALUE = 1\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    original_fstat = scanner_repository.os.fstat
+
+    def mismatched_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_size=metadata.st_size + 1,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=metadata.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(scanner_repository.os, "fstat", mismatched_fstat)
+
+    payload, error = scanner_repository._safe_read(source, 100)
+
+    assert payload is None
+    assert error == "changed_during_scan"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows file identity semantics")
 def test_windows_path_and_handle_metadata_are_compared_consistently(tmp_path: Path) -> None:
     _write(tmp_path, ".gitignore", "*.tmp\n")
