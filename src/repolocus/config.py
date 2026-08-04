@@ -12,13 +12,16 @@ import json
 import math
 import os
 import re
+import stat
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from repolocus.security.display import has_unsafe_display_controls
+from repolocus.security.identity import descriptor_path
 from repolocus.security.network import is_loopback_url
 
 DEFAULT_MODEL = "local"
@@ -39,6 +42,12 @@ _DEFAULTS: dict[str, object] = {
     "max_output_tokens": 2048,
     "max_file_bytes": 1_000_000,
     "context_char_budget": 24_000,
+    "max_repository_files": 100_000,
+    "max_repository_bytes": 512_000_000,
+    "max_directory_depth": 64,
+    "max_repository_chunks": 500_000,
+    "max_repository_symbols": 500_000,
+    "max_scan_seconds": 120,
     "query_synonyms": "{}",
 }
 
@@ -57,6 +66,12 @@ _ENV_KEYS = {
     "REPOLOCUS_MAX_OUTPUT_TOKENS": "max_output_tokens",
     "REPOLOCUS_MAX_FILE_BYTES": "max_file_bytes",
     "REPOLOCUS_CONTEXT_CHAR_BUDGET": "context_char_budget",
+    "REPOLOCUS_MAX_REPOSITORY_FILES": "max_repository_files",
+    "REPOLOCUS_MAX_REPOSITORY_BYTES": "max_repository_bytes",
+    "REPOLOCUS_MAX_DIRECTORY_DEPTH": "max_directory_depth",
+    "REPOLOCUS_MAX_REPOSITORY_CHUNKS": "max_repository_chunks",
+    "REPOLOCUS_MAX_REPOSITORY_SYMBOLS": "max_repository_symbols",
+    "REPOLOCUS_MAX_SCAN_SECONDS": "max_scan_seconds",
     "REPOLOCUS_QUERY_SYNONYMS": "query_synonyms",
 }
 
@@ -68,7 +83,18 @@ _SECRET_KEY_RE = re.compile(
 # Repository files are untrusted input. A committed config may only tighten
 # local resource limits; it cannot select a model, network destination,
 # telemetry policy, request timeout, or spending limit.
-_REPOSITORY_LIMIT_KEYS = frozenset({"max_file_bytes", "context_char_budget"})
+_REPOSITORY_LIMIT_KEYS = frozenset(
+    {
+        "max_file_bytes",
+        "context_char_budget",
+        "max_repository_files",
+        "max_repository_bytes",
+        "max_directory_depth",
+        "max_repository_chunks",
+        "max_repository_symbols",
+        "max_scan_seconds",
+    }
+)
 
 
 def _default_user_config_path() -> Path:
@@ -101,6 +127,12 @@ class Settings:
     max_output_tokens: int = 2048
     max_file_bytes: int = 1_000_000
     context_char_budget: int = 24_000
+    max_repository_files: int = 100_000
+    max_repository_bytes: int = 512_000_000
+    max_directory_depth: int = 64
+    max_repository_chunks: int = 500_000
+    max_repository_symbols: int = 500_000
+    max_scan_seconds: int = 120
     query_synonyms: str = "{}"
 
     def __post_init__(self) -> None:
@@ -119,7 +151,17 @@ class Settings:
             or self.request_timeout <= 0
         ):
             raise ConfigError("request_timeout must be greater than zero")
-        for field_name in ("max_output_tokens", "max_file_bytes", "context_char_budget"):
+        for field_name in (
+            "max_output_tokens",
+            "max_file_bytes",
+            "context_char_budget",
+            "max_repository_files",
+            "max_repository_bytes",
+            "max_directory_depth",
+            "max_repository_chunks",
+            "max_repository_symbols",
+            "max_scan_seconds",
+        ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ConfigError(f"{field_name} must be a positive integer")
@@ -171,14 +213,22 @@ class Settings:
         else:
             repo_paths = []
 
+        if repo_config_path is not None and root is None:
+            raise ConfigError("root is required when repo_config_path is supplied")
+
+        repo_root = Path(root).expanduser().resolve(strict=True) if root is not None else None
         for path in repo_paths:
-            if not path.is_file():
+            if repo_root is None:
+                if not path.is_file():
+                    continue
+                raw = _read_config_bytes(path, source="repository")
+            else:
+                raw = _read_repository_config_bytes(repo_root, path)
+                if raw is None:
+                    continue
+            if path.name == "pyproject.toml" and not _pyproject_declares_repolocus(raw, path):
                 continue
-            if root is not None:
-                _ensure_repo_config_path(Path(root), path)
-            if path.name == "pyproject.toml" and not _pyproject_declares_repolocus(path):
-                continue
-            table = _read_config(path, source="repository")
+            table = _parse_config(raw, path, source="repository")
             # A pyproject is relevant only when it contains [tool.repolocus].
             if path.name == "pyproject.toml" and not _has_repolocus_table(table):
                 continue
@@ -230,11 +280,13 @@ def _validate_base_url(name: str, value: object) -> None:
         raise ConfigError(f"{name} must use HTTPS unless it targets a loopback address")
 
 
-def _ensure_repo_config_path(root: Path, config_path: Path) -> None:
+def _ensure_repo_config_path(root: Path, config_path: Path) -> Path:
+    """Return a lexical path below ``root`` without following repository links."""
+
     root_real = root.expanduser().resolve(strict=True)
-    config_real = config_path.expanduser().resolve(strict=True)
+    config_absolute = config_path.expanduser().absolute()
     try:
-        config_real.relative_to(root_real)
+        return config_absolute.relative_to(root_real)
     except ValueError as exc:
         raise ConfigError(f"repository config escapes repository root: {config_path}") from exc
 
@@ -244,10 +296,10 @@ def _has_repolocus_table(data: Mapping[str, Any]) -> bool:
     return isinstance(tool, Mapping) and isinstance(tool.get("repolocus"), Mapping)
 
 
-def _pyproject_declares_repolocus(path: Path) -> bool:
+def _pyproject_declares_repolocus(raw: bytes, path: Path) -> bool:
     try:
-        text = _read_config_bytes(path, source="repository").decode("utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise ConfigError(f"cannot inspect repository config {path}: {exc}") from exc
     return bool(re.search(r"(?m)^\s*\[tool\.repolocus\]\s*(?:#.*)?$", text))
 
@@ -306,7 +358,17 @@ def _coerce_value(key: str, value: object, source: str) -> object:
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{source}: request_timeout must be a number") from exc
         return parsed
-    if key in {"max_output_tokens", "max_file_bytes", "context_char_budget"}:
+    if key in {
+        "max_output_tokens",
+        "max_file_bytes",
+        "context_char_budget",
+        "max_repository_files",
+        "max_repository_bytes",
+        "max_directory_depth",
+        "max_repository_chunks",
+        "max_repository_symbols",
+        "max_scan_seconds",
+    }:
         if isinstance(value, bool) or not isinstance(value, (int, str)):
             raise ConfigError(f"{source}: {key} must be an integer")
         try:
@@ -367,6 +429,12 @@ def _parse_query_synonyms(
 
 def _read_config(path: Path, *, source: str) -> Mapping[str, Any]:
     raw = _read_config_bytes(path, source=source)
+    return _parse_config(raw, path, source=source)
+
+
+def _parse_config(raw: bytes, path: Path, *, source: str) -> Mapping[str, Any]:
+    """Parse exactly one already-pinned configuration byte snapshot."""
+
     try:
         try:
             import tomllib  # type: ignore[import-not-found]
@@ -382,6 +450,194 @@ def _read_config(path: Path, *, source: str) -> Mapping[str, Any]:
     if not isinstance(parsed, Mapping):
         raise ConfigError(f"invalid TOML table in {source} config {path}")
     return parsed
+
+
+def _same_config_state(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+        and first.st_ctime_ns == second.st_ctime_ns
+    )
+
+
+def _same_config_identity_and_content(first: os.stat_result, second: os.stat_result) -> bool:
+    """Compare metadata collected from a path and an open handle."""
+
+    return (
+        (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+    )
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(metadata, "st_file_attributes", 0) & marker)
+
+
+def _read_config_descriptor(descriptor: int) -> bytes:
+    blocks: list[bytes] = []
+    remaining = MAX_CONFIG_BYTES + 1
+    while remaining:
+        block = os.read(descriptor, min(65_536, remaining))
+        if not block:
+            break
+        blocks.append(block)
+        remaining -= len(block)
+    return b"".join(blocks)
+
+
+def _read_repository_config_bytes(root: Path, path: Path) -> bytes | None:
+    """Open one repository config beneath a pinned root and read it exactly once.
+
+    POSIX walks each component relative to directory descriptors, rejecting links.
+    The fallback keeps a file handle open while it revalidates identity, boundary,
+    and content state before accepting the snapshot.
+    """
+
+    relative = _ensure_repo_config_path(root, path)
+    if not relative.parts:
+        raise ConfigError(f"repository config is not a regular file: {path}")
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise ConfigError(f"repository config escapes repository root: {path}")
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    supports_openat = (
+        bool(nofollow) and os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+    )
+    if supports_openat:
+        descriptors: list[int] = []
+        directory_fd: int | None = None
+        file_opened = False
+        try:
+            root_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            root_flags |= getattr(os, "O_DIRECTORY", 0) | nofollow
+            directory_fd = os.open(root, root_flags)
+            descriptors.append(directory_fd)
+            for component in relative.parts[:-1]:
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_DIRECTORY", 0) | nofollow
+                directory_fd = os.open(component, flags, dir_fd=directory_fd)
+                descriptors.append(directory_fd)
+            name = relative.parts[-1]
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+            file_opened = True
+            descriptors.append(descriptor)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or _is_reparse_point(opened):
+                raise ConfigError(f"repository config is not a safe regular file: {path}")
+            if opened.st_size > MAX_CONFIG_BYTES:
+                raise ConfigError(
+                    f"repository config exceeds the {MAX_CONFIG_BYTES}-byte limit: {path}"
+                )
+            raw = _read_config_descriptor(descriptor)
+            finished = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                _is_reparse_point(current)
+                or not _same_config_state(opened, finished)
+                or not _same_config_state(finished, current)
+            ):
+                raise ConfigError(f"repository config changed while being read: {path}")
+        except FileNotFoundError as exc:
+            if not file_opened:
+                return None
+            raise ConfigError(f"repository config changed while being read: {path}") from exc
+        except ConfigError:
+            raise
+        except OSError as exc:
+            raise ConfigError(
+                f"repository config escapes repository root or uses an unsafe link: {path}"
+            ) from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                with suppress(OSError):
+                    os.close(descriptor)
+    else:
+        candidate = root.joinpath(*relative.parts)
+        file_opened = False
+        try:
+            expected = candidate.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ConfigError(f"cannot inspect repository config {path}: {exc}") from exc
+        if (
+            not stat.S_ISREG(expected.st_mode)
+            or stat.S_ISLNK(expected.st_mode)
+            or _is_reparse_point(expected)
+        ):
+            raise ConfigError(
+                f"repository config escapes repository root or uses an unsafe link: {path}"
+            )
+        try:
+            current_directory = root
+            for component in relative.parts[:-1]:
+                current_directory /= component
+                component_metadata = current_directory.lstat()
+                if (
+                    not stat.S_ISDIR(component_metadata.st_mode)
+                    or stat.S_ISLNK(component_metadata.st_mode)
+                    or _is_reparse_point(component_metadata)
+                ):
+                    raise ConfigError(
+                        f"repository config escapes repository root or uses an unsafe link: {path}"
+                    )
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= (
+                getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            descriptor = os.open(candidate, flags)
+            file_opened = True
+            try:
+                opened = os.fstat(descriptor)
+                opened_path = descriptor_path(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or _is_reparse_point(opened)
+                    or (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino)
+                    or opened_path is None
+                    or not opened_path.is_relative_to(root)
+                ):
+                    raise ConfigError(f"repository config changed while being opened: {path}")
+                if opened.st_size > MAX_CONFIG_BYTES:
+                    raise ConfigError(
+                        f"repository config exceeds the {MAX_CONFIG_BYTES}-byte limit: {path}"
+                    )
+                raw = _read_config_descriptor(descriptor)
+                finished = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            current = candidate.lstat()
+            if stat.S_ISLNK(current.st_mode) or _is_reparse_point(current):
+                raise ConfigError(f"repository config changed while being read: {path}")
+            current_resolved = candidate.resolve(strict=True)
+            current_resolved.relative_to(root)
+            if (
+                not _same_config_state(opened, finished)
+                or not _same_config_identity_and_content(finished, current)
+                or not _same_config_state(expected, current)
+            ):
+                raise ConfigError(f"repository config changed while being read: {path}")
+        except ConfigError:
+            raise
+        except (OSError, ValueError) as exc:
+            if file_opened:
+                raise ConfigError(f"repository config changed while being read: {path}") from exc
+            raise ConfigError(
+                f"repository config escapes repository root or uses an unsafe link: {path}"
+            ) from exc
+
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError(f"repository config exceeds the {MAX_CONFIG_BYTES}-byte limit: {path}")
+    return raw
 
 
 def _read_config_bytes(path: Path, *, source: str) -> bytes:

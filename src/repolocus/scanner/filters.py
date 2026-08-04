@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import re
-from collections import Counter
 from pathlib import Path, PurePosixPath
+
+from repolocus.security.secrets import contains_high_confidence_secret
 
 LANGUAGE_EXTENSIONS: dict[str, str] = {
     ".py": "python",
@@ -59,12 +59,18 @@ _GENERATED_MARKER = re.compile(
 )
 
 
-def is_generated_document(text: str, language: str) -> bool:
-    """Recognize only exact RepoLocus headers near a Markdown document start."""
+def is_generated_document(text: str, language: str | None = None) -> bool:
+    """Recognize an exact RepoLocus header near any supported document start.
 
-    if language != "markdown":
-        return False
-    return any(_GENERATED_MARKER.fullmatch(line) for line in text[:4096].splitlines()[:16])
+    ``language`` is retained for caller compatibility, but deliberately does not
+    gate detection.  Generated Markdown can be copied or renamed to another
+    scanner-supported extension, and must not become source evidence merely
+    because its filename changed.
+    """
+
+    del language
+    prefix = text[:4096].encode("utf-8", errors="replace")[:4096].decode("utf-8", errors="ignore")
+    return any(_GENERATED_MARKER.fullmatch(line) for line in prefix.splitlines()[:16])
 
 
 CONFIG_FILENAMES = frozenset(
@@ -214,36 +220,6 @@ _SENSITIVE_SUFFIXES = (
     ".tfstate",
 )
 
-_HIGH_CONFIDENCE_SECRET_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-    for pattern in (
-        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----",
-        r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
-        r"\bgh[pousr]_[A-Za-z0-9]{30,}\b",
-        r"\bgithub_pat_[A-Za-z0-9_]{50,}\b",
-        r"\bglpat-[A-Za-z0-9_-]{20,}\b",
-        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
-        r"\bAIza[0-9A-Za-z_-]{35}\b",
-        r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b",
-        r"\bhf_[A-Za-z0-9]{20,}\b",
-        r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b",
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b",
-        r"[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@[^\s/]+",
-    )
-)
-
-_QUOTED_ASSIGNMENT_RE = re.compile(
-    r"(?im)[\"']?(?:password|passwd|pwd|secret|client_secret|api[_-]?key|access[_-]?token|"
-    r"auth[_-]?token|private[_-]?key|hf[_-]?token|database[_-]?url|db[_-]?url|dsn)"
-    r"[\"']?\s*[:=]\s*(?:[rubf]{0,2})"
-    r"(?P<quote>[\"'])(?P<value>[^\r\n\"']{4,})(?P=quote)"
-)
-_BARE_ASSIGNMENT_RE = re.compile(
-    r"(?im)^[ \t]*(?:export\s+)?(?:password|passwd|pwd|secret|client_secret|api[_-]?key|"
-    r"access[_-]?token|auth[_-]?token|private[_-]?key|hf[_-]?token|database[_-]?url|"
-    r"db[_-]?url|dsn)\s*[:=]\s*(?P<value>[^\s#;,]{4,})"
-)
-
 
 def detect_language(path: str | Path) -> str | None:
     """Return the supported language for *path*, if any."""
@@ -320,53 +296,10 @@ def is_binary(data: bytes) -> bool:
     return control_count / max(1, len(decoded)) > 0.02
 
 
-def _entropy(value: str) -> float:
-    counts = Counter(value)
-    length = len(value)
-    return -sum((count / length) * math.log2(count / length) for count in counts.values())
-
-
-def _plausible_assigned_secret(value: str) -> bool:
-    stripped = value.strip()
-    lowered = stripped.casefold()
-    if len(stripped) < 8 or len(stripped) > 4_096:
-        return False
-    placeholder_fragments = (
-        "${",
-        "{{",
-        "<your",
-        "changeme",
-        "change_me",
-        "dummy",
-        "example",
-        "fake",
-        "env.get",
-        "getenv",
-        "os.environ",
-        "placeholder",
-        "process.env",
-        "redacted",
-        "replace_me",
-        "sample",
-        "your_",
-    )
-    if any(fragment in lowered for fragment in placeholder_fragments):
-        return False
-    if lowered in {"password", "secret", "undefined", "none", "null"}:
-        return False
-    if len(set(stripped)) <= 2:
-        return False
-    return _entropy(stripped) >= 2.5
-
-
 def contains_likely_secret(text: str) -> bool:
     """Detect high-confidence credentials without returning their value."""
 
-    if any(pattern.search(text) for pattern in _HIGH_CONFIDENCE_SECRET_PATTERNS):
-        return True
-    assignments = list(_QUOTED_ASSIGNMENT_RE.finditer(text))
-    assignments.extend(_BARE_ASSIGNMENT_RE.finditer(text))
-    return any(_plausible_assigned_secret(match.group("value")) for match in assignments)
+    return contains_high_confidence_secret(text)
 
 
 looks_like_secret = contains_likely_secret

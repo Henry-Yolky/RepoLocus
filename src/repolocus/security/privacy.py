@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import stat
 import tempfile
 import threading
 from collections.abc import Iterable, Mapping
@@ -21,6 +22,8 @@ from .redaction import redact_secrets_with_count
 
 _STATE_LOCKS_GUARD = threading.Lock()
 _STATE_LOCKS: dict[str, threading.RLock] = {}
+_STATE_VERSION = 3
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 class PrivacyStoreError(RuntimeError):
@@ -138,12 +141,13 @@ class PrivacyStore:
     def status(self, root: Path | str) -> dict[str, bool]:
         """Return remembered provider grants for ``root``."""
 
-        root_path = self._root(root)
+        root_path, identity = self._repository_context(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
             state = self._read()
-        entry = state["repositories"].get(_repository_id(root_path), {})
-        if entry.get("path") != str(root_path):
+        _require_same_repository_identity(root_path, identity)
+        entry = state["repositories"].get(_repository_id(root_path, identity), {})
+        if not _entry_matches(entry, root_path, identity):
             return {}
         providers = entry.get("providers", {})
         if not isinstance(providers, dict):
@@ -157,12 +161,13 @@ class PrivacyStore:
     def grant_details(self, root: Path | str) -> dict[str, tuple[str, ...]]:
         """Return canonical endpoint identities for remembered provider grants."""
 
-        root_path = self._root(root)
+        root_path, identity = self._repository_context(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
             state = self._read()
-        entry = state["repositories"].get(_repository_id(root_path), {})
-        if entry.get("path") != str(root_path):
+        _require_same_repository_identity(root_path, identity)
+        entry = state["repositories"].get(_repository_id(root_path, identity), {})
+        if not _entry_matches(entry, root_path, identity):
             return {}
         providers = entry.get("providers", {})
         if not isinstance(providers, dict):
@@ -182,29 +187,32 @@ class PrivacyStore:
         if endpoint is None:
             raise PrivacyStoreError("a canonical endpoint is required for remembered cloud consent")
         endpoint_identity = canonical_endpoint(endpoint)
-        root_path = self._root(root)
+        root_path, identity = self._repository_context(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
             state = self._read()
             repository = state["repositories"].setdefault(
-                _repository_id(root_path), {"path": str(root_path), "providers": {}}
+                _repository_id(root_path, identity),
+                {"path": str(root_path), "identity": identity, "providers": {}},
             )
             repository["path"] = str(root_path)
+            repository["identity"] = identity
             providers = repository.setdefault("providers", {})
             endpoints = providers.setdefault(family, {})
             if not isinstance(endpoints, dict):
                 raise PrivacyStoreError("privacy state contains an invalid endpoint grants table")
             endpoints[endpoint_identity] = {"granted_at": datetime.now(timezone.utc).isoformat()}
+            _require_same_repository_identity(root_path, identity)
             self._write(state)
 
     def revoke(self, root: Path | str, provider: str | None = None) -> None:
         """Revoke one provider grant, or all grants for a repository."""
 
-        root_path = self._root(root)
+        root_path, identity = self._repository_context(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
             state = self._read()
-            repository_id = _repository_id(root_path)
+            repository_id = _repository_id(root_path, identity)
             if provider is None:
                 state["repositories"].pop(repository_id, None)
             else:
@@ -216,6 +224,7 @@ class PrivacyStore:
                         providers.pop(family, None)
                         if not providers:
                             state["repositories"].pop(repository_id, None)
+            _require_same_repository_identity(root_path, identity)
             self._write(state)
 
     def is_allowed(
@@ -232,12 +241,13 @@ class PrivacyStore:
         if endpoint is None:
             return False
         endpoint_identity = canonical_endpoint(endpoint)
-        root_path = self._root(root)
+        root_path, identity = self._repository_context(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
             state = self._read()
-        entry = state["repositories"].get(_repository_id(root_path), {})
-        if entry.get("path") != str(root_path):
+        _require_same_repository_identity(root_path, identity)
+        entry = state["repositories"].get(_repository_id(root_path, identity), {})
+        if not _entry_matches(entry, root_path, identity):
             return False
         providers = entry.get("providers", {})
         if not isinstance(providers, dict):
@@ -248,14 +258,25 @@ class PrivacyStore:
         return endpoint_identity in endpoints
 
     @staticmethod
-    def _root(root: Path | str) -> Path:
+    def _repository_context(root: Path | str) -> tuple[Path, dict[str, object]]:
         try:
-            path = Path(root).expanduser().resolve(strict=True)
+            supplied = Path(root).expanduser().absolute()
+            supplied_metadata = supplied.lstat()
+            path = supplied.resolve(strict=True)
+            metadata = path.lstat()
         except (OSError, RuntimeError) as exc:
             raise PrivacyStoreError(f"repository root cannot be resolved: {root}") from exc
-        if not path.is_dir():
+        if (
+            stat.S_ISLNK(supplied_metadata.st_mode)
+            or _is_reparse_point(supplied_metadata)
+            or not stat.S_ISDIR(supplied_metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
             raise PrivacyStoreError(f"repository root is not a directory: {path}")
-        return path
+        if not _same_identity(supplied_metadata, metadata):
+            raise PrivacyStoreError("repository root changed while its identity was inspected")
+        identity = _repository_identity(path, metadata)
+        return path, identity
 
     def _ensure_outside_repository(self, root: Path) -> None:
         state_path = self.path.expanduser().resolve(strict=False)
@@ -297,12 +318,12 @@ class PrivacyStore:
     def _read(self) -> dict[str, Any]:
         path = self.path.expanduser()
         if not path.exists():
-            return {"version": 2, "repositories": {}}
+            return {"version": _STATE_VERSION, "repositories": {}}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PrivacyStoreError(f"cannot read privacy state {path}: {exc}") from exc
-        if not isinstance(data, dict) or data.get("version") not in {1, 2}:
+        if not isinstance(data, dict) or data.get("version") not in {1, 2, _STATE_VERSION}:
             raise PrivacyStoreError("privacy state has an unsupported format")
         repositories = data.get("repositories")
         if not isinstance(repositories, dict):
@@ -313,21 +334,16 @@ class PrivacyStore:
             providers = repository.get("providers", {})
             if not isinstance(providers, dict):
                 raise PrivacyStoreError("privacy state contains an invalid providers table")
-        if data.get("version") == 1:
-            # Family-only grants cannot be safely attached to the endpoint that
-            # happens to be configured during an upgrade.  Migrate fail-closed;
-            # the next explicit grant writes a v2 endpoint-bound record.
-            return {
-                "version": 2,
-                "repositories": {
-                    repository_id: {
-                        "path": repository.get("path", ""),
-                        "providers": {},
-                    }
-                    for repository_id, repository in repositories.items()
-                },
-            }
+        if data.get("version") in {1, 2}:
+            # Older grants were bound only to a path (and v1 only to a provider
+            # family). They cannot be safely attached to the repository object
+            # currently occupying that path, so migration deliberately drops them.
+            return {"version": _STATE_VERSION, "repositories": {}}
         for repository in repositories.values():
+            if not isinstance(repository.get("path"), str) or not _valid_repository_identity(
+                repository.get("identity")
+            ):
+                raise PrivacyStoreError("privacy state contains an invalid repository identity")
             providers = repository.get("providers", {})
             for endpoints in providers.values():
                 if not isinstance(endpoints, dict):
@@ -376,8 +392,108 @@ class PrivacyStore:
             raise PrivacyStoreError(f"cannot write privacy state {path}: {exc}") from exc
 
 
-def _repository_id(root: Path) -> str:
-    return hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    return bool(getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _marker_identity(root: Path) -> dict[str, object]:
+    marker = root / ".git"
+    try:
+        metadata = marker.lstat()
+    except FileNotFoundError:
+        return {"kind": "missing"}
+    except OSError as exc:
+        raise PrivacyStoreError("repository marker cannot be inspected") from exc
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        kind = "link"
+    elif stat.S_ISDIR(metadata.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = "file"
+    else:
+        kind = "special"
+    return {
+        "kind": kind,
+        "device": str(metadata.st_dev),
+        "inode": str(metadata.st_ino),
+    }
+
+
+def _repository_identity(
+    root: Path,
+    metadata: os.stat_result | None = None,
+) -> dict[str, object]:
+    before = metadata if metadata is not None else root.lstat()
+    marker = _marker_identity(root)
+    try:
+        after = root.lstat()
+        marker_after = _marker_identity(root)
+    except OSError as exc:
+        raise PrivacyStoreError("repository identity changed while it was inspected") from exc
+    if (
+        not stat.S_ISDIR(after.st_mode)
+        or _is_reparse_point(after)
+        or not _same_identity(before, after)
+        or marker != marker_after
+    ):
+        raise PrivacyStoreError("repository identity changed while it was inspected")
+    return {
+        "root_device": str(after.st_dev),
+        "root_inode": str(after.st_ino),
+        "git_marker": marker,
+    }
+
+
+def _valid_repository_identity(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "root_device",
+        "root_inode",
+        "git_marker",
+    }:
+        return False
+    if not all(isinstance(value[key], str) and value[key] for key in ("root_device", "root_inode")):
+        return False
+    marker = value["git_marker"]
+    if not isinstance(marker, dict) or marker.get("kind") not in {
+        "missing",
+        "directory",
+        "file",
+        "link",
+        "special",
+    }:
+        return False
+    if marker["kind"] == "missing":
+        return set(marker) == {"kind"}
+    return set(marker) == {"kind", "device", "inode"} and all(
+        isinstance(marker[key], str) and marker[key] for key in ("device", "inode")
+    )
+
+
+def _require_same_repository_identity(root: Path, expected: Mapping[str, object]) -> None:
+    if _repository_identity(root) != expected:
+        raise PrivacyStoreError("repository identity changed before consent state was written")
+
+
+def _entry_matches(entry: object, root: Path, identity: Mapping[str, object]) -> bool:
+    return (
+        isinstance(entry, dict)
+        and entry.get("path") == str(root)
+        and entry.get("identity") == identity
+    )
+
+
+def _repository_id(root: Path, identity: Mapping[str, object]) -> str:
+    payload = json.dumps(
+        {"path": os.path.normcase(str(root)), "identity": identity},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def require_provider_consent(

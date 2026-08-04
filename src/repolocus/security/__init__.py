@@ -20,6 +20,7 @@ from .redaction import (
     redact_secrets_with_count,
     redact_text,
 )
+from .secrets import SecretMatch, contains_high_confidence_secret, find_likely_secrets
 
 __all__ = [
     "CloudSendPreview",
@@ -27,11 +28,14 @@ __all__ = [
     "PathSecurityError",
     "PrivacyStore",
     "PrivacyStoreError",
+    "SecretMatch",
     "build_cloud_send_preview",
     "canonical_endpoint",
+    "contains_high_confidence_secret",
     "contains_likely_secret",
     "ensure_within_root",
     "escape_untrusted_display",
+    "find_likely_secrets",
     "has_unsafe_display_controls",
     "is_local_provider",
     "is_loopback_url",

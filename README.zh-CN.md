@@ -30,7 +30,7 @@ pipx install ./RepoLocus
 cd 你的仓库
 repolocus scan
 repolocus map
-repolocus ask "配置在哪里校验？"
+repolocus ask "设置值由哪个模块检查？"
 repolocus diagram
 ```
 
@@ -46,12 +46,12 @@ repolocus ask "请求如何进入核心循环？" --model ollama/qwen3-coder
 
 云模型调用前，RepoLocus 会展示模型、规范化目的端点、精确序列化 payload 字节数、源码
 片段、文件列表和估算 Token 数。可用 `--allow-cloud` 仅授权本次调用，或同时使用
-`--remember-consent` 为当前仓库记住该供应商端点。v2 授权会绑定规范仓库路径、供应商、
-scheme、host、有效端口和完整请求路径；compatible endpoint 变化后必须重新授权。升级前的
-v1 供应商级授权会按 fail-closed 原则失效，需要重新 grant。
-`map`、`diagram` 和 `ask` 默认使用 `--refresh auto`：优先读取最近一次兼容的已提交 snapshot，
-仅在不存在兼容 snapshot 时扫描。`--refresh always` 会先扫描，`--refresh never` 禁止扫描并在
-没有兼容 snapshot 时失败。
+`--remember-consent` 为当前仓库记住该供应商端点。v3 授权会绑定当前仓库身份、规范路径、
+供应商、scheme、host、有效端口和完整请求路径；仓库目录或 Git marker 被替换、compatible
+endpoint 变化后都必须重新授权。旧的 v1/v2 路径级授权会按 fail-closed 原则失效。
+`map`、`diagram` 和 `ask` 默认使用 `--refresh auto`：查询前执行有界资源预算的增量刷新，避免同一
+路径下的新内容继承旧证据。只有显式要求固定最近一次兼容 snapshot 时才使用
+`--refresh never`。
 
 `repolocus ask ... --follow-up` 可在当前进程内继续追问；首次回答会固定 index generation，
 后续问题关闭 refresh 并要求同一 generation，若其他扫描推进 generation 则 fail closed。输入
@@ -61,6 +61,7 @@ v1 供应商级授权会按 fail-closed 原则失效，需要重新 grant。
 
 - 安全扫描：遵循 `.gitignore`，排除二进制、大文件、密钥文件、构建产物和符号链接；
 - 增量索引：仓库外 SQLite/FTS5 缓存，按文件哈希更新；
+- 配置安全：用户、仓库与环境设置合并后执行类型和边界校验，仓库配置只能收紧资源限制；
 - 项目地图：固定章节、源码链接和 `Confirmed` / `Inferred` / `Needs review` 标签；
 - 证据问答：符号、FTS5/BM25、term 索引与依赖邻居混合检索；term 索引拆分
   camelCase、snake_case 和路径，并为连续 CJK 文本建立 bigram/trigram；用户可通过
@@ -72,7 +73,7 @@ v1 供应商级授权会按 fail-closed 原则失效，需要重新 grant。
 - 隐私控制：默认关闭遥测，云端逐次授权或按仓库和端点记忆授权，可预览与撤回；
 - 自托管 API：安装 `api` 可选依赖后运行 `repolocus serve`。
 - 评测：输出 recall@k、MRR、nDCG@k、any/all-path、citation recall、no-answer
-  precision/accuracy 及按语言汇总；当前仍只是小型 regression set。
+  precision/recall/F1/accuracy，以及按语言和查询类型汇总；当前仍只是小型 regression set。
 
 ## Agent Skill
 
@@ -144,7 +145,13 @@ ACL 检查，因此 `doctor --security` 会明确将 ACL 状态报告为“未�
 扫描器默认排除识别出的 RepoLocus 生成文档；索引仍为迁移或显式导入的记录保留
 `generated` provenance。不完整或暂时不可读的扫描会把旧 facts 保留为 `stale`。默认查询只使用 `source` 且非 `stale` 的已提交 snapshot，确认删除后
 才移除对应行。每次提交通过单调 generation 做 compare-and-swap，拒绝旧扫描覆盖新结果。
-这属于安全重读、内容哈希和 parser-fact 复用，不是 manifest-delta watcher。
+`ask` 的兼容分析版本刷新使用 metadata-only manifest，跳过未变化文件的正文和 parser facts；
+Python API 的 `RepoLocusService.scan()` 对未变化文件同样只返回 metadata 和已缓存的 fact
+计数。需要物化 facts 时应调用 `map()`、`diagram()` 或 `evidence()`。变化文件会安全读取、
+哈希并重新解析。
+扫描同时限制文件/entry 数、总字节、目录深度、chunks、symbols，并在有界操作前后检查总耗时；
+阻塞的文件系统调用或第三方 parser 可能在下一次检查前超时。检测到预算耗尽时，未完成范围会
+标为 `stale`，而不是确认删除旧 facts。
 
 完整命令、架构、测试与开发说明以英文
 [README.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/README.md) 为准。隐私与安全

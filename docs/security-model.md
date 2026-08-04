@@ -40,15 +40,15 @@ retrieved evidence and that the paired quote occurs in that cited source range. 
 that the quote logically supports the model's claim; accepted model text therefore keeps
 `needs_review` confidence.
 
-The default `refresh=auto` query path reads the last compatible committed snapshot without
-rescanning. This makes one operation internally reproducible but does not promise that the
-snapshot reflects an uncommitted filesystem change made afterward. Use `refresh=always` when a
-new scan is required; `refresh=never` fails closed if no compatible snapshot exists. Follow-up
-sessions additionally pin the original generation and stop if another scan changes it.
+The default `refresh=auto` query path performs a bounded incremental refresh before reading
+evidence. `refresh=never` is the explicit committed-snapshot mode and fails closed if no compatible
+snapshot exists. Follow-up sessions pin the original generation and stop if another scan changes
+it. Metadata reuse is permitted only for the same repository identity and analysis version;
+changed files are reopened, hashed, and reparsed.
 
-Remembered-consent state v2 binds a canonical repository and provider to the destination scheme,
-host, effective port, and complete request path. It deliberately does not carry forward legacy v1
-family-only grants because no safe endpoint can be inferred during migration. A changed endpoint
+Remembered-consent state v3 binds the current root-directory and Git-marker identity, canonical
+path, and provider to the destination scheme, host, effective port, and complete request path. It
+does not carry forward legacy v1/v2 path-only grants. A replaced repository or changed endpoint
 therefore requires a new explicit grant. Model names are displayed in previews but are not part of
 the grant identity.
 

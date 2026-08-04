@@ -71,6 +71,23 @@ def _cjk_ngrams(value: str) -> tuple[str, ...]:
     return tuple(terms)
 
 
+def _cjk_coverage_terms(value: str) -> tuple[str, ...]:
+    """Return bounded, position-spread anchors for one contiguous CJK run.
+
+    Overlapping n-grams are highly correlated: ``配置在`` alone contains three
+    generated terms for a longer question that starts the same way.  Coverage
+    therefore uses the complete run plus at most three bigrams spread across
+    its beginning, middle, and end.  Ranking may still use every n-gram.
+    """
+
+    if len(value) <= 2:
+        return (value,)
+    positions = {0, len(value) - 2}
+    if len(value) >= 5:
+        positions.add((len(value) - 2) // 2)
+    return tuple(dict.fromkeys((value, *(value[index : index + 2] for index in sorted(positions)))))
+
+
 def _lexical_terms(text: str, *, maximum: int) -> tuple[str, ...]:
     if not isinstance(text, str) or maximum <= 0:
         return ()
@@ -97,6 +114,64 @@ def literal_query_terms(query: str, *, maximum: int = 64) -> tuple[str, ...]:
     """Return only terms written by the user, without synonym expansion."""
 
     return _lexical_terms(query, maximum=maximum)
+
+
+def is_cjk_term(term: str) -> bool:
+    """Return whether a normalized term consists entirely of one CJK run."""
+
+    return isinstance(term, str) and _CJK_RUN.fullmatch(term) is not None
+
+
+def literal_query_term_groups(
+    query: str,
+    *,
+    maximum: int = 64,
+) -> tuple[tuple[str, ...], ...]:
+    """Return the literal coverage groups required for a retrieval candidate.
+
+    Non-CJK terms remain singleton groups so the index can apply a bounded
+    coverage ratio across them. Each contiguous CJK run is represented by one
+    group containing position-spread anchors, because counting every overlapping
+    bigram and trigram would overstate coverage of one small matching fragment.
+    """
+
+    literal = literal_query_terms(query, maximum=maximum)
+    if not literal:
+        return ()
+    available = set(literal)
+    normalized = unicodedata.normalize("NFKC", query)
+    cjk_groups: list[tuple[str, ...]] = []
+    for match in _CJK_RUN.finditer(normalized):
+        candidates = _cjk_coverage_terms(match.group(0))
+        group: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            term = _normalized(candidate)[:128]
+            if term in available and term not in seen:
+                seen.add(term)
+                group.append(term)
+        if group:
+            cjk_groups.append(tuple(group))
+
+    groups: list[tuple[str, ...]] = []
+    emitted_cjk_groups: set[int] = set()
+    for term in literal:
+        matching_groups = [index for index, group in enumerate(cjk_groups) if term in group]
+        if matching_groups:
+            for index in matching_groups:
+                if index not in emitted_cjk_groups:
+                    emitted_cjk_groups.add(index)
+                    groups.append(cjk_groups[index])
+            continue
+        if _CJK_RUN.search(term):
+            # Mixed CJK/non-CJK lexical tokens are represented by their
+            # independently generated components.  If bounding left no CJK
+            # component, retain the mixed token as a fail-closed requirement.
+            if not cjk_groups:
+                groups.append((term,))
+            continue
+        groups.append((term,))
+    return tuple(groups)
 
 
 def _morphological_expansions(term: str) -> tuple[str, ...]:

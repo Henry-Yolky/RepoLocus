@@ -7,8 +7,9 @@ import hashlib
 import os
 import stat
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from time import monotonic
 
 from repolocus.models import ANALYSIS_VERSION, ScannedFile, ScanResult, ScanStats
 from repolocus.parsers import DEFAULT_REGISTRY, ParseResult, ParserRegistry
@@ -21,17 +22,76 @@ from repolocus.scanner.filters import (
     is_sensitive_path,
 )
 from repolocus.scanner.ignore import IgnoreRules
+from repolocus.security.identity import descriptor_path, filesystem_identity
 
 DEFAULT_MAX_FILE_BYTES = 1_000_000
 DEFAULT_MAX_IGNORE_BYTES = 256_000
+DEFAULT_MAX_REPOSITORY_FILES = 100_000
+DEFAULT_MAX_REPOSITORY_BYTES = 512_000_000
+DEFAULT_MAX_DIRECTORY_DEPTH = 64
+DEFAULT_MAX_REPOSITORY_CHUNKS = 500_000
+DEFAULT_MAX_REPOSITORY_SYMBOLS = 500_000
+DEFAULT_MAX_SCAN_SECONDS = 120
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_IS_WINDOWS = os.name == "nt"
 _USE_DIRECTORY_FDS = (
     os.name == "posix"
     and os.open in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.scandir in os.supports_fd
 )
+
+
+@dataclass(slots=True)
+class _ScanBudget:
+    max_entries: int
+    max_bytes: int
+    max_chunks: int
+    max_symbols: int
+    deadline: float
+    entries: int = 0
+    bytes_seen: int = 0
+    chunks: int = 0
+    symbols: int = 0
+    exhausted_reason: str | None = None
+    reported: bool = False
+
+    def check_deadline(self) -> bool:
+        if self.exhausted_reason is None and monotonic() > self.deadline:
+            self.exhausted_reason = "scan deadline"
+        return self.exhausted_reason is None
+
+    def observe_entry(self) -> bool:
+        if not self.check_deadline():
+            return False
+        if self.entries + 1 > self.max_entries:
+            self.exhausted_reason = "repository file/entry count"
+            return False
+        self.entries += 1
+        return True
+
+    def observe_bytes(self, size: int) -> bool:
+        if not self.check_deadline():
+            return False
+        if self.bytes_seen + size > self.max_bytes:
+            self.exhausted_reason = "repository byte count"
+            return False
+        self.bytes_seen += size
+        return True
+
+    def observe_facts(self, chunks: int, symbols: int) -> bool:
+        if not self.check_deadline():
+            return False
+        if self.chunks + chunks > self.max_chunks:
+            self.exhausted_reason = "repository chunk count"
+            return False
+        if self.symbols + symbols > self.max_symbols:
+            self.exhausted_reason = "repository symbol count"
+            return False
+        self.chunks += chunks
+        self.symbols += symbols
+        return True
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -64,6 +124,37 @@ def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
     return _same_content_state(first, second) and first.st_ctime_ns == second.st_ctime_ns
 
 
+def _is_stable_unpinned_directory(
+    directory: Path,
+    root: Path,
+    expected: os.stat_result,
+) -> bool:
+    """Validate a path-based directory traversal against its enumerated identity."""
+
+    try:
+        before = directory.lstat()
+    except OSError:
+        return False
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or _is_reparse_point(before)
+        or not _same_identity(expected, before)
+    ):
+        return False
+    try:
+        resolved = directory.resolve(strict=True)
+        after = directory.lstat()
+    except (OSError, RuntimeError):
+        return False
+    return (
+        _is_within(resolved, root)
+        and stat.S_ISDIR(after.st_mode)
+        and not _is_reparse_point(after)
+        and _same_identity(expected, after)
+        and _same_identity(before, after)
+    )
+
+
 def _read_descriptor(descriptor: int, limit: int) -> tuple[bytes | None, str | None]:
     blocks: list[bytes] = []
     remaining = limit + 1
@@ -87,11 +178,13 @@ def _safe_read_at(
     *,
     directory: Path,
     directory_fd: int | None,
+    root: Path | None = None,
 ) -> tuple[bytes | None, os.stat_result | None, str | None]:
     """Open and read one enumerated file without resolving a path component twice."""
 
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
     target: str | Path = name if directory_fd is not None else directory / name
@@ -107,6 +200,8 @@ def _safe_read_at(
             else "unreadable"
         )
         return None, None, reason
+    accepted_payload: bytes | None = None
+    preclose_path: os.stat_result | None = None
     try:
         try:
             opened = os.fstat(descriptor)
@@ -118,6 +213,13 @@ def _safe_read_at(
             or not _same_identity(expected, opened)
         ):
             return None, None, "changed_during_scan"
+        # A pinned directory descriptor already confines POSIX openat reads.
+        # Descriptor-path attestation is required only for the path-based
+        # fallback (and on Windows), where it closes the final open race.
+        if root is not None and directory_fd is None:
+            opened_path = descriptor_path(descriptor)
+            if opened_path is None or not _is_within(opened_path, root):
+                return None, None, "changed_during_scan"
         if opened.st_size > limit:
             return None, None, "oversize"
         payload, reason = _read_descriptor(descriptor, limit)
@@ -139,9 +241,27 @@ def _safe_read_at(
             or not _same_file_state(expected, current)
         ):
             return None, None, "changed_during_scan"
-        return payload, finished, None
+        accepted_payload = payload
+        preclose_path = current
     finally:
         os.close(descriptor)
+
+    if accepted_payload is None or preclose_path is None:  # pragma: no cover - control flow
+        raise RuntimeError("safe read completed without an accepted snapshot")
+    try:
+        if directory_fd is None:
+            persisted = os.stat(target, follow_symlinks=False)
+        else:
+            persisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return None, None, "changed_during_scan"
+    if (
+        not stat.S_ISREG(persisted.st_mode)
+        or _is_reparse_point(persisted)
+        or not _same_file_state(preclose_path, persisted)
+    ):
+        return None, None, "changed_during_scan"
+    return accepted_payload, persisted, None
 
 
 def _safe_read(path: Path, limit: int) -> tuple[bytes | None, str | None]:
@@ -161,6 +281,29 @@ def _safe_read(path: Path, limit: int) -> tuple[bytes | None, str | None]:
         directory_fd=None,
     )
     return payload, reason
+
+
+def _metadata_still_matches_at(
+    name: str,
+    expected: os.stat_result,
+    *,
+    directory: Path,
+    directory_fd: int | None,
+) -> bool:
+    """Revalidate one metadata-only cache hit without opening its contents."""
+
+    try:
+        if directory_fd is None:
+            current = os.stat(directory / name, follow_symlinks=False)
+        else:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(current.st_mode)
+        and not _is_reparse_point(current)
+        and _same_file_state(expected, current)
+    )
 
 
 def _open_directory_at(
@@ -246,6 +389,12 @@ class RepositoryScanner:
         max_chunk_lines: int = 160,
         max_chunk_chars: int = 16_000,
         max_ignore_bytes: int = DEFAULT_MAX_IGNORE_BYTES,
+        max_repository_files: int = DEFAULT_MAX_REPOSITORY_FILES,
+        max_repository_bytes: int = DEFAULT_MAX_REPOSITORY_BYTES,
+        max_directory_depth: int = DEFAULT_MAX_DIRECTORY_DEPTH,
+        max_repository_chunks: int = DEFAULT_MAX_REPOSITORY_CHUNKS,
+        max_repository_symbols: int = DEFAULT_MAX_REPOSITORY_SYMBOLS,
+        max_scan_seconds: int = DEFAULT_MAX_SCAN_SECONDS,
         parser_registry: ParserRegistry | None = None,
         analysis_version: str = ANALYSIS_VERSION,
     ) -> None:
@@ -255,12 +404,28 @@ class RepositoryScanner:
             raise ValueError("max_ignore_bytes must be positive")
         if max_chunk_lines <= 0 or max_chunk_chars <= 0:
             raise ValueError("chunk limits must be positive")
+        for name, value in (
+            ("max_repository_files", max_repository_files),
+            ("max_repository_bytes", max_repository_bytes),
+            ("max_directory_depth", max_directory_depth),
+            ("max_repository_chunks", max_repository_chunks),
+            ("max_repository_symbols", max_repository_symbols),
+            ("max_scan_seconds", max_scan_seconds),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if not analysis_version or len(analysis_version) > 96:
             raise ValueError("analysis_version must be a short non-empty string")
         self.max_file_bytes = max_file_bytes
         self.max_ignore_bytes = max_ignore_bytes
         self.max_chunk_lines = max_chunk_lines
         self.max_chunk_chars = max_chunk_chars
+        self.max_repository_files = max_repository_files
+        self.max_repository_bytes = max_repository_bytes
+        self.max_directory_depth = max_directory_depth
+        self.max_repository_chunks = max_repository_chunks
+        self.max_repository_symbols = max_repository_symbols
+        self.max_scan_seconds = max_scan_seconds
         self.parser_registry = parser_registry or DEFAULT_REGISTRY
         self.analysis_version = (
             f"{analysis_version}:lines={max_chunk_lines}:chars={max_chunk_chars}"
@@ -271,6 +436,7 @@ class RepositoryScanner:
         root: Path | str,
         *,
         cached_files: Mapping[str, ScannedFile] | None = None,
+        trusted_cache: bool = False,
         base_generation: int | None = None,
     ) -> ScanResult:
         """Return a stable scan of *root*.
@@ -284,6 +450,8 @@ class RepositoryScanner:
             isinstance(base_generation, bool) or base_generation < 0
         ):
             raise ValueError("base_generation must be a non-negative integer or None")
+        if not isinstance(trusted_cache, bool):
+            raise ValueError("trusted_cache must be true or false")
         supplied_root = Path(root).expanduser().absolute()
         try:
             root_metadata = supplied_root.lstat()
@@ -294,12 +462,23 @@ class RepositoryScanner:
         if not stat.S_ISDIR(root_metadata.st_mode):
             raise ValueError("repository root must be a directory")
         resolved_root = supplied_root.resolve(strict=True)
+        try:
+            root_identity = filesystem_identity(root_metadata)
+        except ValueError as exc:
+            raise ValueError("repository root has no stable filesystem identity") from exc
 
         files: list[ScannedFile] = []
         stats = ScanStats()
         warnings: list[str] = []
         temporarily_unreadable: set[str] = set()
         reusable = cached_files or {}
+        budget = _ScanBudget(
+            max_entries=self.max_repository_files,
+            max_bytes=self.max_repository_bytes,
+            max_chunks=self.max_repository_chunks,
+            max_symbols=self.max_repository_symbols,
+            deadline=monotonic() + self.max_scan_seconds,
+        )
         root_fd: int | None = None
         if _USE_DIRECTORY_FDS:
             flags = os.O_RDONLY
@@ -325,6 +504,7 @@ class RepositoryScanner:
                 resolved_root,
                 resolved_root,
                 root_fd,
+                root_metadata,
                 PurePosixPath(),
                 IgnoreRules(),
                 files,
@@ -332,10 +512,26 @@ class RepositoryScanner:
                 warnings,
                 temporarily_unreadable,
                 reusable,
+                trusted_cache,
+                budget,
             )
         finally:
             if root_fd is not None:
                 os.close(root_fd)
+        try:
+            final_root_metadata = supplied_root.lstat()
+        except OSError:
+            final_root_metadata = None
+        if (
+            final_root_metadata is None
+            or not stat.S_ISDIR(final_root_metadata.st_mode)
+            or _is_reparse_point(final_root_metadata)
+            or not _same_identity(root_metadata, final_root_metadata)
+        ):
+            files.clear()
+            stats = ScanStats(skipped={"changed_during_scan": 1})
+            warnings = ["repository root changed during scan"]
+            temporarily_unreadable = {"."}
         files.sort(key=lambda item: item.path)
         warnings.sort()
         return ScanResult(
@@ -346,10 +542,12 @@ class RepositoryScanner:
             analysis_version=self.analysis_version,
             temporarily_unreadable=tuple(sorted(temporarily_unreadable)),
             base_generation=base_generation,
+            repository_identity=root_identity,
         )
 
     def _load_local_ignore(
         self,
+        root: Path,
         directory: Path,
         directory_fd: int | None,
         relative_directory: PurePosixPath,
@@ -382,6 +580,7 @@ class RepositoryScanner:
             metadata,
             directory=directory,
             directory_fd=directory_fd,
+            root=root,
         )
         if payload is None:
             location = (relative_directory / ".gitignore").as_posix()
@@ -402,6 +601,7 @@ class RepositoryScanner:
         root: Path,
         directory: Path,
         directory_fd: int | None,
+        expected_directory: os.stat_result,
         relative_directory: PurePosixPath,
         inherited_rules: IgnoreRules,
         files: list[ScannedFile],
@@ -409,8 +609,90 @@ class RepositoryScanner:
         warnings: list[str],
         temporarily_unreadable: set[str],
         cached_files: Mapping[str, ScannedFile],
+        trusted_cache: bool,
+        budget: _ScanBudget,
     ) -> None:
+        file_checkpoint = len(files)
+        warning_checkpoint = len(warnings)
+        unreadable_checkpoint = set(temporarily_unreadable)
+        stats_checkpoint = (
+            stats.discovered_files,
+            stats.indexed_files,
+            stats.indexed_bytes,
+            dict(stats.languages),
+            dict(stats.skipped),
+        )
+        directory_location = relative_directory.as_posix() or "."
+
+        def stop_for_global_budget() -> None:
+            temporarily_unreadable.add(".")
+            if not budget.reported:
+                budget.reported = True
+                stats.skip("repository_budget")
+                warnings.append(
+                    f"repository scan stopped at {budget.exhausted_reason or 'a hard limit'}"
+                )
+
+        def discard_changed_directory() -> None:
+            del files[file_checkpoint:]
+            del warnings[warning_checkpoint:]
+            temporarily_unreadable.clear()
+            temporarily_unreadable.update(unreadable_checkpoint)
+            (
+                stats.discovered_files,
+                stats.indexed_files,
+                stats.indexed_bytes,
+                languages,
+                skipped,
+            ) = stats_checkpoint
+            stats.languages.clear()
+            stats.languages.update(languages)
+            stats.skipped.clear()
+            stats.skipped.update(skipped)
+            stats.skip("changed_during_scan")
+            warnings.append(f"directory changed during scan: {directory_location}")
+            temporarily_unreadable.add(directory_location)
+            if budget.exhausted_reason is not None:
+                # A rollback removes the first budget diagnostic as well. Let
+                # the global marker be emitted again so callers retain both
+                # independent reasons that this scan is incomplete.
+                budget.reported = False
+                stop_for_global_budget()
+
+        def directory_is_stable() -> bool:
+            # A descriptor pins the opened directory object, but it does not
+            # prove that the repository-relative path still names that object.
+            # Revalidate the path binding as well so a rename followed by a
+            # replacement cannot make facts from the detached directory fresh.
+            if not _is_stable_unpinned_directory(directory, root, expected_directory):
+                return False
+            if directory_fd is None:
+                return True
+            try:
+                opened_directory = os.fstat(directory_fd)
+            except OSError:
+                return False
+            return (
+                stat.S_ISDIR(opened_directory.st_mode)
+                and not _is_reparse_point(opened_directory)
+                and _same_identity(expected_directory, opened_directory)
+            )
+
+        # A path-based traversal must validate the identity and root boundary
+        # before opening a local ignore file or enumerating any children.
+        if len(relative_directory.parts) > self.max_directory_depth:
+            stats.skip("max_directory_depth")
+            warnings.append(f"maximum directory depth reached: {directory_location}")
+            temporarily_unreadable.add(directory_location)
+            return
+        if not budget.check_deadline():
+            stop_for_global_budget()
+            return
+        if not directory_is_stable():
+            discard_changed_directory()
+            return
         rules = self._load_local_ignore(
+            root,
             directory,
             directory_fd,
             relative_directory,
@@ -418,21 +700,44 @@ class RepositoryScanner:
             warnings,
             temporarily_unreadable,
         )
+        if not directory_is_stable():
+            discard_changed_directory()
+            return
         if rules is None:
             stats.skip("unreadable_ignore")
             return
         try:
             scan_target: int | Path = directory_fd if directory_fd is not None else directory
             with os.scandir(scan_target) as iterator:
-                entries = sorted(iterator, key=lambda entry: entry.name)
+                entries = []
+                for entry in iterator:
+                    if not budget.observe_entry():
+                        stop_for_global_budget()
+                        return
+                    entries.append(entry)
+                entries.sort(key=lambda entry: entry.name)
         except OSError:
-            location = relative_directory.as_posix() or "."
+            if not directory_is_stable():
+                discard_changed_directory()
+                return
             stats.skip("unreadable")
-            warnings.append(f"could not list directory: {location}")
-            temporarily_unreadable.add(location)
+            warnings.append(f"could not list directory: {directory_location}")
+            temporarily_unreadable.add(directory_location)
+            return
+        if not directory_is_stable():
+            discard_changed_directory()
+            return
+        if not budget.check_deadline():
+            stop_for_global_budget()
             return
 
         for entry in entries:
+            if not budget.check_deadline():
+                stop_for_global_budget()
+                return
+            if not directory_is_stable():
+                discard_changed_directory()
+                return
             relative_path = relative_directory / entry.name
             display_path = relative_path.as_posix()
             absolute_path = directory / entry.name
@@ -443,6 +748,9 @@ class RepositoryScanner:
                 else:
                     metadata = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError:
+                if not directory_is_stable():
+                    discard_changed_directory()
+                    return
                 stats.discovered_files += 1
                 stats.skip("unreadable")
                 warnings.append(f"could not inspect path: {display_path}")
@@ -457,6 +765,10 @@ class RepositoryScanner:
                     warnings.append(f"outside-root symlink skipped: {display_path}")
                 else:
                     warnings.append(f"symlink skipped: {display_path}")
+                # The entry may have replaced a previously indexed file or
+                # directory. Never interpret that old subtree as a confirmed
+                # deletion when the current object cannot be traversed.
+                temporarily_unreadable.add(display_path)
                 continue
 
             if stat.S_ISDIR(metadata.st_mode):
@@ -474,23 +786,12 @@ class RepositoryScanner:
                         warnings.append(f"could not safely open directory: {display_path}")
                         temporarily_unreadable.add(display_path)
                         continue
-                else:
-                    try:
-                        resolved_directory = absolute_path.resolve(strict=True)
-                    except OSError:
-                        stats.skip("unreadable")
-                        warnings.append(f"could not resolve directory: {display_path}")
-                        temporarily_unreadable.add(display_path)
-                        continue
-                    if not _is_within(resolved_directory, root):
-                        stats.skip("outside_root")
-                        warnings.append(f"outside-root directory skipped: {display_path}")
-                        continue
                 try:
                     self._walk(
                         root,
                         absolute_path,
                         child_fd,
+                        metadata,
                         relative_path,
                         rules,
                         files,
@@ -498,10 +799,18 @@ class RepositoryScanner:
                         warnings,
                         temporarily_unreadable,
                         cached_files,
+                        trusted_cache,
+                        budget,
                     )
                 finally:
                     if child_fd is not None:
                         os.close(child_fd)
+                if not directory_is_stable():
+                    discard_changed_directory()
+                    return
+                if budget.exhausted_reason is not None:
+                    stop_for_global_budget()
+                    return
                 continue
 
             stats.discovered_files += 1
@@ -535,19 +844,67 @@ class RepositoryScanner:
                     warnings.append(f"could not resolve file: {display_path}")
                     temporarily_unreadable.add(display_path)
                     continue
+                if not directory_is_stable():
+                    discard_changed_directory()
+                    return
                 if not _is_within(resolved_file, root):
-                    stats.skip("outside_root")
-                    warnings.append(f"outside-root file skipped: {display_path}")
+                    stats.skip("changed_during_scan")
+                    warnings.append(f"file changed during scan: {display_path}")
+                    temporarily_unreadable.add(display_path)
                     continue
 
             cached = cached_files.get(display_path)
+            if not budget.observe_bytes(metadata.st_size):
+                stop_for_global_budget()
+                return
+            # Service-provided cache entries are bound to the same repository
+            # identity and analysis version. Exact metadata matches can therefore
+            # reuse parser facts without reading and hashing unchanged contents.
+            if (
+                trusted_cache
+                and cached is not None
+                and cached.provenance == "source"
+                and not cached.stale
+                and cached.language == language
+                and cached.size_bytes == metadata.st_size
+                and cached.mtime_ns == metadata.st_mtime_ns
+                and cached.ctime_ns == metadata.st_ctime_ns
+                and _metadata_still_matches_at(
+                    entry.name,
+                    metadata,
+                    directory=directory,
+                    directory_fd=directory_fd,
+                )
+            ):
+                cached_chunks = (
+                    len(cached.chunks) or cached.cached_chunk_count or int(bool(cached.text))
+                )
+                cached_symbols = len(cached.symbols) or cached.cached_symbol_count
+                if not budget.observe_facts(cached_chunks, cached_symbols):
+                    stop_for_global_budget()
+                    return
+                if not directory_is_stable():
+                    discard_changed_directory()
+                    return
+                files.append(replace(cached, provenance="source", stale=False))
+                stats.indexed_files += 1
+                stats.indexed_bytes += cached.size_bytes
+                stats.languages[language] = stats.languages.get(language, 0) + 1
+                continue
             payload, post_read_metadata, read_error = _safe_read_at(
                 entry.name,
                 self.max_file_bytes,
                 metadata,
                 directory=directory,
                 directory_fd=directory_fd,
+                root=root,
             )
+            if not directory_is_stable():
+                discard_changed_directory()
+                return
+            if not budget.check_deadline():
+                stop_for_global_budget()
+                return
             if payload is None:
                 stats.skip(read_error or "unreadable")
                 if read_error == "changed_during_scan":
@@ -570,6 +927,10 @@ class RepositoryScanner:
                 stats.skip("binary")
                 warnings.append(f"non-UTF-8 file skipped: {display_path}")
                 continue
+            if _IS_WINDOWS:
+                # Binary descriptor reads preserve on-disk bytes for size and hashing;
+                # normalize the CRLF translation previously supplied by the CRT.
+                text = text.replace("\r\n", "\n")
             if is_generated_document(text, language):
                 stats.skip("generated")
                 continue
@@ -582,10 +943,19 @@ class RepositoryScanner:
                 continue
             if (
                 cached is not None
+                and cached.provenance == "source"
+                and not cached.stale
                 and cached.language == language
                 and cached.size_bytes == len(payload)
                 and cached.sha256.casefold() == digest
             ):
+                cached_chunks = (
+                    len(cached.chunks) or cached.cached_chunk_count or int(bool(cached.text))
+                )
+                cached_symbols = len(cached.symbols) or cached.cached_symbol_count
+                if not budget.observe_facts(cached_chunks, cached_symbols):
+                    stop_for_global_budget()
+                    return
                 files.append(
                     replace(
                         cached,
@@ -608,6 +978,20 @@ class RepositoryScanner:
                     max_chunk_lines=self.max_chunk_lines,
                     max_chunk_chars=self.max_chunk_chars,
                 )
+            except Exception as exc:  # Parser plugins are an isolation boundary.
+                stats.skip("parse_error")
+                warnings.append(f"parse failed ({type(exc).__name__}) for file: {display_path}")
+                temporarily_unreadable.add(display_path)
+                continue
+
+            if not budget.check_deadline():
+                stop_for_global_budget()
+                return
+            parsed_chunks = len(parsed.chunks) or int(bool(text))
+            if not budget.observe_facts(parsed_chunks, len(parsed.symbols)):
+                stop_for_global_budget()
+                return
+            try:
                 _validate_parse_result(
                     parsed,
                     path=display_path,
@@ -642,6 +1026,12 @@ class RepositoryScanner:
             stats.indexed_files += 1
             stats.indexed_bytes += len(payload)
             stats.languages[language] = stats.languages.get(language, 0) + 1
+
+        if not directory_is_stable():
+            discard_changed_directory()
+            return
+        if not budget.check_deadline():
+            stop_for_global_budget()
 
     @staticmethod
     def _symlink_reason(path: Path, root: Path) -> str:

@@ -41,7 +41,10 @@ flowchart LR
 
 ## Data invariants
 
-All stored and returned paths are POSIX-style and relative to one canonical repository root.
+Indexed source addresses are POSIX-style and relative to one canonical repository root. Generated
+file links are relative to the output document; stdout/API document links are explicitly
+repository-root-relative. Operational metadata may separately expose the canonical absolute root
+and external index path.
 Source lines are one-based and inclusive. Every symbol and chunk has a concrete line range.
 Index updates occur in a transaction. Retrieval never expands beyond indexed chunks. Provider
 context is redacted and bounded by a character budget. Every material provider claim must be
@@ -54,11 +57,10 @@ body; execution consumes those values rather than retrieving the evidence again.
 ## Snapshot and index lifecycle
 
 The canonical repository path is hashed to choose an opaque database name under the user cache
-directory. The database records its canonical root, schema/parser versions, and monotonic commit
-generation. `map`, `diagram`, and `ask` use `refresh=auto` by default: a compatible committed
-snapshot is queried without scanning, while a missing or incompatible snapshot triggers a scan.
-`refresh=always` scans first; `refresh=never` forbids scanning and fails closed without a compatible
-snapshot. Callers can also pin an expected generation. CLI follow-up sessions pin the first
+directory. The database records its canonical root, directory identity, schema/parser versions,
+and monotonic commit generation. `map`, `diagram`, and `ask` use `refresh=auto` by default and run a
+bounded incremental refresh before querying. `refresh=never` is the explicit snapshot-only mode
+and fails closed without a compatible snapshot. Callers can also pin an expected generation. CLI follow-up sessions pin the first
 answer's generation and use `refresh=never`, so a concurrent generation change ends the session.
 
 Recognized RepoLocus-generated documents are excluded by the scanner. The schema also retains
@@ -73,11 +75,15 @@ scan cannot overwrite a newer commit. Unpinned scans may retry from the new gene
 caller that pinned a generation fails closed. `repolocus clean` deletes only that database and its
 SQLite sidecars.
 
-For a compatible analysis version, the scanner safely re-reads and hashes candidate files but
-reuses stored parser facts when the bytes are identical. This avoids trusting timestamps alone,
-while skipping AST/heuristic parsing and SQLite replacement for unchanged files. Parser or chunk
-policy changes alter the analysis version and force full fact regeneration. This is content-hash
-fact reuse after bounded discovery, not a manifest-delta watcher.
+For a compatible analysis version and repository identity, evidence refresh loads a metadata-only
+manifest instead of every source body and parser fact. Exact size/mtime/ctime matches reuse the
+stored facts; changed files are opened without following links, hashed, and reparsed. Parser,
+secret-detector, or chunk-policy changes alter the analysis version and force regeneration.
+Repository scans enforce hard count/size limits for entries/files, total candidate bytes, directory
+depth, chunks, and symbols. A monotonic elapsed-time deadline is checked before and after bounded
+I/O and parser operations; a blocking filesystem call or third-party parser may overrun before the
+next check. Any detected exhaustion marks the unvisited range incomplete so old facts become
+excluded `stale` rows rather than confirmed deletions.
 
 ## Extension points
 

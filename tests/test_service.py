@@ -30,12 +30,14 @@ class RecordingScanner(RepositoryScanner):
         root: Path | str,
         *,
         cached_files: Mapping[str, ScannedFile] | None = None,
+        trusted_cache: bool = False,
         base_generation: int | None = None,
     ) -> ScanResult:
         self.calls.append((base_generation, tuple(sorted((cached_files or {}).keys()))))
         return super().scan(
             root,
             cached_files=cached_files,
+            trusted_cache=trusted_cache,
             base_generation=base_generation,
         )
 
@@ -63,6 +65,45 @@ def test_end_to_end_local_workflow_is_incremental(
     assert any(item.path == "src/demo/config.py" for item in answer.evidence)
     assert preview.fragment_count == len(answer.evidence)
     assert not (sample_repo / ".repolocus").exists()
+
+
+def test_evidence_refresh_uses_metadata_manifest_instead_of_full_snapshot(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs)
+    service.scan(sample_repo)
+
+    def unexpected_full_materialization(_index: RepositoryIndex) -> list[ScannedFile]:
+        raise AssertionError("evidence refresh must not load every indexed source and parser fact")
+
+    monkeypatch.setattr(RepositoryIndex, "get_files", unexpected_full_materialization)
+
+    evidence, operation = service.evidence("Where is load_config defined?", sample_repo)
+
+    assert any(item.path == "src/demo/config.py" for item in evidence)
+    assert operation.update.unchanged > 0
+    assert all(file.text == "" for file in operation.result.files)
+
+
+def test_explicit_scan_refresh_uses_metadata_manifest(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs)
+    service.scan(sample_repo)
+
+    def unexpected_full_materialization(_index: RepositoryIndex) -> list[ScannedFile]:
+        raise AssertionError("incremental scan must not load every stored source body")
+
+    monkeypatch.setattr(RepositoryIndex, "get_files", unexpected_full_materialization)
+
+    operation = service.scan(sample_repo)
+
+    assert operation.update.unchanged > 0
+    assert all(file.text == "" for file in operation.result.files)
 
 
 def test_changed_file_updates_only_changed_content(
@@ -262,6 +303,16 @@ def test_snapshot_operation_contains_only_fresh_source_files(
     assert operation.update.stale == 1
     assert any("excludes 1 stale file" in warning for warning in operation.result.warnings)
 
+    _document, refreshed = service.map(
+        sample_repo,
+        refresh="auto",
+        expected_generation=second.generation,
+    )
+    readme = next(file for file in refreshed.result.files if file.path == "README.md")
+    assert readme.provenance == "source"
+    assert readme.text
+    assert readme.chunks
+
 
 def test_service_rejects_a_symlink_repository_root(
     sample_repo: Path, isolated_user_dirs: Path, tmp_path: Path
@@ -274,7 +325,7 @@ def test_service_rejects_a_symlink_repository_root(
         service.scan(linked)
 
 
-def test_empty_committed_snapshot_is_valid_for_auto_refresh(
+def test_auto_refresh_scans_even_when_committed_snapshot_is_empty(
     tmp_path: Path, isolated_user_dirs: Path
 ) -> None:
     repository = tmp_path / "empty"
@@ -289,8 +340,64 @@ def test_empty_committed_snapshot_is_valid_for_auto_refresh(
     first = service.scan(repository)
     _document, cached = service.map(repository, refresh="auto")
 
-    assert len(scanner.calls) == 1
-    assert first.update.generation == cached.update.generation
+    assert len(scanner.calls) == 2
+    assert cached.update.generation == first.update.generation + 1
+
+
+def test_auto_refresh_observes_edits_while_never_is_explicit_snapshot_reuse(
+    tmp_path: Path, isolated_user_dirs: Path
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = repository / "value.py"
+    source.write_text("OLD_SYMBOL = 1\n", encoding="utf-8")
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+
+    first, initial = service.evidence("OLD_SYMBOL", repository, refresh="auto")
+    source.write_text("NEW_SYMBOL = 2\n", encoding="utf-8")
+    stale, reused = service.evidence("OLD_SYMBOL", repository, refresh="never")
+    fresh, refreshed = service.evidence("NEW_SYMBOL", repository, refresh="auto")
+
+    assert first and stale
+    assert reused.update.generation == initial.update.generation
+    assert fresh
+    assert refreshed.update.generation == initial.update.generation + 1
+    assert len(scanner.calls) == 2
+
+
+def test_service_does_not_seed_scanner_cache_with_stale_files(
+    tmp_path: Path, isolated_user_dirs: Path
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+    first = service.scan(repository)
+    with RepositoryIndex.open(repository) as index:
+        index.update(
+            ScanResult(
+                repository,
+                [],
+                ScanStats(),
+                analysis_version=scanner.analysis_version,
+                temporarily_unreadable=("value.py",),
+                base_generation=first.update.generation,
+            )
+        )
+
+    service.scan(repository)
+
+    assert scanner.calls[-1][1] == ()
 
 
 def test_cloud_call_is_stopped_before_provider_creation(
@@ -436,6 +543,23 @@ def test_context_redacts_credentials(sample_repo: Path, isolated_user_dirs: Path
     assert "abcdefghijklmnopqrstuvwxyz" not in context
     assert "[REDACTED]" in context
     assert count >= 1
+
+
+def test_cloud_preview_counts_and_removes_secrets_from_the_question(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs, model="openai/test-model")
+    token = "glpat-abcdefghijklmnopqrstuvwxyz1234"
+
+    prepared, _operation = service.prepare_ask(
+        f"Where is load_config defined? token={token}",
+        sample_repo,
+    )
+
+    assert prepared.request_plan is not None
+    assert prepared.preview.redaction_count >= 1
+    assert token.encode() not in prepared.request_plan.body
 
 
 def test_context_escapes_source_delimiters_and_limits_citable_ranges(

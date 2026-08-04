@@ -22,9 +22,13 @@ Ollama endpoint and every cloud provider are disabled until the user either pass
 `--allow-cloud` for one call or records a repository/provider grant. Before every approved
 remote CLI call, RepoLocus displays the exact redacted source content and ranges, fragment count,
 estimated tokens, and redaction count that will be sent, including calls covered by a remembered
-grant. System and user prompts are redacted again immediately before transport. The self-hosted
-API has no interactive confirmation UI; cloud access is operator-disabled by default and should
-remain so unless a trusted front end provides an equivalent review step.
+grant. System and user prompts are redacted again immediately before transport, and the final
+serialized JSON body is scanned fail-closed before a network client is created. Provider responses
+are read with byte, content-type, JSON-depth, per-HTTP-phase timeout, and elapsed-deadline checks
+between streamed chunks. A blocking HTTP phase is bounded by the configured HTTPX phase timeout;
+the elapsed deadline is cooperative rather than an operating-system-level interrupt. The
+self-hosted API has no interactive confirmation UI; cloud access is operator-disabled by default
+and should remain so unless a trusted front end provides an equivalent review step.
 
 Only retrieved fragments needed for the question are sent. API credentials are read from
 environment variables and are never written to repository or consent configuration.
@@ -44,7 +48,7 @@ are not a guarantee that arbitrary source contains no confidential information. 
 RepoLocus does not import configuration, indexes, environment-variable settings, or remembered
 cloud consent from pre-rename DevPilot alpha builds. Requiring fresh configuration and consent
 prevents old network destinations or grants from silently carrying over. The legacy
-`.devpilot/` directory remains excluded from scans, and existing generated documents can still
-be safely replaced, but `repolocus clean --all` and `repolocus privacy revoke` operate only on
+`.devpilot/` directory remains excluded from scans, and recognized generated Markdown outputs can
+still be safely replaced, but `repolocus clean --all` and `repolocus privacy revoke` operate only on
 RepoLocus state. Inspect and explicitly remove obsolete operating-system config, cache, and state
 directories named `devpilot` if they are no longer needed.

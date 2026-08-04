@@ -28,6 +28,7 @@ from repolocus.config import Settings
 from repolocus.core import PrivacyRequiredError, RepoLocusService
 from repolocus.index import cache_root, index_path_for
 from repolocus.models import Evidence
+from repolocus.scanner import is_generated_document
 from repolocus.security import (
     CloudSendPreview,
     PrivacyStore,
@@ -48,11 +49,7 @@ app.add_typer(privacy_app, name="privacy")
 console = Console()
 error_console = Console(stderr=True)
 
-_GENERATED_OUTPUT_MARKER = re.compile(
-    r"^[ \t]*<!--[ \t]*Generator:[ \t]*(?:RepoLocus|DevPilot)"
-    r"(?:[ \t]+[^;<>\r\n]+)?;[ \t]*deterministic[ \t]+"
-    r"(?:source[ \t]+map|static[ \t]+graph)\.[ \t]*-->[ \t]*$"
-)
+_MARKDOWN_OUTPUT_SUFFIXES = frozenset({".md", ".markdown", ".mdown", ".mdx"})
 
 RepoArgument = Annotated[
     Path,
@@ -138,7 +135,14 @@ def _fail(exc: Exception, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
+def _require_markdown_output(requested: Path) -> None:
+    if requested.suffix.casefold() not in _MARKDOWN_OUTPUT_SUFFIXES:
+        supported = ", ".join(sorted(_MARKDOWN_OUTPUT_SUFFIXES))
+        raise ValueError(f"generated output must use a Markdown suffix ({supported})")
+
+
 def _generated_file(root: Path, requested: Path, content: str, force: bool) -> Path:
+    _require_markdown_output(requested)
     requested_destination = requested if requested.is_absolute() else root / requested
     if requested_destination.is_symlink():
         raise ValueError(f"refusing to replace symlink output: {requested_destination}")
@@ -146,10 +150,9 @@ def _generated_file(root: Path, requested: Path, content: str, force: bool) -> P
     if destination.exists():
         if destination.is_symlink() or not destination.is_file():
             raise ValueError(f"refusing to replace non-regular output: {destination}")
-        prior = destination.read_text(encoding="utf-8", errors="replace")[:4096]
-        generated = any(
-            _GENERATED_OUTPUT_MARKER.fullmatch(line) for line in prior.splitlines()[:16]
-        )
+        with destination.open("r", encoding="utf-8", errors="replace") as handle:
+            prior = handle.read(4096)
+        generated = is_generated_document(prior)
         if not (force or generated):
             raise ValueError(
                 f"output already exists and is not recognized as generated: {destination}; "
@@ -286,7 +289,12 @@ def map_command(
     """Generate a stable, source-linked PROJECT_MAP.md."""
 
     try:
-        document, operation = _service(path).map(path, refresh=refresh)  # type: ignore[arg-type]
+        _require_markdown_output(output)
+        document, operation = _service(path).map(  # type: ignore[arg-type]
+            path,
+            refresh=refresh,
+            destination=None if stdout else output,
+        )
         if stdout:
             sys.stdout.write(document)
             return
@@ -321,9 +329,11 @@ def diagram(
     """Generate a deterministic, validated Mermaid architecture graph."""
 
     try:
+        _require_markdown_output(output)
         document, operation = _service(path).diagram(  # type: ignore[arg-type]
             path,
             refresh=refresh,
+            destination=None if stdout else output,
         )
         if stdout:
             sys.stdout.write(document)

@@ -13,6 +13,7 @@ from repolocus.providers import (
     OpenAICompatibleProvider,
     ProviderConfigurationError,
     ProviderRequestError,
+    ProviderRequestPlan,
     ProviderResponseError,
     build_provider_request_plan,
     create_provider,
@@ -245,6 +246,143 @@ def test_malformed_provider_response_has_clear_error() -> None:
     )
 
     with pytest.raises(ProviderResponseError, match="missing message"):
+        provider.generate("System", "Question")
+
+
+def test_final_transport_boundary_blocks_a_tampered_secret_body() -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"message": {"content": "unexpected"}})
+
+    provider = OllamaProvider("model", transport=httpx.MockTransport(handler))
+    plan = ProviderRequestPlan(
+        "ollama",
+        "model",
+        "http://127.0.0.1:11434/api/chat",
+        json.dumps(
+            {
+                "model": "model",
+                "messages": [
+                    {"role": "user", "content": "ASIA1234567890ABCDEF"},
+                ],
+            }
+        ).encode(),
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="credential-like content"):
+        provider.generate_prepared(plan)
+    assert requests == 0
+
+
+def test_request_plan_reports_redactions_outside_evidence() -> None:
+    plan = build_provider_request_plan(
+        "openai",
+        "model",
+        base_url="https://api.openai.com/v1",
+        system_prompt="System",
+        user_prompt="Check glpat-abcdefghijklmnopqrstuvwxyz1234",
+    )
+
+    assert plan.redaction_count == 1
+    assert b"glpat-" not in plan.body
+
+
+def test_provider_rejects_declared_or_streamed_oversized_responses() -> None:
+    declared = OllamaProvider(
+        "model",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(4 * 1024 * 1024 + 1),
+                },
+                content=b"{}",
+            )
+        ),
+    )
+    with pytest.raises(ProviderResponseError, match="exceeds"):
+        declared.generate("System", "Question")
+
+    class OversizedStream(httpx.SyncByteStream):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            yield b"{" + b" " * (2 * 1024 * 1024)
+            yield b" " * (2 * 1024 * 1024) + b"}"
+
+    streamed = OllamaProvider(
+        "model",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                stream=OversizedStream(),
+            )
+        ),
+    )
+    with pytest.raises(ProviderResponseError, match="exceeded"):
+        streamed.generate("System", "Question")
+
+
+def test_provider_requires_json_content_type_and_bounded_json_depth() -> None:
+    wrong_type = OllamaProvider(
+        "model",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=b"{}")),
+    )
+    with pytest.raises(ProviderResponseError, match="content type"):
+        wrong_type.generate("System", "Question")
+
+    nested: object = "content"
+    for _ in range(70):
+        nested = [nested]
+    too_deep = OllamaProvider(
+        "model",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"message": nested})
+        ),
+    )
+    with pytest.raises(ProviderResponseError, match="overly complex"):
+        too_deep.generate("System", "Question")
+
+    recursion_depth = 2_000
+    recursive_body = (
+        b'{"message":' + b"[" * recursion_depth + b'"content"' + b"]" * recursion_depth + b"}"
+    )
+    recursive = OllamaProvider(
+        "model",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                content=recursive_body,
+            )
+        ),
+    )
+    with pytest.raises(ProviderResponseError, match=r"(?:invalid|overly complex) JSON"):
+        recursive.generate("System", "Question")
+
+
+def test_provider_rejects_a_response_after_the_elapsed_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repolocus.providers import http as provider_http
+
+    readings = iter((10.0, 12.0))
+    monkeypatch.setattr(provider_http, "monotonic", lambda: next(readings))
+    provider = OllamaProvider(
+        "model",
+        timeout=1,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"message": {"content": "late"}},
+            )
+        ),
+    )
+
+    with pytest.raises(ProviderRequestError, match="elapsed-time deadline"):
         provider.generate("System", "Question")
 
 

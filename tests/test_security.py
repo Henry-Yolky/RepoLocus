@@ -4,11 +4,14 @@ import hashlib
 import json
 import os
 import stat
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from platformdirs import user_state_dir
 
+from repolocus.scanner import contains_likely_secret as scanner_detects_likely_secret
 from repolocus.security import (
     ConsentRequiredError,
     PathSecurityError,
@@ -17,12 +20,56 @@ from repolocus.security import (
     build_cloud_send_preview,
     canonical_endpoint,
     ensure_within_root,
+    find_likely_secrets,
     redact_secrets,
     require_provider_consent,
 )
+from repolocus.security.identity import descriptor_path, filesystem_identity
 
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
+
+
+def test_filesystem_identity_fails_closed_without_stable_ids() -> None:
+    metadata = type("Metadata", (), {"st_dev": 0, "st_ino": 0})()
+
+    with pytest.raises(ValueError, match="stable object identity"):
+        filesystem_identity(metadata)  # type: ignore[arg-type]
+    assert descriptor_path(-1) is None
+
+
+def test_descriptor_path_uses_darwin_f_getpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from repolocus.security import identity as identity_module
+
+    source = tmp_path / "opened.txt"
+    source.write_text("content\n", encoding="utf-8")
+    expected = source.resolve()
+    encoded = os.fsencode(expected)
+    fake_fcntl = SimpleNamespace(
+        F_GETPATH=50,
+        fcntl=lambda _descriptor, _command, buffer: (encoded + b"\0").ljust(len(buffer), b"\0"),
+    )
+    monkeypatch.setattr(identity_module.sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "fcntl", fake_fcntl)
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert identity_module.descriptor_path(descriptor) == expected
+    finally:
+        os.close(descriptor)
+
+
+def test_descriptor_path_resolves_a_real_open_file(tmp_path: Path) -> None:
+    source = tmp_path / "opened.txt"
+    source.write_text("content\n", encoding="utf-8")
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        opened_path = descriptor_path(descriptor)
+        assert opened_path is not None
+        assert opened_path.samefile(source)
+    finally:
+        os.close(descriptor)
 
 
 def test_canonical_path_check_accepts_descendants(tmp_path: Path) -> None:
@@ -80,6 +127,89 @@ YWJjZA==
 -----END PRIVATE KEY-----"""
 
     assert redact_secrets(source) == ("[REDACTED]", 1)
+
+
+@pytest.mark.parametrize(
+    ("kind", "source", "secret"),
+    [
+        (
+            "private_key",
+            "-----BEGIN PRIVATE KEY-----\nYWJjZA==\n-----END PRIVATE KEY-----",
+            "YWJjZA==",
+        ),
+        ("aws_access_key", "ASIA1234567890ABCDEF", "ASIA1234567890ABCDEF"),
+        (
+            "github_token",
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        ),
+        (
+            "github_fine_grained_token",
+            "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+            "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+        ),
+        ("gitlab_token", "glpat-1234567890abcdefghij", "glpat-1234567890abcdefghij"),
+        ("slack_token", "xoxb-1234567890-abcdefghij", "xoxb-1234567890-abcdefghij"),
+        (
+            "google_api_key",
+            "AIza1234567890abcdefghijklmnopqrstuvwxyz",
+            "AIza1234567890abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "provider_api_key",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "hugging_face_token",
+            "hf_abcdefghijklmnopqrstuvwxyz123456",
+            "hf_abcdefghijklmnopqrstuvwxyz123456",
+        ),
+        ("stripe_live_key", "sk_live_1234567890abcdef", "sk_live_1234567890abcdef"),
+        (
+            "jwt",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123",
+        ),
+        (
+            "url_password",
+            "postgresql://alice:correct-horse@example.invalid/app",
+            "correct-horse",
+        ),
+        ("bearer_token", "Bearer abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz"),
+        (
+            "credential_assignment",
+            'api_key = "v3ry-long-random-value-827364"',
+            "v3ry-long-random-value-827364",
+        ),
+    ],
+)
+def test_scanner_and_transport_secret_rules_have_parity(
+    kind: str,
+    source: str,
+    secret: str,
+) -> None:
+    assert scanner_detects_likely_secret(source)
+    matches = find_likely_secrets(source)
+    assert any(match.kind == kind and match.confidence == "high" for match in matches)
+
+    redacted, count = redact_secrets(source)
+
+    assert count == 1
+    assert secret not in redacted
+    assert not scanner_detects_likely_secret(redacted)
+
+
+def test_overlapping_assignment_and_typed_token_count_as_one_secret() -> None:
+    source = 'api_key = "sk-proj-abcdefghijklmnopqrstuvwxyz"'
+
+    redacted, count = redact_secrets(source)
+    repeated, repeated_count = redact_secrets(redacted)
+
+    assert redacted == 'api_key = "[REDACTED]"'
+    assert count == 1
+    assert repeated == redacted
+    assert repeated_count == 0
 
 
 def test_privacy_store_remembers_per_repo_provider_outside_repo(tmp_path: Path) -> None:
@@ -180,6 +310,42 @@ def test_privacy_store_revoke_all_is_repository_scoped(tmp_path: Path) -> None:
 
     assert store.status(repo_a) == {}
     assert store.status(repo_b) == {"openai": True}
+
+
+def test_remembered_consent_does_not_follow_a_replaced_repository(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_path = tmp_path / "state" / "privacy.json"
+    store = PrivacyStore(state_path)
+    store.grant(repo, "openai", OPENAI_ENDPOINT)
+
+    repo.rename(tmp_path / "old-repo")
+    repo.mkdir()
+
+    assert store.status(repo) == {}
+    assert store.is_allowed(repo, "openai", OPENAI_ENDPOINT) is False
+
+
+def test_consent_read_fails_if_repository_changes_during_state_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = PrivacyStore(tmp_path / "state" / "privacy.json")
+    store.grant(repo, "openai", OPENAI_ENDPOINT)
+    original_read = store._read
+
+    def replace_repository() -> dict[str, object]:
+        state = original_read()
+        repo.rename(tmp_path / "old-repo")
+        repo.mkdir()
+        return state
+
+    monkeypatch.setattr(store, "_read", replace_repository)
+
+    with pytest.raises(PrivacyStoreError, match="identity changed"):
+        store.is_allowed(repo, "openai", OPENAI_ENDPOINT)
 
 
 def test_privacy_store_refuses_state_inside_repository(tmp_path: Path) -> None:

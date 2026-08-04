@@ -66,10 +66,10 @@ repolocus ask "Where is configuration validated?" \
   --model openai/gpt-4.1-mini --allow-cloud
 ```
 
-Remembered-consent format v2 binds a grant to the canonical repository, provider, scheme, host,
-effective port, and complete request path. Changing a compatible-provider endpoint therefore
-requires fresh consent. Legacy v1 family-only grants are intentionally ignored after upgrade and
-must be granted again.
+Remembered-consent format v3 binds a grant to the current repository identity, canonical path,
+provider, scheme, host, effective port, and complete request path. Replacing the directory or its
+Git marker, or changing a compatible-provider endpoint, therefore requires fresh consent. Legacy
+path-only v1/v2 grants are intentionally ignored after upgrade.
 
 ## What it produces
 
@@ -112,9 +112,11 @@ supports the claim. A model answer that passes these checks is still labeled `ne
 | `repolocus serve` | Start the optional self-hosted FastAPI service |
 
 Every command accepts `--help`. Use `--json` on automation-friendly commands where available.
-`map`, `diagram`, and `ask` default to `--refresh auto`: they query the last compatible committed
-snapshot and scan only when one is unavailable. Use `--refresh always` to scan before the
-operation, or `--refresh never` to forbid scanning and fail if no compatible snapshot exists.
+`map`, `diagram`, and `ask` default to `--refresh auto`: they perform a bounded incremental refresh
+before querying, so edits or a repository replaced at the same path cannot inherit old evidence.
+Use `--refresh never` only when explicitly pinning the last compatible committed snapshot.
+The Python `RepoLocusService.scan()` result keeps unchanged files metadata-only (including cached
+fact counts); use `map()`, `diagram()`, or `evidence()` when materialized facts are required.
 
 Add `--follow-up` to `ask` for a non-persistent in-memory question session; entering a blank line
 ends it. The first answer pins an index generation, and every follow-up uses that exact generation
@@ -257,13 +259,14 @@ of evaluating autonomous behavior.
 uv sync --all-extras
 uv run ruff check .
 uv run pytest --cov=repolocus --cov-report=term-missing
-uv run python scripts/evaluate_retrieval.py evaluation/questions.json .
+uv run python scripts/evaluate_retrieval.py evaluation/questions.dataset .
 uv build
 ```
 
 The retrieval report includes per-case recall@k, reciprocal rank, nDCG@k, expected-path coverage,
 and citation recall, plus aggregate macro recall, MRR, mean nDCG, any/all-path rates,
-no-answer precision and accuracy, and per-language breakdowns. The CLI can enforce minimum
+no-answer precision/recall/F1/accuracy, and per-language/per-query-type breakdowns. Answerable retrieval and
+no-answer classification are aggregated separately. The CLI can enforce minimum
 any-path hit rate, macro recall, and MRR. These metrics describe the checked-in regression cases,
 not the planned release-scale evaluation.
 

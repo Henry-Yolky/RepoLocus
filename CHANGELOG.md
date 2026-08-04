@@ -3,6 +3,37 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and versions use
 Semantic Versioning while the project is in alpha.
 
+## [Unreleased]
+
+## [0.1.4] - 2026-08-04
+
+### Changed
+
+- `refresh=auto` now performs an identity-bound delta scan; the evidence path uses a metadata-only
+  manifest so unchanged files avoid source reads and parser-fact materialization, while changed
+  files are securely read, hashed, and parsed.
+- The public `RepoLocusService.scan()` result is metadata-only for unchanged files; callers that
+  need source text and parser facts should use `map()`, `diagram()`, or retrieval evidence.
+- The bundled Skill now requires a RepoLocus `>=0.1.4,<0.2.0` runtime so older security and
+  analysis policies cannot pass adapter preflight.
+- CJK retrieval uses position-spread bounded n-gram coverage, and answerable retrieval metrics are
+  aggregated separately from no-answer classification metrics and query-type breakdowns.
+- Generated-output detection is extension-independent, nested generated documents use correct
+  relative source links, and generated CLI files require a Markdown suffix.
+- Added repository-wide limits for entries/files, bytes, depth, chunks, symbols, and scan time.
+
+### Security
+
+- Invalidated older analysis facts and path-only index/consent identities; repository replacement,
+  stale parser caches, and incomplete upgrades now fail closed.
+- Unified scanner and transport secret rules, count prompt redactions in previews, and scan the
+  final serialized request before transport.
+- Stream provider responses under byte, media-type, HTTP phase-timeout, elapsed-deadline, and
+  JSON-structure limits; read repository configuration once through a pinned, no-follow
+  descriptor chain.
+- Force low-level scanner and repository-config reads into binary mode on Windows so raw-byte
+  size, hashes, secret checks, and Ctrl-Z handling remain consistent across platforms.
+
 ## [0.1.3] - 2026-08-04
 
 ### Added
