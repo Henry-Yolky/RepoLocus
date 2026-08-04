@@ -3,6 +3,13 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and versions use
 Semantic Versioning while the project is in alpha.
 
+## [0.1.2] - 2026-08-04
+
+### Changed
+
+- Precompiled reusable regular expressions in the Markdown and configuration parsers, avoiding
+  repeated regular-expression cache lookups for every source line.
+
 ## [0.1.1] - 2026-08-03
 
 ### Changed
