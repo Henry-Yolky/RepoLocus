@@ -3,7 +3,7 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and versions use
 Semantic Versioning while the project is in alpha.
 
-## [Unreleased]
+## [0.1.3] - 2026-08-04
 
 ### Added
 
