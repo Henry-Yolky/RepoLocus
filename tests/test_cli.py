@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from urllib.parse import unquote
 
 from typer.testing import CliRunner
 
@@ -230,6 +232,43 @@ def test_generated_output_migrates_the_pre_rename_marker(
     generated = output.read_text(encoding="utf-8")
     assert "Generator: RepoLocus" in generated
     assert "Generator: DevPilot" not in generated
+
+
+def test_generated_commands_require_markdown_outputs_and_fix_nested_links(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+) -> None:
+    rejected = runner.invoke(
+        app,
+        ["map", str(sample_repo), "--output", "generated-map.py"],
+    )
+    mapped = runner.invoke(
+        app,
+        ["map", str(sample_repo), "--output", "docs/generated/PROJECT_MAP.md"],
+    )
+    diagrammed = runner.invoke(
+        app,
+        ["diagram", str(sample_repo), "--output", "docs/generated/ARCHITECTURE.md"],
+    )
+
+    assert rejected.exit_code == 1
+    assert "must use a Markdown suffix" in rejected.output
+    assert not (sample_repo / "generated-map.py").exists()
+    assert mapped.exit_code == 0, mapped.output
+    project_map = (sample_repo / "docs/generated/PROJECT_MAP.md").read_text(encoding="utf-8")
+    assert "(../../src/demo/config.py#L1)" in project_map
+    assert "Source link base: generated-document-relative" in project_map
+    assert diagrammed.exit_code == 0, diagrammed.output
+    architecture = (sample_repo / "docs/generated/ARCHITECTURE.md").read_text(encoding="utf-8")
+    assert "(../../src/demo/config.py#L1)" in architecture
+    assert "Source links are relative to this generated document." in architecture
+    for output_path, document in (
+        (sample_repo / "docs/generated/PROJECT_MAP.md", project_map),
+        (sample_repo / "docs/generated/ARCHITECTURE.md", architecture),
+    ):
+        match = re.search(r"\(([^)#]+config\.py)#L1\)", document)
+        assert match is not None
+        assert (output_path.parent / unquote(match.group(1))).resolve(strict=True).is_file()
 
 
 def test_privacy_status_defaults_to_no_grants(sample_repo: Path, isolated_user_dirs: Path) -> None:

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from html import escape as html_escape
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 from repolocus import __version__
@@ -29,12 +31,37 @@ _CONFIG_NAMES = {
 }
 
 
-def _citation(path: str, line: int, label: str | None = None) -> str:
-    """Return a repository-relative Markdown line link."""
+@dataclass(frozen=True, slots=True)
+class _SourceLinks:
+    """Translate repository paths into links from one generated document."""
 
-    visible = _markdown_text(label or f"{path}:{line}")
-    escaped = quote(path, safe="/._-")
-    return f"[{visible}]({escaped}#L{line})"
+    prefix: str = ""
+    destination_supplied: bool = False
+
+    @classmethod
+    def for_output(cls, root: Path, destination: Path | str | None) -> _SourceLinks:
+        if destination is None:
+            return cls()
+        requested = Path(destination).expanduser()
+        if not requested.is_absolute():
+            requested = root / requested
+        requested = requested.resolve(strict=False)
+        relative_root = Path(os.path.relpath(root, start=requested.parent)).as_posix()
+        return cls("" if relative_root == "." else relative_root, True)
+
+    def citation(self, path: str, line: int, label: str | None = None) -> str:
+        visible = _markdown_text(label or f"{path}:{line}")
+        target = PurePosixPath(path)
+        if self.prefix:
+            target = PurePosixPath(self.prefix) / target
+        escaped = quote(target.as_posix(), safe="/._-")
+        return f"[{visible}]({escaped}#L{line})"
+
+    @property
+    def description(self) -> str:
+        if self.destination_supplied:
+            return "generated-document-relative"
+        return "repository-root-relative"
 
 
 def _markdown_text(value: str) -> str:
@@ -117,7 +144,15 @@ def _first_line_for(file: ScannedFile) -> int:
 class ProjectMapGenerator:
     """Render a conservative map from facts observed during a repository scan."""
 
-    def generate(self, result: ScanResult) -> str:
+    def generate(
+        self,
+        result: ScanResult,
+        *,
+        destination: Path | str | None = None,
+    ) -> str:
+        """Render the map, defaulting to repository-root-relative source links."""
+
+        links = _SourceLinks.for_output(result.root, destination)
         files = sorted(result.files, key=lambda item: item.path)
         by_path = {item.path: item for item in files}
         lines: list[str] = [
@@ -126,21 +161,26 @@ class ProjectMapGenerator:
             f"<!-- Generator: RepoLocus {__version__}; deterministic source map. -->",
             "",
         ]
-        lines.extend(self._overview(result, by_path))
-        lines.extend(self._quick_start(files))
-        lines.extend(self._layout(files))
-        lines.extend(self._entry_points(files))
-        lines.extend(self._modules(files))
-        lines.extend(self._runtime_flow(files))
-        lines.extend(self._dependencies(files))
-        lines.extend(self._configuration(files))
-        lines.extend(self._tests(files))
-        lines.extend(self._risks(result, files))
-        lines.extend(self._reading_order(files))
-        lines.extend(self._metadata(result))
+        lines.extend(self._overview(result, by_path, links))
+        lines.extend(self._quick_start(files, links))
+        lines.extend(self._layout(files, links))
+        lines.extend(self._entry_points(files, links))
+        lines.extend(self._modules(files, links))
+        lines.extend(self._runtime_flow(files, links))
+        lines.extend(self._dependencies(files, links))
+        lines.extend(self._configuration(files, links))
+        lines.extend(self._tests(files, links))
+        lines.extend(self._risks(result, files, links))
+        lines.extend(self._reading_order(files, links))
+        lines.extend(self._metadata(result, links))
         return "\n".join(lines).rstrip() + "\n"
 
-    def _overview(self, result: ScanResult, by_path: dict[str, ScannedFile]) -> list[str]:
+    def _overview(
+        self,
+        result: ScanResult,
+        by_path: dict[str, ScannedFile],
+        links: _SourceLinks,
+    ) -> list[str]:
         readme = next((by_path[name] for name in _README_NAMES if name in by_path), None)
         if readme:
             paragraph = _first_content_paragraph(readme)
@@ -149,7 +189,7 @@ class ProjectMapGenerator:
                 return [
                     "## What this repository does",
                     "",
-                    f"**Confirmed:** {text} ({_citation(readme.path, line)})",
+                    f"**Confirmed:** {text} ({links.citation(readme.path, line)})",
                     "",
                 ]
         languages = Counter(file.language for file in result.files if file.language != "Text")
@@ -162,7 +202,7 @@ class ProjectMapGenerator:
             "",
         ]
 
-    def _quick_start(self, files: list[ScannedFile]) -> list[str]:
+    def _quick_start(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         candidates = [
             file
             for file in files
@@ -175,11 +215,11 @@ class ProjectMapGenerator:
             return output
         for file in candidates[:5]:
             line = _first_line_for(file)
-            output.append(f"- **Confirmed:** Start with {_citation(file.path, line)}.")
+            output.append(f"- **Confirmed:** Start with {links.citation(file.path, line)}.")
         output.append("")
         return output
 
-    def _layout(self, files: list[ScannedFile]) -> list[str]:
+    def _layout(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         groups: dict[str, list[ScannedFile]] = defaultdict(list)
         for file in files:
             groups[_top_group(file.path)].append(file)
@@ -196,12 +236,12 @@ class ProjectMapGenerator:
             witness = min(grouped, key=lambda item: item.path)
             output.append(
                 f"| {_code(group)} | {len(grouped)} | {_markdown_text(language_text)} | "
-                f"{_citation(witness.path, _first_line_for(witness))} |"
+                f"{links.citation(witness.path, _first_line_for(witness))} |"
             )
         output.append("")
         return output
 
-    def _entry_points(self, files: list[ScannedFile]) -> list[str]:
+    def _entry_points(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         entries = [file for file in files if file.is_entry_point]
         output = ["## Main entry points", ""]
         if not entries:
@@ -220,12 +260,12 @@ class ProjectMapGenerator:
             line = symbol.start_line if symbol else _first_line_for(file)
             output.append(
                 f"- **Confirmed:** {_code(file.path)} matches an entry-point convention "
-                f"({_citation(file.path, line)})."
+                f"({links.citation(file.path, line)})."
             )
         output.append("")
         return output
 
-    def _modules(self, files: list[ScannedFile]) -> list[str]:
+    def _modules(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         groups: dict[str, list[ScannedFile]] = defaultdict(list)
         for file in files:
             groups[_top_group(file.path)].append(file)
@@ -238,14 +278,14 @@ class ProjectMapGenerator:
                 f"- **Inferred:** {_code(group)} is a module area with "
                 f"{len(grouped)} indexed files "
                 f"and {symbol_count} extracted symbols; representative source: "
-                f"{_citation(witness.path, _first_line_for(witness))}."
+                f"{links.citation(witness.path, _first_line_for(witness))}."
             )
         if not ranked:
             output.append("**Needs review:** The scan did not index any source modules.")
         output.append("")
         return output
 
-    def _runtime_flow(self, files: list[ScannedFile]) -> list[str]:
+    def _runtime_flow(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         entries = [file for file in files if file.is_entry_point]
         output = ["## Runtime and data flow", ""]
         flows = 0
@@ -257,7 +297,7 @@ class ProjectMapGenerator:
             output.append(
                 f"- **Inferred:** {_code(entry.path)} begins a static dependency flow toward "
                 f"{targets} "
-                f"({_citation(entry.path, deps[0].line)})."
+                f"({links.citation(entry.path, deps[0].line)})."
             )
             flows += 1
         if not flows:
@@ -268,7 +308,7 @@ class ProjectMapGenerator:
         output.append("")
         return output
 
-    def _dependencies(self, files: list[ScannedFile]) -> list[str]:
+    def _dependencies(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         dependencies: list[Dependency] = [dep for file in files for dep in file.dependencies]
         local_roots: set[str] = set()
         for file in files:
@@ -298,7 +338,9 @@ class ProjectMapGenerator:
         output.extend(["| Dependency | References | Evidence |", "|---|---:|---|"])
         for target, count in target_counts.most_common(20):
             dep = first[target]
-            output.append(f"| {_code(target)} | {count} | {_citation(dep.source_path, dep.line)} |")
+            output.append(
+                f"| {_code(target)} | {count} | {links.citation(dep.source_path, dep.line)} |"
+            )
         output.append("")
         return output
 
@@ -314,7 +356,7 @@ class ProjectMapGenerator:
         root = re.split(r"[./]", target, maxsplit=1)[0].casefold()
         return bool(root and root not in local_roots and root not in standard_library)
 
-    def _configuration(self, files: list[ScannedFile]) -> list[str]:
+    def _configuration(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         configs = [file for file in files if _is_config(file.path)]
         output = ["## Configuration and environment", ""]
         if not configs:
@@ -323,12 +365,12 @@ class ProjectMapGenerator:
         for file in configs[:20]:
             output.append(
                 f"- **Confirmed:** {_code(file.path)} is a configuration or build file "
-                f"({_citation(file.path, _first_line_for(file))})."
+                f"({links.citation(file.path, _first_line_for(file))})."
             )
         output.append("")
         return output
 
-    def _tests(self, files: list[ScannedFile]) -> list[str]:
+    def _tests(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         tests = [file for file in files if _is_test(file.path)]
         output = ["## Tests and quality gates", ""]
         if not tests:
@@ -342,19 +384,25 @@ class ProjectMapGenerator:
             witness = witness_by_group[group]
             output.append(
                 f"- **Confirmed:** {_code(group)} contains {count} test-like files; example: "
-                f"{_citation(witness.path, _first_line_for(witness))}."
+                f"{links.citation(witness.path, _first_line_for(witness))}."
             )
         output.append("")
         return output
 
-    def _risks(self, result: ScanResult, files: list[ScannedFile]) -> list[str]:
+    def _risks(
+        self,
+        result: ScanResult,
+        files: list[ScannedFile],
+        links: _SourceLinks,
+    ) -> list[str]:
         output = ["## High-change or high-risk areas", ""]
         largest = sorted(files, key=lambda file: (-file.line_count, file.path))[:5]
         for file in largest:
             output.append(
                 f"- **Inferred:** {_code(file.path)} is relatively large "
                 f"({file.line_count} lines) and "
-                f"may deserve focused review ({_citation(file.path, _first_line_for(file))})."
+                f"may deserve focused review "
+                f"({links.citation(file.path, _first_line_for(file))})."
             )
         if result.stats.skipped:
             detail = ", ".join(
@@ -372,7 +420,7 @@ class ProjectMapGenerator:
         output.append("")
         return output
 
-    def _reading_order(self, files: list[ScannedFile]) -> list[str]:
+    def _reading_order(self, files: list[ScannedFile], links: _SourceLinks) -> list[str]:
         readmes = [
             file for file in files if PurePosixPath(file.path).name.lower().startswith("readme")
         ]
@@ -409,7 +457,8 @@ class ProjectMapGenerator:
             elif file.symbols:
                 reason = "core symbols and module boundaries"
             output.append(
-                f"{number}. **Inferred:** Read {_citation(file.path, _first_line_for(file))} for "
+                f"{number}. **Inferred:** Read "
+                f"{links.citation(file.path, _first_line_for(file))} for "
                 f"{reason}."
             )
         if not selected:
@@ -417,7 +466,7 @@ class ProjectMapGenerator:
         output.append("")
         return output
 
-    def _metadata(self, result: ScanResult) -> list[str]:
+    def _metadata(self, result: ScanResult, links: _SourceLinks) -> list[str]:
         language_text = ", ".join(
             f"{name} ({count})" for name, count in sorted(result.stats.languages.items())
         )
@@ -429,6 +478,7 @@ class ProjectMapGenerator:
             f"- Indexed files: {result.stats.indexed_files}",
             f"- Indexed bytes: {result.stats.indexed_bytes}",
             f"- Languages: {language_text or 'none'}",
+            f"- Source link base: {links.description}",
             "- Evidence labels: **Confirmed** = direct source fact; **Inferred** = deterministic "
             "static-analysis inference; **Needs review** = insufficient or incomplete evidence.",
             "",

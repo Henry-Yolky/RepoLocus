@@ -30,9 +30,11 @@ from repolocus.models import (
     ScanResult,
     Symbol,
 )
+from repolocus.security.identity import filesystem_identity
 
-SCHEMA_VERSION = 3
-INDEX_FORMAT_VERSION = "3"
+SCHEMA_VERSION = 4
+INDEX_FORMAT_VERSION = "4"
+_PROVENANCE_SCHEMA_VERSION = 3
 # The product rename did not change the SQLite schema. Keep the original format
 # magic so existing valid indexes remain recognizable when explicitly opened.
 APPLICATION_ID = 0x4456504C  # "DVPL"
@@ -98,6 +100,21 @@ def _canonical_root(root: Path) -> Path:
     return resolved
 
 
+def _repository_identity(root: Path) -> str:
+    """Return a stable identity for the directory currently mounted at *root*."""
+
+    try:
+        metadata = root.lstat()
+    except OSError as exc:
+        raise IndexFormatError(f"repository root cannot be identified: {root}") from exc
+    try:
+        return filesystem_identity(metadata)
+    except ValueError as exc:
+        raise IndexFormatError(
+            "the filesystem does not expose a stable repository identity"
+        ) from exc
+
+
 def _root_key(root: Path) -> str:
     canonical = os.path.normcase(str(root))
     return hashlib.sha256(canonical.encode("utf-8", errors="surrogatepass")).hexdigest()
@@ -160,6 +177,14 @@ def _literal_query_tokens(query: str) -> frozenset[str]:
     return frozenset(literal_query_terms(query))
 
 
+def _literal_query_token_groups(query: str) -> tuple[tuple[str, ...], ...]:
+    """Return literal groups that expanded terms may not satisfy."""
+
+    from repolocus.retrieval.terms import literal_query_term_groups
+
+    return literal_query_term_groups(query)
+
+
 def _validate_relative_path(value: str) -> None:
     if not value or "\x00" in value or "\\" in value:
         raise ValueError(f"invalid indexed path: {value!r}")
@@ -176,6 +201,8 @@ def _validate_scanned_file(file: ScannedFile) -> None:
         raise ValueError(f"negative file metadata for {file.path}")
     if file.mtime_ns < 0 or file.ctime_ns < 0:
         raise ValueError(f"negative file timestamp for {file.path}")
+    if file.cached_chunk_count < 0 or file.cached_symbol_count < 0:
+        raise ValueError(f"negative cached fact count for {file.path}")
     if file.provenance not in {"source", "generated"}:
         raise ValueError(f"invalid provenance for {file.path}")
     if file.stale:
@@ -311,6 +338,7 @@ class RepositoryIndex:
 
     def __init__(self, root: Path, database_path: Path) -> None:
         self._root = root
+        self._repository_identity = _repository_identity(root)
         self._database_path = database_path
         self._lock = threading.RLock()
         self._closed = False
@@ -419,8 +447,14 @@ class RepositoryIndex:
                         missing = ", ".join(sorted(_V2_REQUIRED_TABLES - tables))
                         raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
                     self._migrate_v2_to_v3()
-                    version = SCHEMA_VERSION
+                    version = _PROVENANCE_SCHEMA_VERSION
                     tables.add("chunk_terms")
+                if version == _PROVENANCE_SCHEMA_VERSION:
+                    if not _REQUIRED_TABLES.issubset(tables):
+                        missing = ", ".join(sorted(_REQUIRED_TABLES - tables))
+                        raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
+                    self._migrate_v3_to_v4()
+                    version = SCHEMA_VERSION
                 elif version != SCHEMA_VERSION:
                     raise IndexFormatError(
                         f"unsupported index schema {version}; expected {SCHEMA_VERSION}"
@@ -435,6 +469,8 @@ class RepositoryIndex:
                 )
             if metadata.get("index_format_version") != INDEX_FORMAT_VERSION:
                 raise IndexFormatError("index format version is incompatible")
+            if metadata.get("repository_identity") != self._repository_identity:
+                self._rebind_repository_identity(self._repository_identity)
         except sqlite3.Error as exc:
             raise IndexFormatError(f"invalid SQLite index at {self._database_path}: {exc}") from exc
 
@@ -446,7 +482,7 @@ class RepositoryIndex:
                 # Another process may have completed the migration while this
                 # connection waited for BEGIN IMMEDIATE.
                 current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-                if current_version == SCHEMA_VERSION:
+                if current_version in {_PROVENANCE_SCHEMA_VERSION, SCHEMA_VERSION}:
                     return
                 if current_version != 2:
                     raise IndexFormatError(
@@ -464,10 +500,8 @@ class RepositoryIndex:
 
                 generated_paths = [
                     str(row["path"])
-                    for row in self._connection.execute(
-                        "SELECT path, text FROM files WHERE lower(language) = 'markdown'"
-                    )
-                    if is_generated_document(str(row["text"]), "markdown")
+                    for row in self._connection.execute("SELECT path, text FROM files")
+                    if is_generated_document(str(row["text"]))
                 ]
                 self._connection.executemany(
                     "UPDATE files SET provenance = 'generated' WHERE path = ?",
@@ -513,13 +547,91 @@ class RepositoryIndex:
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                     """,
                     (
+                        ("schema_version", str(_PROVENANCE_SCHEMA_VERSION)),
+                        ("index_format_version", str(_PROVENANCE_SCHEMA_VERSION)),
+                    ),
+                )
+                self._connection.execute(f"PRAGMA user_version = {_PROVENANCE_SCHEMA_VERSION}")
+        except sqlite3.Error as exc:
+            raise IndexFormatError(f"could not migrate v2 index: {exc}") from exc
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Invalidate path-only facts before binding the index to this directory."""
+
+        try:
+            with self._transaction():
+                current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+                if current_version == SCHEMA_VERSION:
+                    return
+                if current_version != _PROVENANCE_SCHEMA_VERSION:
+                    raise IndexFormatError(
+                        f"unsupported index schema {current_version}; "
+                        f"expected {_PROVENANCE_SCHEMA_VERSION}"
+                    )
+                generation = self._generation_in_transaction()
+                self._clear_repository_facts()
+                self._connection.executemany(
+                    """
+                    INSERT INTO meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
                         ("schema_version", str(SCHEMA_VERSION)),
                         ("index_format_version", INDEX_FORMAT_VERSION),
+                        ("analysis_version", ""),
+                        ("generation", str(generation + 1)),
+                        ("repository_identity", self._repository_identity),
                     ),
                 )
                 self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except sqlite3.Error as exc:
-            raise IndexFormatError(f"could not migrate v2 index: {exc}") from exc
+            raise IndexFormatError(f"could not migrate v3 index: {exc}") from exc
+
+    def _generation_in_transaction(self) -> int:
+        row = self._connection.execute("SELECT value FROM meta WHERE key = 'generation'").fetchone()
+        try:
+            generation = int(row["value"]) if row else 0
+        except (TypeError, ValueError) as exc:
+            raise IndexFormatError("index generation metadata is invalid") from exc
+        if generation < 0:
+            raise IndexFormatError("index generation metadata is invalid")
+        return generation
+
+    def _clear_repository_facts(self) -> None:
+        self._connection.execute("DELETE FROM files")
+        self._connection.execute(
+            "DELETE FROM meta WHERE key LIKE 'last_scan_%' OR key LIKE 'last_update_%'"
+        )
+
+    def _rebind_repository_identity(self, identity: str) -> None:
+        """Fail closed when the canonical path now names a different directory."""
+
+        with self._lock, self._transaction():
+            metadata = {
+                str(row["key"]): str(row["value"])
+                for row in self._connection.execute("SELECT key, value FROM meta")
+            }
+            if metadata.get("repository_identity") == identity:
+                return
+            generation = self._generation_in_transaction()
+            self._clear_repository_facts()
+            self._connection.executemany(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (
+                    ("analysis_version", ""),
+                    ("generation", str(generation + 1)),
+                    ("repository_identity", identity),
+                ),
+            )
+
+    def _ensure_repository_identity(self) -> None:
+        identity = _repository_identity(self._root)
+        if identity != self._repository_identity:
+            self._rebind_repository_identity(identity)
+            self._repository_identity = identity
 
     def _create_fts_triggers(self) -> None:
         for statement in (
@@ -661,6 +773,7 @@ class RepositoryIndex:
                         ("index_format_version", INDEX_FORMAT_VERSION),
                         ("analysis_version", ""),
                         ("generation", "0"),
+                        ("repository_identity", self._repository_identity),
                     ),
                 )
                 self._connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
@@ -674,9 +787,13 @@ class RepositoryIndex:
         """Apply a complete scan using SHA256 values for incremental invalidation."""
 
         self._ensure_open()
+        self._ensure_repository_identity()
         scan_root = _canonical_root(scan.root)
         if scan_root != self._root:
             raise ValueError(f"scan root {scan_root} does not match index root {self._root}")
+        scan_identity = scan.repository_identity or _repository_identity(scan_root)
+        if scan_identity != self._repository_identity:
+            raise StaleScanError("repository identity changed after the scan started")
         incoming: dict[str, ScannedFile] = {}
         incomplete_paths = tuple(sorted(set(scan.temporarily_unreadable)))
         skipped_summary, warning_summary = _snapshot_scan_metadata(scan)
@@ -712,12 +829,17 @@ class RepositoryIndex:
                     f"scan generation {scan.base_generation} is stale; "
                     f"current generation is {current_generation}"
                 )
+            if _repository_identity(self._root) != scan_identity:
+                raise StaleScanError("repository identity changed while committing the scan")
             current = {
                 str(row["path"]): (
                     str(row["sha256"]).casefold(),
                     str(row["provenance"]),
+                    bool(row["stale"]),
                 )
-                for row in self._connection.execute("SELECT path, sha256, provenance FROM files")
+                for row in self._connection.execute(
+                    "SELECT path, sha256, provenance, stale FROM files"
+                )
             }
             incoming_paths = set(incoming)
             current_paths = set(current)
@@ -735,6 +857,7 @@ class RepositoryIndex:
                     analysis_changed
                     or incoming[path].sha256.casefold() != current[path][0]
                     or incoming[path].provenance != current[path][1]
+                    or current[path][2]
                 )
             )
             unchanged_paths = sorted((incoming_paths & current_paths) - set(changed))
@@ -785,6 +908,9 @@ class RepositoryIndex:
                 """,
                 sorted(metadata.items()),
             )
+
+            if _repository_identity(self._root) != scan_identity:
+                raise StaleScanError("repository identity changed while committing the scan")
 
         return IndexUpdate(
             added=len(added),
@@ -919,9 +1045,29 @@ class RepositoryIndex:
         return generation
 
     def snapshot(self) -> IndexSnapshot:
-        """Read cache facts and their CAS generation from one SQLite snapshot."""
+        """Read full cache facts and their CAS generation from one SQLite snapshot."""
+
+        return self._snapshot(manifest_only=False)
+
+    def manifest_snapshot(self, *, max_files: int | None = None) -> IndexSnapshot:
+        """Read only file metadata needed for an incremental scan.
+
+        Text, symbols, dependencies, and chunks stay in SQLite for unchanged
+        paths; changed files are read and reparsed by the scanner.
+        """
+
+        return self._snapshot(manifest_only=True, max_manifest_files=max_files)
+
+    def _snapshot(
+        self,
+        *,
+        manifest_only: bool,
+        max_manifest_files: int | None = None,
+    ) -> IndexSnapshot:
+        """Read one generation-consistent full or metadata-only snapshot."""
 
         self._ensure_open()
+        self._ensure_repository_identity()
         with self._lock:
             self._connection.execute("BEGIN")
             try:
@@ -934,7 +1080,11 @@ class RepositoryIndex:
                     raise IndexFormatError("index generation metadata is invalid")
                 analysis_version = metadata.get("analysis_version", "")
                 skipped, warnings, incomplete = _decode_snapshot_state(metadata)
-                files = tuple(self.get_files())
+                files = tuple(
+                    self.get_file_manifest(max_files=max_manifest_files)
+                    if manifest_only
+                    else self.get_files()
+                )
             except BaseException:
                 self._connection.rollback()
                 raise
@@ -1045,6 +1195,49 @@ class RepositoryIndex:
             symbol=str(row["symbol"]),
         )
 
+    def get_file_manifest(self, *, max_files: int | None = None) -> list[ScannedFile]:
+        """Return bounded per-file metadata without loading source text or parser facts."""
+
+        self._ensure_open()
+        if max_files is not None and (
+            isinstance(max_files, bool) or not isinstance(max_files, int) or max_files <= 0
+        ):
+            raise ValueError("max_files must be a positive integer or None")
+        query = """
+            SELECT f.path, f.language, f.size_bytes, f.sha256, f.line_count,
+                   f.is_entry_point, f.mtime_ns, f.ctime_ns, f.provenance, f.stale,
+                   (SELECT count(*) FROM chunks AS c WHERE c.file_path = f.path)
+                       AS cached_chunk_count,
+                   (SELECT count(*) FROM symbols AS s WHERE s.file_path = f.path)
+                       AS cached_symbol_count
+            FROM files AS f
+            ORDER BY f.path
+        """
+        parameters: tuple[int, ...] = ()
+        if max_files is not None:
+            query += " LIMIT ?"
+            parameters = (max_files,)
+        with self._lock:
+            rows = self._connection.execute(query, parameters).fetchall()
+        return [
+            ScannedFile(
+                path=str(row["path"]),
+                language=str(row["language"]),
+                size_bytes=int(row["size_bytes"]),
+                sha256=str(row["sha256"]),
+                line_count=int(row["line_count"]),
+                text="",
+                is_entry_point=bool(row["is_entry_point"]),
+                mtime_ns=int(row["mtime_ns"]),
+                ctime_ns=int(row["ctime_ns"]),
+                provenance=str(row["provenance"]),  # type: ignore[arg-type]
+                stale=bool(row["stale"]),
+                cached_chunk_count=int(row["cached_chunk_count"]),
+                cached_symbol_count=int(row["cached_symbol_count"]),
+            )
+            for row in rows
+        ]
+
     def get_files(self) -> list[ScannedFile]:
         self._ensure_open()
         with self._lock:
@@ -1077,6 +1270,8 @@ class RepositoryIndex:
                 ctime_ns=int(row["ctime_ns"]),
                 provenance=str(row["provenance"]),  # type: ignore[arg-type]
                 stale=bool(row["stale"]),
+                cached_chunk_count=len(chunks_by_path[str(row["path"])]),
+                cached_symbol_count=len(symbols_by_path[str(row["path"])]),
             )
             for row in file_rows
         ]
@@ -1105,10 +1300,41 @@ class RepositoryIndex:
         )
         fts_tokens = tokens[:1] if identifier_query else tokens
         expression = " OR ".join(f'"{token}"' for token in fts_tokens)
-        minimum_term_matches = max(1, len(_literal_query_tokens(query)))
+        literal_groups = _literal_query_token_groups(query)
+        from repolocus.retrieval.terms import is_cjk_term
+
+        cjk_groups = [group for group in literal_groups if is_cjk_term(group[0])]
+        non_cjk_literals = [group[0] for group in literal_groups if not is_cjk_term(group[0])]
+        if identifier_query and non_cjk_literals:
+            # A snake_case or camelCase lookup names one concrete identifier.
+            # Requiring only two decomposed parts would let
+            # ``old_unique_value`` match ``new_unique_value``.
+            non_cjk_literals = non_cjk_literals[:1]
+        coverage_clauses: list[str] = []
+        coverage_parameters: list[str | int] = []
+        if non_cjk_literals:
+            placeholders = ", ".join("?" for _ in non_cjk_literals)
+            coverage_clauses.append(
+                "(SELECT count(*) FROM chunk_terms AS required_term "  # nosec B608
+                "WHERE required_term.chunk_id = c.id "
+                f"AND required_term.term IN ({placeholders})"
+                ") >= ?"
+            )
+            coverage_parameters.extend(non_cjk_literals)
+            coverage_parameters.append(min(2, len(non_cjk_literals)))
+        for group in cjk_groups:
+            placeholders = ", ".join("?" for _ in group)
+            coverage_clauses.append(
+                "(SELECT count(*) FROM chunk_terms AS required_term "  # nosec B608
+                "WHERE required_term.chunk_id = c.id "
+                f"AND required_term.term IN ({placeholders})"
+                ") >= ?"
+            )
+            coverage_parameters.extend(group)
+            coverage_parameters.append(min(2, len(group)))
+        literal_coverage = " AND ".join(coverage_clauses) or "1 = 1"
         with self._lock:
-            fts_rows = self._connection.execute(
-                """
+            fts_query_template = """
                 SELECT c.*, bm25(chunks_fts, 2.0, 5.0, 1.0) AS fts_rank
                 FROM chunks_fts
                 JOIN chunks AS c ON c.id = chunks_fts.rowid
@@ -1116,10 +1342,15 @@ class RepositoryIndex:
                 WHERE chunks_fts MATCH ?
                   AND f.provenance = 'source'
                   AND f.stale = 0
+                  AND %s
                 ORDER BY fts_rank, c.file_path, c.start_line, c.ordinal
                 LIMIT ?
-                """,
-                (expression, min(int(limit), 500)),
+                """
+            # Only generated SQLite parameter markers are interpolated; every value stays bound.
+            fts_query = fts_query_template % literal_coverage  # nosec B608
+            fts_rows = self._connection.execute(
+                fts_query,
+                (expression, *coverage_parameters, min(int(limit), 500)),
             ).fetchall()
             placeholders = ", ".join("?" for _ in tokens)
             # Only generated SQLite parameter markers are interpolated; every value stays bound.
@@ -1131,15 +1362,15 @@ class RepositoryIndex:
                 WHERE t.term IN (%s)
                   AND f.provenance = 'source'
                   AND f.stale = 0
+                  AND %s
                 GROUP BY c.id
-                HAVING count(*) >= ?
                 ORDER BY term_matches DESC, c.file_path, c.start_line, c.ordinal
                 LIMIT ?
                 """
-            term_query = term_query_template % placeholders  # nosec B608
+            term_query = term_query_template % (placeholders, literal_coverage)  # nosec B608
             term_rows = self._connection.execute(
                 term_query,
-                (*tokens, minimum_term_matches, min(int(limit), 500)),
+                (*tokens, *coverage_parameters, min(int(limit), 500)),
             ).fetchall()
         hits: dict[int, IndexedChunkHit] = {}
         for row in fts_rows:

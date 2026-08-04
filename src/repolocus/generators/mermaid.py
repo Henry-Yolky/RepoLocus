@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import html
+import os
 import re
 from collections import Counter, defaultdict
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 from repolocus.models import Dependency, ScannedFile, ScanResult
@@ -49,8 +50,11 @@ def _markdown_cell(value: str) -> str:
     )
 
 
-def _source_link(path: str, line: int) -> str:
-    escaped = quote(path, safe="/._-")
+def _source_link(path: str, line: int, prefix: str = "") -> str:
+    target = PurePosixPath(path)
+    if prefix:
+        target = PurePosixPath(prefix) / target
+    escaped = quote(target.as_posix(), safe="/._-")
     visible = html.escape(escape_untrusted_display(f"{path}:{line}"), quote=False)
     visible = visible.replace("\\", "\\\\")
     for marker in ("[", "]", "|"):
@@ -95,7 +99,15 @@ class MermaidGenerator:
         self.max_nodes = max(2, max_nodes)
         self.max_edges = max(1, max_edges)
 
-    def generate(self, result: ScanResult) -> str:
+    def generate(
+        self,
+        result: ScanResult,
+        *,
+        destination: Path | str | None = None,
+    ) -> str:
+        """Render a graph with repository-root-relative links by default."""
+
+        link_prefix = self._link_prefix(result.root, destination)
         source = self.generate_source(result)
         valid, reason = validate_mermaid(source)
         if not valid:
@@ -103,7 +115,12 @@ class MermaidGenerator:
             valid, fallback_reason = validate_mermaid(source)
             if not valid:  # pragma: no cover - defensive invariant
                 raise ValueError(f"could not produce valid Mermaid: {reason}; {fallback_reason}")
-        evidence = self._evidence_table(result)
+        evidence = self._evidence_table(result, link_prefix)
+        link_contract = (
+            "Source links are relative to this generated document."
+            if destination is not None
+            else "Source links are repository-root-relative."
+        )
         return "\n".join(
             [
                 "# Architecture",
@@ -112,6 +129,7 @@ class MermaidGenerator:
                 "",
                 "This graph is a static approximation. Nodes and edges are derived from "
                 "indexed paths and import statements; runtime dispatch may differ.",
+                link_contract,
                 "",
                 "```mermaid",
                 source.rstrip(),
@@ -123,6 +141,17 @@ class MermaidGenerator:
                 "",
             ]
         )
+
+    @staticmethod
+    def _link_prefix(root: Path, destination: Path | str | None) -> str:
+        if destination is None:
+            return ""
+        requested = Path(destination).expanduser()
+        if not requested.is_absolute():
+            requested = root / requested
+        requested = requested.resolve(strict=False)
+        relative_root = Path(os.path.relpath(root, start=requested.parent)).as_posix()
+        return "" if relative_root == "." else relative_root
 
     def generate_source(self, result: ScanResult) -> str:
         selected, ranked_edges = self._graph_facts(result)
@@ -218,7 +247,7 @@ class MermaidGenerator:
             lines.append(f'    {_node_id(group)}["{_escape_label(group)}"]')
         return "\n".join(lines) + "\n"
 
-    def _evidence_table(self, result: ScanResult) -> str:
+    def _evidence_table(self, result: ScanResult, link_prefix: str = "") -> str:
         witnesses: dict[str, tuple[str, int]] = {}
         for file in sorted(result.files, key=lambda item: item.path):
             group = _group(file.path)
@@ -230,7 +259,7 @@ class MermaidGenerator:
             return "No source files were indexed."
         lines = ["### Node evidence", "", "| Node | Representative source |", "|---|---|"]
         for group, (path, line) in sorted(witnesses.items()):
-            lines.append(f"| `{_markdown_cell(group)}` | {_source_link(path, line)} |")
+            lines.append(f"| `{_markdown_cell(group)}` | {_source_link(path, line, link_prefix)} |")
         _selected, ranked_edges = self._graph_facts(result)
         lines.extend(
             [
@@ -247,6 +276,7 @@ class MermaidGenerator:
             edge = f"{source_group} -> {target_group}"
             lines.append(
                 f"| `{_markdown_cell(edge)}` | `{_markdown_cell(dependency.target)}` | "
-                f"{_source_link(dependency.source_path, dependency.line)} | {count} |"
+                f"{_source_link(dependency.source_path, dependency.line, link_prefix)} | "
+                f"{count} |"
             )
         return "\n".join(lines)

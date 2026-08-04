@@ -90,10 +90,13 @@ def evaluate_cases(
         raise ValueError("evaluation limit must be positive")
     outcomes: list[dict[str, object]] = []
     language_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
-    predicted_no_answer = 0
-    correct_predicted_no_answer = 0
-    no_answer_cases = 0
-    correct_no_answer_cases = 0
+    language_case_counts: dict[str, int] = defaultdict(int)
+    query_type_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
+    query_type_case_counts: dict[str, int] = defaultdict(int)
+    no_answer_true_positive = 0
+    no_answer_false_positive = 0
+    no_answer_false_negative = 0
+    no_answer_true_negative = 0
     citation_scores: list[float] = []
     for case in cases:
         question = str(case["question"])
@@ -103,43 +106,51 @@ def evaluate_cases(
         expected = {str(path) for path in raw_expected}
         evidence = retrieval.search(question, limit=limit)
         returned = _unique_paths(evidence)
+        answerable = bool(expected)
+        predicted_no_answer = not returned
         relevant_ranks = [rank for rank, path in enumerate(returned, 1) if path in expected]
-        recall = (
-            len(expected.intersection(returned)) / len(expected)
-            if expected
-            else float(not returned)
+        recall = len(expected.intersection(returned)) / len(expected) if answerable else None
+        reciprocal_rank = (
+            (1.0 / relevant_ranks[0] if relevant_ranks else 0.0) if answerable else None
         )
-        reciprocal_rank = 1.0 / relevant_ranks[0] if relevant_ranks else 0.0
-        if not expected and not returned:
-            reciprocal_rank = 1.0
-        ndcg = _ndcg(returned, expected, limit)
+        ndcg = _ndcg(returned, expected, limit) if answerable else None
         expected_citations = case.get("expected_citations", [])
         if not isinstance(expected_citations, list):
             raise ValueError("expected_citations must be a JSON list")
         citation_recall = _citation_recall(evidence, [str(item) for item in expected_citations])
         if citation_recall is not None:
             citation_scores.append(citation_recall)
-        if not returned:
-            predicted_no_answer += 1
-            if not expected:
-                correct_predicted_no_answer += 1
-        if not expected:
-            no_answer_cases += 1
-            if not returned:
-                correct_no_answer_cases += 1
+        if not answerable and predicted_no_answer:
+            no_answer_true_positive += 1
+        elif answerable and predicted_no_answer:
+            no_answer_false_positive += 1
+        elif not answerable:
+            no_answer_false_negative += 1
+        else:
+            no_answer_true_negative += 1
         language = str(case.get("language", "unspecified"))
-        language_metrics[language].append((recall, reciprocal_rank, ndcg))
+        language_case_counts[language] += 1
+        query_type = str(case.get("query_type", "unspecified"))
+        query_type_case_counts[query_type] += 1
+        if answerable:
+            if recall is None or reciprocal_rank is None or ndcg is None:  # pragma: no cover
+                raise RuntimeError("answerable metric invariant violated")
+            language_metrics[language].append((recall, reciprocal_rank, ndcg))
+            query_type_metrics[query_type].append((recall, reciprocal_rank, ndcg))
         outcomes.append(
             {
                 "question": question,
                 "language": language,
-                "any_expected_path": (
-                    bool(expected.intersection(returned)) if expected else not returned
+                "query_type": query_type,
+                "answerable": answerable,
+                "predicted_no_answer": predicted_no_answer,
+                "any_expected_path": bool(expected.intersection(returned)) if answerable else None,
+                "all_expected_paths": expected.issubset(returned) if answerable else None,
+                "recall_at_k": round(recall, 6) if recall is not None else None,
+                "reciprocal_rank": (
+                    round(reciprocal_rank, 6) if reciprocal_rank is not None else None
                 ),
-                "all_expected_paths": expected.issubset(returned) if expected else not returned,
-                "recall_at_k": round(recall, 6),
-                "reciprocal_rank": round(reciprocal_rank, 6),
-                "ndcg_at_k": round(ndcg, 6),
+                "ndcg_at_k": round(ndcg, 6) if ndcg is not None else None,
                 "citation_recall": (
                     round(citation_recall, 6) if citation_recall is not None else None
                 ),
@@ -149,46 +160,93 @@ def evaluate_cases(
             }
         )
 
-    answerable = [outcome for outcome in outcomes if outcome["expected_paths"]]
+    answerable = [outcome for outcome in outcomes if outcome["answerable"]]
+    no_answer_cases = len(outcomes) - len(answerable)
+    no_answer_precision_denominator = no_answer_true_positive + no_answer_false_positive
+    no_answer_recall_denominator = no_answer_true_positive + no_answer_false_negative
+    no_answer_precision = (
+        no_answer_true_positive / no_answer_precision_denominator
+        if no_answer_precision_denominator
+        else 0.0
+        if no_answer_cases
+        else None
+    )
+    no_answer_recall = (
+        no_answer_true_positive / no_answer_recall_denominator
+        if no_answer_recall_denominator
+        else None
+    )
+    no_answer_f1 = (
+        2 * no_answer_precision * no_answer_recall / (no_answer_precision + no_answer_recall)
+        if no_answer_precision is not None
+        and no_answer_recall is not None
+        and no_answer_precision + no_answer_recall > 0
+        else 0.0
+        if no_answer_precision is not None and no_answer_recall is not None
+        else None
+    )
+
+    def answerable_average(field: str) -> float | None:
+        if not answerable:
+            return None
+        return round(sum(float(outcome[field]) for outcome in answerable) / len(answerable), 6)
+
+    def bucket_summary(
+        counts: Mapping[str, int],
+        values: Mapping[str, list[tuple[float, float, float]]],
+    ) -> dict[str, dict[str, int | float | None]]:
+        summary: dict[str, dict[str, int | float | None]] = {}
+        for label in sorted(counts):
+            answerable_values = values[label]
+            answerable_count = len(answerable_values)
+            summary[label] = {
+                "cases": counts[label],
+                "answerable_cases": answerable_count,
+                "no_answer_cases": counts[label] - answerable_count,
+                "macro_recall_at_k": (
+                    round(sum(item[0] for item in answerable_values) / answerable_count, 6)
+                    if answerable_values
+                    else None
+                ),
+                "mrr": (
+                    round(sum(item[1] for item in answerable_values) / answerable_count, 6)
+                    if answerable_values
+                    else None
+                ),
+                "mean_ndcg_at_k": (
+                    round(sum(item[2] for item in answerable_values) / answerable_count, 6)
+                    if answerable_values
+                    else None
+                ),
+            }
+        return summary
+
     metrics: dict[str, object] = {
-        "macro_recall_at_k": round(
-            sum(float(outcome["recall_at_k"]) for outcome in outcomes) / len(outcomes), 6
-        ),
-        "mrr": round(
-            sum(float(outcome["reciprocal_rank"]) for outcome in outcomes) / len(outcomes), 6
-        ),
-        "mean_ndcg_at_k": round(
-            sum(float(outcome["ndcg_at_k"]) for outcome in outcomes) / len(outcomes), 6
-        ),
-        "any_expected_path_rate": round(
-            sum(bool(outcome["any_expected_path"]) for outcome in outcomes) / len(outcomes), 6
-        ),
-        "all_expected_paths_rate": round(
-            sum(bool(outcome["all_expected_paths"]) for outcome in outcomes) / len(outcomes), 6
-        ),
-        "answerable_all_paths_rate": round(
-            sum(bool(outcome["all_expected_paths"]) for outcome in answerable) / len(answerable), 6
-        )
-        if answerable
-        else None,
+        "cases": len(outcomes),
+        "answerable_cases": len(answerable),
+        "no_answer_cases": no_answer_cases,
+        "macro_recall_at_k": answerable_average("recall_at_k"),
+        "mrr": answerable_average("reciprocal_rank"),
+        "mean_ndcg_at_k": answerable_average("ndcg_at_k"),
+        "any_expected_path_rate": answerable_average("any_expected_path"),
+        "all_expected_paths_rate": answerable_average("all_expected_paths"),
+        # Compatibility alias retained for reports produced by v0.1.3.
+        "answerable_all_paths_rate": answerable_average("all_expected_paths"),
         "citation_recall": round(sum(citation_scores) / len(citation_scores), 6)
         if citation_scores
         else None,
-        "no_answer_precision": round(correct_predicted_no_answer / predicted_no_answer, 6)
-        if predicted_no_answer
+        "no_answer_precision": (
+            round(no_answer_precision, 6) if no_answer_precision is not None else None
+        ),
+        "no_answer_recall": round(no_answer_recall, 6) if no_answer_recall is not None else None,
+        "no_answer_f1": round(no_answer_f1, 6) if no_answer_f1 is not None else None,
+        "no_answer_accuracy": round(
+            (no_answer_true_positive + no_answer_true_negative) / len(outcomes), 6
+        )
+        if outcomes
         else None,
-        "no_answer_accuracy": round(correct_no_answer_cases / no_answer_cases, 6)
-        if no_answer_cases
-        else None,
-        "by_language": {
-            language: {
-                "cases": len(values),
-                "macro_recall_at_k": round(sum(item[0] for item in values) / len(values), 6),
-                "mrr": round(sum(item[1] for item in values) / len(values), 6),
-                "mean_ndcg_at_k": round(sum(item[2] for item in values) / len(values), 6),
-            }
-            for language, values in sorted(language_metrics.items())
-        },
+        "by_language": bucket_summary(language_case_counts, language_metrics),
+        "by_query_type": bucket_summary(query_type_case_counts, query_type_metrics),
     }
     return outcomes, metrics
 
@@ -211,6 +269,8 @@ def main() -> int:
     with RepositoryIndex.open(repository) as index:
         retrieval = RetrievalEngine(index)
         outcomes, metrics = evaluate_cases(retrieval, questions, limit=arguments.limit)
+    if not metrics["answerable_cases"]:
+        raise ValueError("evaluation file must contain at least one answerable case")
     hit_rate = float(metrics["any_expected_path_rate"])
     report = {
         "repository": str(repository),

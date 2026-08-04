@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from repolocus.scanner import (
     contains_likely_secret,
     detect_language,
     is_binary,
+    is_generated_document,
     is_sensitive_path,
 )
 
@@ -188,6 +190,24 @@ def test_repolocus_and_legacy_generated_markdown_are_excluded(tmp_path: Path) ->
     assert result.stats.skipped["generated"] == 3
 
 
+def test_generated_marker_is_extension_independent_and_strictly_bounded(
+    tmp_path: Path,
+) -> None:
+    marker = "<!-- Generator: RepoLocus 0.1.3; deterministic source map. -->"
+    _write(tmp_path, "renamed.py", marker + "\nself_derived = True\n")
+    _write(tmp_path, "line-16.py", ("# padding\n" * 15) + marker + "\n")
+    _write(tmp_path, "line-17.py", ("# padding\n" * 16) + marker + "\n")
+
+    result = RepositoryScanner().scan(tmp_path)
+
+    assert [file.path for file in result.files] == ["line-17.py"]
+    assert result.stats.skipped["generated"] == 2
+    assert is_generated_document(("x\n" * 16) + marker) is False
+    assert is_generated_document((" " * 4096) + marker) is False
+    assert is_generated_document(("界" * 1400) + "\n" + marker) is False
+    assert is_generated_document("Generator: RepoLocus; deterministic source map.") is False
+
+
 def test_secret_detection_is_reapplied_before_cached_fact_reuse(tmp_path: Path) -> None:
     text = 'api_key = "sk-abcdefghijklmnopqrstuvwxyz1234"\n'
     source = _write(tmp_path, "settings.py", text)
@@ -207,6 +227,22 @@ def test_secret_detection_is_reapplied_before_cached_fact_reuse(tmp_path: Path) 
 
     assert result.files == []
     assert result.stats.skipped == {"likely_secret": 1}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd/openat is POSIX-only")
+def test_dirfd_reads_do_not_require_linux_proc_descriptor_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(tmp_path, "value.py", "VALUE = 1\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    if not scanner_repository._USE_DIRECTORY_FDS:
+        pytest.skip("directory descriptor traversal is unavailable")
+    monkeypatch.setattr(scanner_repository, "descriptor_path", lambda _descriptor: None)
+
+    result = RepositoryScanner().scan(tmp_path)
+
+    assert [(file.path, file.text) for file in result.files] == [(source.name, "VALUE = 1\n")]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd/openat is POSIX-only")
@@ -242,6 +278,244 @@ def test_directory_swap_to_outside_symlink_is_never_followed(
     assert result.files == []
     assert result.temporarily_unreadable == ("nested",)
     assert all("stolen-outside" not in warning for warning in result.warnings)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd/openat is POSIX-only")
+def test_open_directory_rename_and_replacement_marks_subtree_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    nested = repository / "nested"
+    nested.mkdir(parents=True)
+    _write(repository, "nested/value.py", "VALUE = 'old'\n")
+    scanner = RepositoryScanner()
+    baseline = scanner.scan(repository)
+    cached = {file.path: file for file in baseline.files}
+    from repolocus.scanner import repository as scanner_repository
+
+    if not scanner_repository._USE_DIRECTORY_FDS:
+        pytest.skip("directory descriptor traversal is unavailable")
+    original_open_directory = scanner_repository._open_directory_at
+    swapped = False
+
+    def swap_after_open(
+        name: str, expected: os.stat_result, directory_fd: int
+    ) -> tuple[int | None, str | None]:
+        nonlocal swapped
+        descriptor, reason = original_open_directory(name, expected, directory_fd)
+        if name == "nested" and descriptor is not None and not swapped:
+            swapped = True
+            nested.rename(repository / "detached-nested")
+            nested.mkdir()
+            _write(repository, "nested/value.py", "VALUE = 'replacement'\n")
+        return descriptor, reason
+
+    monkeypatch.setattr(scanner_repository, "_open_directory_at", swap_after_open)
+
+    result = scanner.scan(
+        repository,
+        cached_files=cached,
+        trusted_cache=True,
+        base_generation=1,
+    )
+
+    assert swapped
+    assert result.files == []
+    assert result.temporarily_unreadable == ("nested",)
+    assert result.stats.skipped == {"changed_during_scan": 1}
+    assert result.warnings == ["directory changed during scan: nested"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX symlinks")
+def test_path_based_walk_revalidates_directory_before_loading_ignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    nested = repository / "nested"
+    nested.mkdir(parents=True)
+    _write(repository, "nested/value.py", "VALUE = 'inside'\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, ".gitignore", "!\n")
+    _write(outside, "value.py", "VALUE = 'stolen-outside'\n")
+    scanner = RepositoryScanner()
+    baseline = scanner.scan(repository)
+    cached = {item.path: item for item in baseline.files}
+
+    from repolocus.scanner import repository as scanner_repository
+
+    monkeypatch.setattr(scanner_repository, "_USE_DIRECTORY_FDS", False)
+    original_resolve = Path.resolve
+    original_safe_read_at = scanner_repository._safe_read_at
+    swapped = False
+    ignore_reads: list[Path] = []
+
+    def swap_after_resolve(path: Path, strict: bool = False) -> Path:
+        nonlocal swapped
+        resolved = original_resolve(path, strict=strict)
+        if path == nested and strict and not swapped:
+            swapped = True
+            nested.rename(repository / "original-nested")
+            nested.symlink_to(outside, target_is_directory=True)
+        return resolved
+
+    def track_safe_read(
+        name: str,
+        limit: int,
+        expected: os.stat_result,
+        *,
+        directory: Path,
+        directory_fd: int | None,
+        root: Path | None = None,
+    ) -> tuple[bytes | None, os.stat_result | None, str | None]:
+        if name == ".gitignore":
+            ignore_reads.append(directory)
+        return original_safe_read_at(
+            name,
+            limit,
+            expected,
+            directory=directory,
+            directory_fd=directory_fd,
+            root=root,
+        )
+
+    monkeypatch.setattr(Path, "resolve", swap_after_resolve)
+    monkeypatch.setattr(scanner_repository, "_safe_read_at", track_safe_read)
+
+    result = scanner.scan(repository, cached_files=cached)
+
+    assert swapped
+    assert ignore_reads == []
+    assert result.files == []
+    assert result.stats.skipped == {"changed_during_scan": 1}
+    assert result.temporarily_unreadable == ("nested",)
+    assert result.warnings == ["directory changed during scan: nested"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor paths")
+def test_path_based_ignore_open_verifies_the_opened_file_is_inside_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    nested = repository / "nested"
+    nested.mkdir(parents=True)
+    _write(repository, "nested/value.py", "VALUE = 'inside'\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write(outside, ".gitignore", "*.py\n")
+    _write(outside, "value.py", "VALUE = 'outside'\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    monkeypatch.setattr(scanner_repository, "_USE_DIRECTORY_FDS", False)
+    original_load = RepositoryScanner._load_local_ignore
+    original_read = scanner_repository._read_descriptor
+    payload_reads = 0
+    swapped = False
+
+    def swap_before_ignore_open(self, root, directory, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if directory == nested and not swapped:
+            swapped = True
+            nested.rename(tmp_path / "old-nested")
+            nested.symlink_to(outside, target_is_directory=True)
+        return original_load(self, root, directory, *args, **kwargs)
+
+    def count_payload_reads(descriptor: int, limit: int):  # type: ignore[no-untyped-def]
+        nonlocal payload_reads
+        payload_reads += 1
+        return original_read(descriptor, limit)
+
+    monkeypatch.setattr(RepositoryScanner, "_load_local_ignore", swap_before_ignore_open)
+    monkeypatch.setattr(scanner_repository, "_read_descriptor", count_payload_reads)
+
+    result = RepositoryScanner().scan(repository)
+
+    assert swapped
+    assert payload_reads == 0
+    assert result.files == []
+    assert result.temporarily_unreadable == ("nested",)
+
+
+def test_empty_directory_deadline_is_checked_after_enumeration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repolocus.scanner import repository as scanner_repository
+
+    now = [0.0]
+    original_scandir = scanner_repository.os.scandir
+
+    class TimedScandir:
+        def __init__(self, target: int | Path) -> None:
+            self.iterator = original_scandir(target)
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self.iterator.__enter__()
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            result = self.iterator.__exit__(*args)
+            now[0] = 2.0
+            return result
+
+    monkeypatch.setattr(scanner_repository, "monotonic", lambda: now[0])
+    monkeypatch.setattr(scanner_repository.os, "scandir", TimedScandir)
+
+    result = RepositoryScanner(max_scan_seconds=1).scan(tmp_path)
+
+    assert result.temporarily_unreadable == (".",)
+    assert result.stats.skipped["repository_budget"] == 1
+    assert any("scan deadline" in warning for warning in result.warnings)
+
+
+def test_directory_rollback_preserves_a_global_budget_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repolocus.scanner import repository as scanner_repository
+
+    _write(tmp_path, "nested/a.py", "VALUE = 1\n")
+    _write(tmp_path, "nested/b.py", "VALUE = 2\n")
+    changed = False
+
+    class ChangeAfterSecondParse:
+        languages = frozenset({"python"})
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def parse(
+            self,
+            path: str,
+            text: str,
+            language: str,
+            **_kwargs: object,
+        ) -> ParseResult:
+            nonlocal changed
+            self.calls += 1
+            if self.calls == 2:
+                changed = True
+            return ParseResult(chunks=(Chunk(path, 1, 1, text.rstrip(), language),))
+
+    parser = ChangeAfterSecondParse()
+    registry = ParserRegistry()
+    registry.register(parser)
+    monkeypatch.setattr(scanner_repository, "_USE_DIRECTORY_FDS", False)
+    monkeypatch.setattr(
+        scanner_repository,
+        "_is_stable_unpinned_directory",
+        lambda *_args, **_kwargs: not changed,
+    )
+
+    result = RepositoryScanner(
+        parser_registry=registry,
+        max_repository_chunks=1,
+    ).scan(tmp_path)
+
+    assert result.files == []
+    assert result.stats.skipped["changed_during_scan"] == 1
+    assert result.stats.skipped["repository_budget"] == 1
+    assert result.temporarily_unreadable == (".",)
+    assert any("chunk count" in warning for warning in result.warnings)
 
 
 def test_windows_reparse_attribute_is_explicitly_recognized() -> None:
@@ -468,6 +742,139 @@ def test_unchanged_files_reuse_versioned_parser_results(tmp_path: Path) -> None:
     assert first.analysis_version == "counting-v1:lines=160:chars=16000"
 
 
+def test_trusted_incremental_cache_skips_unchanged_file_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write(tmp_path, "one.py", "VALUE = 1\n")
+    scanner = RepositoryScanner()
+    first = scanner.scan(tmp_path)
+    from repolocus.scanner import repository as scanner_repository
+
+    original_read = scanner_repository._safe_read_at
+
+    def reject_source_read(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if name == source.name:
+            raise AssertionError("unchanged trusted cache entry must not be reopened")
+        return original_read(name, *args, **kwargs)
+
+    monkeypatch.setattr(scanner_repository, "_safe_read_at", reject_source_read)
+
+    second = scanner.scan(
+        tmp_path,
+        cached_files={file.path: file for file in first.files},
+        trusted_cache=True,
+        base_generation=1,
+    )
+
+    assert second.files == first.files
+
+
+def test_trusted_incremental_cache_never_reuses_generated_rows(tmp_path: Path) -> None:
+    source = _write(tmp_path, "one.py", "VALUE = 1\n")
+    scanner = RepositoryScanner()
+    first = scanner.scan(tmp_path)
+    generated = replace(first.files[0], text="", chunks=(), symbols=(), provenance="generated")
+
+    second = scanner.scan(
+        tmp_path,
+        cached_files={generated.path: generated},
+        trusted_cache=True,
+        base_generation=1,
+    )
+
+    assert second.files[0].text == source.read_text(encoding="utf-8")
+    assert second.files[0].chunks
+    assert second.files[0].provenance == "source"
+
+
+def test_repository_file_and_byte_budgets_fail_closed(tmp_path: Path) -> None:
+    _write(tmp_path, "a.py", "VALUE=1\n")
+    _write(tmp_path, "b.py", "VALUE=2\n")
+    _write(tmp_path, "c.py", "VALUE=3\n")
+
+    file_limited = RepositoryScanner(max_repository_files=2).scan(tmp_path)
+    byte_limited = RepositoryScanner(max_repository_bytes=10).scan(tmp_path)
+
+    assert file_limited.files == []
+    assert file_limited.temporarily_unreadable == (".",)
+    assert file_limited.stats.skipped["repository_budget"] == 1
+    assert len(byte_limited.files) == 1
+    assert byte_limited.temporarily_unreadable == (".",)
+    assert any("repository byte count" in warning for warning in byte_limited.warnings)
+
+
+def test_directory_and_parser_fact_budgets_mark_unscanned_content_incomplete(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, "a/b/deep.py", "def deep():\n    return 1\n")
+    depth_limited = RepositoryScanner(max_directory_depth=1).scan(tmp_path)
+
+    assert depth_limited.files == []
+    assert depth_limited.temporarily_unreadable == ("a/b",)
+    assert depth_limited.stats.skipped["max_directory_depth"] == 1
+
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    _write(flat, "a.py", "def first():\n    return 1\n")
+    _write(flat, "b.py", "def second():\n    return 2\n")
+    chunk_limited = RepositoryScanner(max_repository_chunks=1).scan(flat)
+    symbol_limited = RepositoryScanner(max_repository_symbols=1).scan(flat)
+
+    assert chunk_limited.temporarily_unreadable == (".",)
+    assert symbol_limited.temporarily_unreadable == (".",)
+    assert len(chunk_limited.files) == 1
+    assert len(symbol_limited.files) == 1
+
+
+def test_scan_wall_clock_deadline_marks_the_repository_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repolocus.scanner import repository as scanner_repository
+
+    _write(tmp_path, "one.py", "VALUE = 1\n")
+    readings = iter((10.0, 12.0))
+    monkeypatch.setattr(scanner_repository, "monotonic", lambda: next(readings))
+
+    result = RepositoryScanner(max_scan_seconds=1).scan(tmp_path)
+
+    assert result.files == []
+    assert result.temporarily_unreadable == (".",)
+    assert any("scan deadline" in warning for warning in result.warnings)
+
+
+def test_stale_cached_file_is_never_reused(tmp_path: Path) -> None:
+    class CountingParser:
+        languages = frozenset({"python"})
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def parse(
+            self,
+            path: str,
+            text: str,
+            language: str,
+            **kwargs: object,
+        ) -> ParseResult:
+            self.calls += 1
+            return ParseResult(chunks=(Chunk(path, 1, 1, text.rstrip(), language),))
+
+    parser = CountingParser()
+    registry = ParserRegistry()
+    registry.register(parser)
+    _write(tmp_path, "one.py", "value=1\n")
+    scanner = RepositoryScanner(parser_registry=registry, analysis_version="counting-v1")
+    first = scanner.scan(tmp_path)
+    stale = replace(first.files[0], stale=True)
+
+    second = scanner.scan(tmp_path, cached_files={stale.path: stale})
+
+    assert parser.calls == 2
+    assert second.files[0].stale is False
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -475,6 +882,12 @@ def test_unchanged_files_reuse_versioned_parser_results(tmp_path: Path) -> None:
         {"max_file_bytes": 1, "max_ignore_bytes": 0},
         {"max_file_bytes": 1, "max_chunk_lines": 0},
         {"max_file_bytes": 1, "max_chunk_chars": 0},
+        {"max_file_bytes": 1, "max_repository_files": 0},
+        {"max_file_bytes": 1, "max_repository_bytes": 0},
+        {"max_file_bytes": 1, "max_directory_depth": 0},
+        {"max_file_bytes": 1, "max_repository_chunks": 0},
+        {"max_file_bytes": 1, "max_repository_symbols": 0},
+        {"max_file_bytes": 1, "max_scan_seconds": 0},
     ],
 )
 def test_scanner_rejects_non_positive_limits(kwargs: dict[str, int]) -> None:

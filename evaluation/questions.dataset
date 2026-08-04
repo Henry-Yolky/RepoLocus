@@ -1,60 +1,87 @@
 [
   {
     "question": "Where is Settings configuration validated?",
-    "expected_paths": ["src/repolocus/config.py"]
+    "language": "en",
+    "query_type": "identifier",
+    "expected_paths": ["src/repolocus/config.py"],
+    "expected_citations": ["src/repolocus/config.py:139"]
   },
   {
     "question": "How is cloud provider consent enforced?",
+    "language": "en",
+    "query_type": "english",
     "expected_paths": ["src/repolocus/core/service.py", "src/repolocus/security/privacy.py"]
   },
   {
     "question": "Where are symlinks rejected during repository scanning?",
+    "language": "en",
+    "query_type": "english",
     "expected_paths": ["src/repolocus/scanner/repository.py"]
   },
   {
     "question": "Where is the SQLite FTS5 schema created?",
+    "language": "en",
+    "query_type": "identifier",
     "expected_paths": ["src/repolocus/index/store.py"]
   },
   {
     "question": "How is generated Mermaid syntax validated?",
+    "language": "en",
+    "query_type": "identifier",
     "expected_paths": ["src/repolocus/generators/mermaid.py"]
   },
   {
     "question": "Where does the OpenAI-compatible provider send requests?",
+    "language": "en",
+    "query_type": "identifier",
     "expected_paths": ["src/repolocus/providers/http.py"]
   },
   {
     "question": "How does the API confine requests to its configured root?",
+    "language": "en",
+    "query_type": "identifier",
     "expected_paths": ["src/repolocus/api/app.py"]
   },
   {
     "question": "Where are secrets redacted before model use?",
+    "language": "en",
+    "query_type": "english",
     "expected_paths": ["src/repolocus/security/redaction.py", "src/repolocus/core/service.py"]
   },
   {
     "question": "Where are generated output paths kept inside the repository?",
+    "language": "en",
+    "query_type": "english",
     "expected_paths": ["src/repolocus/security/paths.py", "src/repolocus/cli.py"]
   },
   {
     "question": "Where is the parser plugin registry implemented?",
+    "language": "en",
+    "query_type": "english",
     "expected_paths": ["src/repolocus/parsers/base.py"]
   },
   {
     "question": "How are retrieval candidates ranked and deduplicated?",
+    "language": "en",
+    "query_type": "english",
     "expected_paths": ["src/repolocus/retrieval/engine.py"]
   },
   {
     "question": "Where does clean refuse unsafe cache contents?",
+    "language": "en",
+    "query_type": "identifier",
     "expected_paths": ["src/repolocus/cli.py"]
   },
   {
     "question": "配置在哪里校验",
     "language": "zh",
-    "expected_paths": ["tests/test_terms.py"]
+    "query_type": "cjk",
+    "expected_paths": ["README.zh-CN.md"]
   },
   {
-    "question": "？？？",
-    "language": "no-answer",
+    "question": "How does the Erlang OTP supervisor restart crashed workers?",
+    "language": "en",
+    "query_type": "english",
     "expected_paths": []
   }
 ]

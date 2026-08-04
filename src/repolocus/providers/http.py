@@ -7,13 +7,14 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
 from repolocus.security.network import is_loopback_url
-from repolocus.security.redaction import redact_text
+from repolocus.security.redaction import contains_likely_secret, redact_secrets_with_count
 
 from .base import (
     ModelProvider,
@@ -21,6 +22,11 @@ from .base import (
     ProviderRequestError,
     ProviderResponseError,
 )
+
+_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 100_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +37,15 @@ class ProviderRequestPlan:
     model: str
     endpoint: str
     body: bytes
+    redaction_count: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.redaction_count, bool)
+            or not isinstance(self.redaction_count, int)
+            or self.redaction_count < 0
+        ):
+            raise ValueError("redaction_count must be a non-negative integer")
 
 
 def build_provider_request_plan(
@@ -50,8 +65,8 @@ def build_provider_request_plan(
     if not clean_model:
         raise ProviderConfigurationError("model name must not be empty")
     normalised_base = _normalise_base_url(base_url)
-    redacted_system = redact_text(system_prompt)
-    redacted_user = redact_text(user_prompt)
+    redacted_system, system_redactions = redact_secrets_with_count(system_prompt)
+    redacted_user, user_redactions = redact_secrets_with_count(user_prompt)
     if family == "ollama":
         endpoint = _append_endpoint(normalised_base, "/api/chat", accepted_suffix="/api/chat")
         payload: Mapping[str, Any] = {
@@ -96,7 +111,77 @@ def build_provider_request_plan(
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
-    return ProviderRequestPlan(family, clean_model, endpoint, body)
+    return ProviderRequestPlan(
+        family,
+        clean_model,
+        endpoint,
+        body,
+        system_redactions + user_redactions,
+    )
+
+
+def _walk_json(value: object) -> list[str]:
+    strings: list[str] = []
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            raise ValueError("JSON structure exceeds the configured complexity limit")
+        if isinstance(current, str):
+            strings.append(current)
+        elif isinstance(current, Mapping):
+            stack.extend((key, depth + 1) for key in current)
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+    return strings
+
+
+def _validate_outbound_body(body: bytes) -> None:
+    """Reject a malformed or secret-bearing body immediately before transport."""
+
+    if not isinstance(body, bytes) or len(body) > _MAX_REQUEST_BYTES:
+        raise ProviderConfigurationError("prepared provider request body is invalid or too large")
+    try:
+        raw_text = body.decode("utf-8")
+        data = json.loads(raw_text)
+        strings = _walk_json(data)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ProviderConfigurationError("prepared provider request body is not safe JSON") from exc
+    if not isinstance(data, Mapping):
+        raise ProviderConfigurationError("prepared provider request body must be a JSON object")
+    if contains_likely_secret(raw_text) or any(contains_likely_secret(value) for value in strings):
+        raise ProviderConfigurationError(
+            "prepared provider request was blocked because credential-like content remained"
+        )
+
+
+def _validate_response_headers(response: httpx.Response) -> None:
+    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
+    if media_type != "application/json" and not media_type.endswith("+json"):
+        raise ProviderResponseError("provider returned a non-JSON content type")
+    content_length = response.headers.get("content-length")
+    if content_length is None:
+        return
+    try:
+        declared = int(content_length, 10)
+    except ValueError as exc:
+        raise ProviderResponseError("provider returned an invalid Content-Length") from exc
+    if declared < 0:
+        raise ProviderResponseError("provider returned an invalid Content-Length")
+    if declared > _MAX_RESPONSE_BYTES:
+        raise ProviderResponseError(
+            f"provider response exceeds the {_MAX_RESPONSE_BYTES}-byte limit"
+        )
+
+
+def _validate_json_shape(data: Mapping[str, Any], *, provider: str) -> None:
+    try:
+        _walk_json(data)
+    except ValueError as exc:
+        raise ProviderResponseError(f"{provider} returned overly complex JSON") from exc
 
 
 class _HTTPProvider(ModelProvider):
@@ -129,13 +214,53 @@ class _HTTPProvider(ModelProvider):
         headers: Mapping[str, str],
         body: bytes,
     ) -> Mapping[str, Any]:
+        _validate_outbound_body(body)
+        deadline = monotonic() + self.timeout
         try:
-            with httpx.Client(
-                timeout=httpx.Timeout(self.timeout),
-                transport=self._transport,
-                trust_env=not is_loopback_url(self.base_url),
-            ) as client:
-                response = client.post(endpoint, headers=headers, content=body)
+            with (
+                httpx.Client(
+                    timeout=httpx.Timeout(self.timeout),
+                    transport=self._transport,
+                    trust_env=not is_loopback_url(self.base_url),
+                ) as client,
+                client.stream("POST", endpoint, headers=headers, content=body) as response,
+            ):
+                if monotonic() > deadline:
+                    raise ProviderRequestError(
+                        f"{self.name} request exceeded the {self.timeout:g}-second "
+                        "elapsed-time deadline; it was not retried"
+                    )
+                if response.status_code >= 400:
+                    if response.status_code in {401, 403}:
+                        detail = "authentication was rejected"
+                    elif response.status_code == 429:
+                        detail = "rate limit or quota was exceeded"
+                    else:
+                        detail = f"HTTP {response.status_code}"
+                    raise ProviderRequestError(
+                        f"{self.name} request failed: {detail}; the request was not retried"
+                    )
+                _validate_response_headers(response)
+                blocks: list[bytes] = []
+                received = 0
+                for block in response.iter_bytes():
+                    if monotonic() > deadline:
+                        raise ProviderRequestError(
+                            f"{self.name} request exceeded the {self.timeout:g}-second "
+                            "elapsed-time deadline; it was not retried"
+                        )
+                    received += len(block)
+                    if received > _MAX_RESPONSE_BYTES:
+                        raise ProviderResponseError(
+                            f"{self.name} response exceeded the {_MAX_RESPONSE_BYTES}-byte limit"
+                        )
+                    blocks.append(block)
+                if monotonic() > deadline:
+                    raise ProviderRequestError(
+                        f"{self.name} request exceeded the {self.timeout:g}-second "
+                        "elapsed-time deadline; it was not retried"
+                    )
+                response_body = b"".join(blocks)
         except httpx.TimeoutException as exc:
             raise ProviderRequestError(
                 f"{self.name} request timed out after {self.timeout:g} seconds; it was not retried"
@@ -144,23 +269,13 @@ class _HTTPProvider(ModelProvider):
             raise ProviderRequestError(
                 f"could not reach {self.name} provider; check its URL and network access"
             ) from exc
-
-        if response.status_code >= 400:
-            if response.status_code in {401, 403}:
-                detail = "authentication was rejected"
-            elif response.status_code == 429:
-                detail = "rate limit or quota was exceeded"
-            else:
-                detail = f"HTTP {response.status_code}"
-            raise ProviderRequestError(
-                f"{self.name} request failed: {detail}; the request was not retried"
-            )
         try:
-            data = response.json()
-        except ValueError as exc:
+            data = json.loads(response_body)
+        except (ValueError, RecursionError) as exc:
             raise ProviderResponseError(f"{self.name} returned invalid JSON") from exc
         if not isinstance(data, Mapping):
             raise ProviderResponseError(f"{self.name} returned a non-object JSON response")
+        _validate_json_shape(data, provider=self.name)
         return data
 
 

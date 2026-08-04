@@ -8,7 +8,7 @@ from typing import Literal
 
 Confidence = Literal["confirmed", "inferred", "needs_review"]
 Provenance = Literal["source", "generated"]
-ANALYSIS_VERSION = "2"
+ANALYSIS_VERSION = "3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +77,8 @@ class ScannedFile:
     ctime_ns: int = 0
     provenance: Provenance = "source"
     stale: bool = False
+    cached_chunk_count: int = 0
+    cached_symbol_count: int = 0
 
 
 @dataclass(slots=True)
@@ -104,6 +106,7 @@ class ScanResult:
     analysis_version: str = ANALYSIS_VERSION
     temporarily_unreadable: tuple[str, ...] = ()
     base_generation: int | None = None
+    repository_identity: str = ""
 
 
 @dataclass(frozen=True, slots=True)

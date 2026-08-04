@@ -27,6 +27,7 @@ from repolocus.models import (
     ScanStats,
     Symbol,
 )
+from repolocus.scanner import RepositoryScanner
 
 
 def _file(
@@ -63,6 +64,26 @@ def _file(
 
 def _scan(root: Path, *files: ScannedFile) -> ScanResult:
     return ScanResult(root=root, files=list(files), stats=ScanStats())
+
+
+def test_manifest_snapshot_does_not_materialize_text_or_parser_facts(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = _file("app.py", "def main():\n    return 1\n", symbol="main")
+
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        index.update(_scan(repository, source))
+        snapshot = index.manifest_snapshot()
+
+    assert len(snapshot.files) == 1
+    manifest = snapshot.files[0]
+    assert manifest.path == "app.py"
+    assert manifest.text == ""
+    assert manifest.symbols == ()
+    assert manifest.dependencies == ()
+    assert manifest.chunks == ()
+    assert manifest.cached_symbol_count == 1
+    assert manifest.cached_chunk_count == 1
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions use mode bits")
@@ -177,6 +198,82 @@ def test_incremental_update_round_trip_and_removal(tmp_path: Path) -> None:
     with RepositoryIndex.open(repository, cache) as reopened:
         assert [file.path for file in reopened.get_files()] == ["app.py", "new.py"]
         assert reopened.get_metadata()["last_update_removed"] == "1"
+
+
+def test_manifest_query_never_reads_stored_source_text(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        index.update(_scan(repository, _file("source.py", "VALUE = 1\n")))
+
+        def deny_text_read(
+            action: int,
+            table: str | None,
+            column: str | None,
+            _database: str | None,
+            _trigger: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_READ and table == "files" and column == "text":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        index._connection.set_authorizer(deny_text_read)
+        try:
+            manifest = index.get_file_manifest()
+        finally:
+            index._connection.set_authorizer(None)
+
+    assert [file.path for file in manifest] == ["source.py"]
+    assert manifest[0].text == ""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX symlinks")
+def test_directory_replaced_by_symlink_retains_old_facts_as_stale(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    nested = repository / "nested"
+    nested.mkdir(parents=True)
+    (nested / "value.py").write_text("VALUE = 'old'\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "value.py").write_text("VALUE = 'outside'\n", encoding="utf-8")
+    scanner = RepositoryScanner()
+
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        initial_scan = scanner.scan(repository)
+        initial = index.update(initial_scan)
+        nested.rename(tmp_path / "old-nested")
+        nested.symlink_to(outside, target_is_directory=True)
+
+        changed_scan = scanner.scan(
+            repository,
+            cached_files={file.path: file for file in initial_scan.files},
+            trusted_cache=True,
+            base_generation=initial.generation,
+        )
+        changed = index.update(changed_scan)
+        retained = index.get_files()
+
+    assert "nested" in changed_scan.temporarily_unreadable
+    assert changed.removed == 0
+    assert changed.stale == 1
+    assert [(file.path, file.stale) for file in retained] == [("nested/value.py", True)]
+
+
+def test_scan_commit_rejects_repository_replaced_after_scan(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "old.py").write_text("OLD = 1\n", encoding="utf-8")
+    scan = RepositoryScanner().scan(repository)
+
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        repository.rename(tmp_path / "old-repository")
+        repository.mkdir()
+        (repository / "new.py").write_text("NEW = 1\n", encoding="utf-8")
+
+        with pytest.raises(StaleScanError, match="identity changed"):
+            index.update(scan)
+
+        assert index.get_files() == []
 
 
 def test_file_text_becomes_fallback_chunk(tmp_path: Path) -> None:
@@ -327,7 +424,8 @@ def test_incomplete_scan_retains_old_facts_as_stale_until_refreshed(tmp_path: Pa
                 base_generation=retained.generation,
             )
         )
-        assert refreshed.unchanged == 1
+        assert refreshed.changed == 1
+        assert refreshed.unchanged == 0
         assert refreshed.stale == 0
         assert index.get_files()[0].stale is False
         assert index.search_chunks("KEEP_ME")[0].chunk.path == "src/keep.py"
@@ -400,17 +498,14 @@ def test_generated_provenance_round_trips_but_is_not_retrieved_by_default(
         assert index.find_symbol_chunks("UNIQUE_GENERATED_ASSERTION") == []
 
 
-def test_v2_index_is_migrated_without_losing_existing_facts(tmp_path: Path) -> None:
+def test_v2_index_migration_invalidates_untrusted_existing_facts(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
     cache = tmp_path / "cache"
     source = _file("one.py", "VALUE = 1\n")
-    generated = replace(
-        _file(
-            "PROJECT_MAP.md",
-            "# Project Map\n\n<!-- Generator: RepoLocus 0.1.2; deterministic source map. -->\n",
-        ),
-        language="markdown",
+    generated = _file(
+        "renamed-generated.py",
+        "# Project Map\n\n<!-- Generator: RepoLocus 0.1.2; deterministic source map. -->\n",
     )
     prose = replace(
         _file(
@@ -428,26 +523,102 @@ def test_v2_index_is_migrated_without_losing_existing_facts(tmp_path: Path) -> N
     connection.execute("ALTER TABLE files DROP COLUMN provenance")
     connection.execute("DROP TABLE chunk_terms")
     connection.execute("DELETE FROM meta WHERE key = 'generation'")
+    connection.execute("DELETE FROM meta WHERE key = 'repository_identity'")
     connection.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
     connection.execute("UPDATE meta SET value = '2' WHERE key = 'index_format_version'")
     connection.execute("PRAGMA user_version = 2")
     connection.commit()
+    connection.row_factory = sqlite3.Row
+    v2_migrator = object.__new__(RepositoryIndex)
+    v2_migrator._connection = connection
+    v2_migrator._migrate_v2_to_v3()
+    migrated_provenance = {
+        str(row["path"]): str(row["provenance"])
+        for row in connection.execute("SELECT path, provenance FROM files")
+    }
+    assert migrated_provenance["renamed-generated.py"] == "generated"
+    assert migrated_provenance["notes.md"] == "source"
     connection.close()
 
     with RepositoryIndex.open(repository, cache) as migrated:
-        files = {file.path: file for file in migrated.get_files()}
+        metadata = migrated.get_metadata()
 
-        assert files["one.py"].text == source.text
-        assert files["one.py"].provenance == "source"
-        assert files["one.py"].stale is False
-        assert files["PROJECT_MAP.md"].provenance == "generated"
-        assert files["notes.md"].provenance == "source"
-        assert migrated.generation() == 0
-        assert migrated.get_metadata()["schema_version"] == "3"
-        assert migrated.search_chunks("VALUE")[0].chunk.path == "one.py"
+        assert migrated.get_files() == []
+        assert migrated.get_symbols() == []
+        assert migrated.search_chunks("VALUE") == []
+        assert migrated.generation() == 1
+        assert metadata["analysis_version"] == ""
+        assert metadata["schema_version"] == "4"
+        assert metadata["index_format_version"] == "4"
+        assert len(metadata["repository_identity"]) == 64
         indexes = {
             str(row[1]) for row in migrated._connection.execute("PRAGMA index_list('chunk_terms')")
         }
         assert "chunk_terms_chunk_idx" in indexes
         migrated._migrate_v2_to_v3()  # Models a waiter after another migration.
-        assert migrated.get_files()
+        assert migrated.get_files() == []
+
+
+def test_same_path_repository_replacement_invalidates_index_identity(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = tmp_path / "cache"
+    old = _file("old.py", "OLD_REPOSITORY = True\n")
+
+    with RepositoryIndex.open(repository, cache) as index:
+        committed = index.update(_scan(repository, old))
+        old_identity = index.get_metadata()["repository_identity"]
+
+    repository.rename(tmp_path / "old-repository")
+    repository.mkdir()
+
+    with RepositoryIndex.open(repository, cache) as replacement:
+        metadata = replacement.get_metadata()
+
+        assert replacement.get_files() == []
+        assert replacement.search_chunks("OLD_REPOSITORY") == []
+        assert replacement.generation() == committed.generation + 1
+        assert metadata["analysis_version"] == ""
+        assert metadata["repository_identity"] != old_identity
+
+
+def test_restored_stale_file_replaces_same_hash_parser_facts(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = tmp_path / "cache"
+    old = _file("same.py", "VALUE = 1\n", symbol="parser_v1")
+    reparsed = replace(
+        old,
+        symbols=(Symbol("parser_v2", "function", "same.py", 1, 1, "parser_v2"),),
+        chunks=(Chunk("same.py", 1, 1, old.text, "python", "parser_v2"),),
+    )
+
+    with RepositoryIndex.open(repository, cache) as index:
+        first = index.update(
+            ScanResult(repository, [old], ScanStats(), analysis_version="parser-v1")
+        )
+        incomplete = index.update(
+            ScanResult(
+                repository,
+                [],
+                ScanStats(),
+                analysis_version="parser-v2",
+                temporarily_unreadable=("same.py",),
+                base_generation=first.generation,
+            )
+        )
+
+        restored = index.update(
+            ScanResult(
+                repository,
+                [reparsed],
+                ScanStats(),
+                analysis_version="parser-v2",
+                base_generation=incomplete.generation,
+            )
+        )
+
+        assert restored.changed == 1
+        assert restored.unchanged == 0
+        assert [symbol.name for symbol in index.get_symbols()] == ["parser_v2"]
+        assert index.get_files()[0].stale is False

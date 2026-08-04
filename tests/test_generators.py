@@ -1,4 +1,6 @@
+import re
 from pathlib import Path
+from urllib.parse import unquote
 
 from repolocus.generators import MermaidGenerator, ProjectMapGenerator, validate_mermaid
 from repolocus.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
@@ -96,6 +98,29 @@ def test_mermaid_document_keeps_source_evidence() -> None:
     assert "```mermaid" in document
     assert "## Source evidence" in document
     assert "[src/app/main.py:1](src/app/main.py#L1)" in document
+
+
+def test_nested_generated_documents_use_destination_relative_source_links(tmp_path: Path) -> None:
+    result = _result()
+    result.root = tmp_path
+    for file in result.files:
+        source = tmp_path / file.path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(file.text or "fixture\n", encoding="utf-8")
+    destination = tmp_path / "docs/generated/output.md"
+    destination.parent.mkdir(parents=True)
+
+    project_map = ProjectMapGenerator().generate(result, destination=destination)
+    diagram = MermaidGenerator().generate(result, destination=destination)
+
+    assert "[src/app/main.py:3](../../src/app/main.py#L3)" in project_map
+    assert "Source link base: generated-document-relative" in project_map
+    assert "[src/app/main.py:1](../../src/app/main.py#L1)" in diagram
+    assert "Source links are relative to this generated document." in diagram
+    for document, line in ((project_map, 3), (diagram, 1)):
+        match = re.search(rf"\[src/app/main\.py:{line}\]\(([^)#]+)#L{line}\)", document)
+        assert match is not None
+        assert (destination.parent / unquote(match.group(1))).resolve(strict=True).is_file()
 
 
 def test_every_mermaid_edge_has_import_evidence() -> None:

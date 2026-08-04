@@ -104,6 +104,12 @@ class RepoLocusService:
         self.settings = settings or Settings.load()
         self.scanner = scanner or RepositoryScanner(
             max_file_bytes=self.settings.max_file_bytes,
+            max_repository_files=self.settings.max_repository_files,
+            max_repository_bytes=self.settings.max_repository_bytes,
+            max_directory_depth=self.settings.max_directory_depth,
+            max_repository_chunks=self.settings.max_repository_chunks,
+            max_repository_symbols=self.settings.max_repository_symbols,
+            max_scan_seconds=self.settings.max_scan_seconds,
         )
         self.privacy = privacy or PrivacyStore()
 
@@ -112,20 +118,37 @@ class RepoLocusService:
         root: Path | str = ".",
         *,
         expected_generation: int | None = None,
+        _materialize_files: bool = False,
     ) -> ScanOperation:
-        """Refresh the index, retrying only scans not pinned to a generation."""
+        """Refresh the index, retrying only scans not pinned to a generation.
+
+        Unchanged files in the returned operation carry metadata and cached fact
+        counts, not materialized source text/chunks/symbols. Consumers that need
+        facts should query the committed index through map, diagram, or evidence.
+        """
 
         repo = self._repository(root)
         with RepositoryIndex.open(repo) as index:
             for attempt in range(_SCAN_ATTEMPTS):
-                snapshot = index.snapshot()
+                snapshot = (
+                    index.snapshot()
+                    if _materialize_files
+                    else index.manifest_snapshot(
+                        max_files=self.scanner.max_repository_files,
+                    )
+                )
                 self._require_generation(snapshot.generation, expected_generation)
                 cached_files: dict[str, ScannedFile] = {}
                 if snapshot.analysis_version == self.scanner.analysis_version:
-                    cached_files = {file.path: file for file in snapshot.files}
+                    cached_files = {
+                        file.path: file
+                        for file in snapshot.files
+                        if file.provenance == "source" and not file.stale
+                    }
                 result = self.scanner.scan(
                     repo,
                     cached_files=cached_files,
+                    trusted_cache=True,
                     base_generation=snapshot.generation,
                 )
                 try:
@@ -142,30 +165,29 @@ class RepoLocusService:
         root: Path | str,
         refresh: RefreshMode,
         expected_generation: int | None,
+        *,
+        materialize_files: bool = True,
     ) -> ScanOperation:
         mode = self._refresh_mode(refresh)
         repo = self._repository(root)
-        if mode == "always":
-            return self.scan(repo, expected_generation=expected_generation)
+        if mode in {"auto", "always"}:
+            return self.scan(
+                repo,
+                expected_generation=expected_generation,
+                _materialize_files=materialize_files,
+            )
 
         with RepositoryIndex.open(repo) as index:
-            snapshot = index.snapshot()
-            self._require_generation(snapshot.generation, expected_generation)
-            if self._valid_snapshot(snapshot):
-                return self._snapshot_operation(repo, index.db_path, snapshot)
-            if mode == "never" and self._compatible_snapshot(snapshot):
-                return self._snapshot_operation(repo, index.db_path, snapshot)
-        if mode == "never":
-            raise RuntimeError(
-                "no valid index snapshot is available; refresh the repository before querying"
+            snapshot = (
+                index.snapshot()
+                if materialize_files
+                else index.manifest_snapshot(max_files=self.scanner.max_repository_files)
             )
-        return self.scan(repo, expected_generation=expected_generation)
-
-    def _valid_snapshot(self, snapshot: IndexSnapshot) -> bool:
-        return (
-            self._compatible_snapshot(snapshot)
-            and not snapshot.temporarily_unreadable
-            and not any(file.stale for file in snapshot.files)
+            self._require_generation(snapshot.generation, expected_generation)
+            if self._compatible_snapshot(snapshot):
+                return self._snapshot_operation(repo, index.db_path, snapshot)
+        raise RuntimeError(
+            "no valid index snapshot is available; refresh the repository before querying"
         )
 
     def _compatible_snapshot(self, snapshot: IndexSnapshot) -> bool:
@@ -239,9 +261,17 @@ class RepoLocusService:
         *,
         refresh: RefreshMode = "auto",
         expected_generation: int | None = None,
+        destination: Path | str | None = None,
     ) -> tuple[str, ScanOperation]:
+        """Generate a map with links relative to *destination* when supplied.
+
+        Without a destination, links remain repository-root-relative for API
+        and stdout consumers; ``ScanOperation.to_dict()`` exposes that root.
+        """
+
         operation = self._operation(root, refresh, expected_generation)
-        return ProjectMapGenerator().generate(operation.result), operation
+        output = self._generation_destination(operation.result.root, destination)
+        return ProjectMapGenerator().generate(operation.result, destination=output), operation
 
     def diagram(
         self,
@@ -249,9 +279,25 @@ class RepoLocusService:
         *,
         refresh: RefreshMode = "auto",
         expected_generation: int | None = None,
+        destination: Path | str | None = None,
     ) -> tuple[str, ScanOperation]:
+        """Generate a diagram using the same source-link contract as :meth:`map`."""
+
         operation = self._operation(root, refresh, expected_generation)
-        return MermaidGenerator().generate(operation.result), operation
+        output = self._generation_destination(operation.result.root, destination)
+        return MermaidGenerator().generate(operation.result, destination=output), operation
+
+    @staticmethod
+    def _generation_destination(
+        root: Path,
+        destination: Path | str | None,
+    ) -> Path | None:
+        if destination is None:
+            return None
+        requested = Path(destination).expanduser()
+        if not requested.is_absolute():
+            requested = root / requested
+        return requested.resolve(strict=False)
 
     def evidence(
         self,
@@ -266,7 +312,12 @@ class RepoLocusService:
             raise ValueError("question must not be empty")
         if len(question) > 4_000:
             raise ValueError("question must not exceed 4000 characters")
-        operation = self._operation(root, refresh, expected_generation)
+        operation = self._operation(
+            root,
+            refresh,
+            expected_generation,
+            materialize_files=False,
+        )
         with RepositoryIndex.open(operation.result.root) as index:
             self._require_generation(index.generation(), operation.update.generation)
             evidence = RetrievalEngine(
@@ -328,7 +379,9 @@ class RepoLocusService:
             paths=tuple(dict.fromkeys(item.path for item in bounded)),
             fragment_count=len(bounded),
             estimated_tokens=self._estimated_tokens(bounded),
-            redaction_count=redaction_count,
+            redaction_count=(
+                redaction_count + (request_plan.redaction_count if request_plan is not None else 0)
+            ),
             model=chosen_model,
             endpoint=endpoint,
             payload_bytes=len(request_plan.body) if request_plan is not None else 0,

@@ -1,16 +1,31 @@
 from __future__ import annotations
 
-from repolocus.retrieval.terms import document_terms, literal_query_terms, query_terms
+from repolocus.retrieval.terms import (
+    document_terms,
+    literal_query_term_groups,
+    literal_query_terms,
+    query_terms,
+)
 
 
 def test_cjk_terms_use_bigrams_and_trigrams() -> None:
-    indexed = document_terms("配置在哪里校验")
+    query = "\u914d\u7f6e" + "\u5728\u54ea\u91cc" + "\u6821\u9a8c"
+    indexed = document_terms(query)
 
-    assert "配置" in indexed
-    assert "校验" in indexed
-    assert "配置在" in indexed
-    assert "置在哪" in indexed
-    assert "配" not in indexed
+    assert "\u914d\u7f6e" in indexed
+    assert "\u6821\u9a8c" in indexed
+    assert "\u914d\u7f6e\u5728" in indexed
+    assert "\u7f6e\u5728\u54ea" in indexed
+    assert "\u914d" not in indexed
+
+
+def test_literal_coverage_groups_cjk_alternatives_but_not_non_cjk_terms() -> None:
+    cjk_query = "\u914d\u7f6e" + "\u5728\u54ea\u91cc" + "\u6821\u9a8c"
+    groups = literal_query_term_groups(cjk_query + " policy")
+
+    assert groups[0][0] == cjk_query
+    assert groups[0] == (cjk_query, "\u914d\u7f6e", "\u5728\u54ea", "\u6821\u9a8c")
+    assert groups[1] == ("policy",)
 
 
 def test_identifiers_paths_and_unicode_are_normalized() -> None:

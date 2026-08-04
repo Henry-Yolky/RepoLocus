@@ -117,16 +117,85 @@ def test_cjk_subphrases_and_identifier_parts_are_searchable(tmp_path: Path) -> N
     repository.mkdir()
     source = _source(
         "src/httpClient.py",
-        "def loadConfigValue():\n    # 配置在哪里校验\n    return True\n",
+        "def loadConfigValue():\n    # \u8fd9\u91cc\u6267\u884c\u914d\u7f6e"
+        "\u6821\u9a8c\u903b\u8f91\n    return True\n",
         "loadConfigValue",
     )
     with RepositoryIndex.open(repository, tmp_path / "cache") as index:
         index.update(ScanResult(repository, [source], ScanStats()))
         retrieval = RetrievalEngine(index)
 
-        assert retrieval.search("配置", limit=1)[0].path == "src/httpClient.py"
-        assert retrieval.search("校验", limit=1)[0].path == "src/httpClient.py"
+        assert retrieval.search("\u914d\u7f6e", limit=1)[0].path == "src/httpClient.py"
+        assert retrieval.search("\u6821\u9a8c", limit=1)[0].path == "src/httpClient.py"
         assert retrieval.search("http client", limit=1)[0].path == "src/httpClient.py"
+
+
+def test_cjk_rewrite_uses_one_ngram_group_and_keeps_non_cjk_literal_required(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    with_policy = _source(
+        "src/primary.py",
+        "def verify_policy():\n    # \u8fd9\u91cc\u6267\u884c\u914d\u7f6e"
+        "\u6821\u9a8c\u903b\u8f91\n    return policy\n",
+        "verify_policy",
+    )
+    without_policy = _source(
+        "src/secondary.py",
+        "def verify_value():\n    # \u8fd9\u91cc\u6267\u884c\u914d\u7f6e"
+        "\u6821\u9a8c\u903b\u8f91\n    return True\n",
+        "verify_value",
+    )
+    one_overlap_only = _source(
+        "src/distractor.py",
+        "def load_configuration():\n    # \u8fd9\u91cc\u53ea\u8d1f\u8d23\u914d\u7f6e\u5728"
+        "\u52a0\u8f7d\n    return True\n",
+        "load_configuration",
+    )
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        index.update(
+            ScanResult(
+                repository,
+                [one_overlap_only, with_policy, without_policy],
+                ScanStats(),
+            )
+        )
+
+        cjk_query = "\u914d\u7f6e" + "\u5728\u54ea\u91cc" + "\u6821\u9a8c"
+        rewritten = index.search_chunks(cjk_query, limit=10)
+        mixed = index.search_chunks(cjk_query + " policy", limit=10)
+
+    assert {hit.chunk.path for hit in rewritten} == {
+        "src/primary.py",
+        "src/secondary.py",
+    }
+    assert [hit.chunk.path for hit in mixed] == ["src/primary.py"]
+
+
+def test_expanded_terms_cannot_substitute_for_literal_coverage(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    literal = _source(
+        "src/literal.py",
+        "def literal_match():\n    return configuration and validated\n",
+        "literal_match",
+    )
+    expanded_only = _source(
+        "src/expanded.py",
+        "def expanded_match():\n    return config and validate\n",
+        "expanded_match",
+    )
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        index.update(ScanResult(repository, [literal, expanded_only], ScanStats()))
+
+        hits = index.search_chunks(
+            "configuration validated",
+            limit=10,
+            synonyms={"configuration": ("config",), "validated": ("validate",)},
+        )
+
+    assert [hit.chunk.path for hit in hits] == ["src/literal.py"]
 
 
 def test_dependency_neighbors_expand_in_both_directions(

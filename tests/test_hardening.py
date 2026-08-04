@@ -91,7 +91,7 @@ def test_path_boundary_rejects_a_regular_file_as_root(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "state",
     [
-        {"version": 3, "repositories": {}},
+        {"version": 4, "repositories": {}},
         {"version": 1, "repositories": []},
     ],
 )
