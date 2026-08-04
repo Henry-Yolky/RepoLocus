@@ -253,6 +253,18 @@ def test_windows_reparse_attribute_is_explicitly_recognized() -> None:
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows file identity semantics")
+def test_windows_regular_file_is_not_reported_as_changed(tmp_path: Path) -> None:
+    _write(tmp_path, "app.py", "VALUE = 1\n")
+
+    result = RepositoryScanner().scan(tmp_path)
+
+    assert [item.path for item in result.files] == ["app.py"]
+    assert result.stats.indexed_files == 1
+    assert result.stats.skipped.get("changed_during_scan", 0) == 0
+    assert result.temporarily_unreadable == ()
+
+
 def test_sensitive_binary_oversize_and_likely_secret_files_are_filtered(tmp_path: Path) -> None:
     _write(tmp_path, ".env", "PASSWORD=correct-horse-battery-staple\n")
     _write(tmp_path, "id_rsa", "not actually a key\n")

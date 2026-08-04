@@ -433,7 +433,8 @@ class RepositoryScanner:
             absolute_path = directory / entry.name
             try:
                 if directory_fd is None:
-                    metadata = entry.stat(follow_symlinks=False)
+                    # Windows DirEntry.stat() may reuse find data without a stable file ID.
+                    metadata = absolute_path.lstat()
                 else:
                     metadata = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError:

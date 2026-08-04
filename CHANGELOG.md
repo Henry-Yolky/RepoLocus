@@ -27,6 +27,8 @@ Semantic Versioning while the project is in alpha.
 - Mermaid output now records one concrete import witness for every rendered edge.
 - The Codex Skill now requires a preinstalled compatible runtime or pre-synchronized trusted
   checkout and runs offline/no-sync, failing closed rather than installing dependencies.
+- Windows scans now use path-backed identity metadata so ordinary files are not falsely reported
+  as having changed between directory enumeration and opening.
 
 ### Security
 
