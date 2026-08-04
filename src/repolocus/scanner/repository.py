@@ -237,7 +237,9 @@ def _safe_read_at(
             or not _same_file_state(expected, current)
         ):
             return None, None, "changed_during_scan"
-        return payload, finished, None
+        # Persist path-derived timestamps. On Windows, handle and path ctime
+        # semantics differ, and the next trusted-cache comparison is path-based.
+        return payload, current, None
     finally:
         os.close(descriptor)
 

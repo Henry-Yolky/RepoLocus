@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from pathlib import Path
 
 _FILESYSTEM_IDENTITY_VERSION = "1"
@@ -49,6 +50,17 @@ def descriptor_path(descriptor: int) -> Path | None:
                 value = value[4:]
             return Path(value)
         except (ImportError, OSError, ValueError):
+            return None
+    if sys.platform == "darwin":  # pragma: no cover - exercised on macOS CI
+        try:
+            import fcntl
+
+            buffer = fcntl.fcntl(descriptor, fcntl.F_GETPATH, b"\0" * 1024)
+            encoded_path = buffer.split(b"\0", 1)[0]
+            if not encoded_path:
+                return None
+            return Path(os.fsdecode(encoded_path)).resolve(strict=True)
+        except (AttributeError, ImportError, OSError, RuntimeError, ValueError):
             return None
     proc_path = Path(f"/proc/self/fd/{descriptor}")
     try:

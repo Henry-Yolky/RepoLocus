@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -307,7 +308,7 @@ def test_repository_config_fallback_rejects_intermediate_links(
     external.mkdir()
     (external / "config.toml").write_text("max_file_bytes = 1\n", encoding="utf-8")
     (repo / ".repolocus").symlink_to(external, target_is_directory=True)
-    monkeypatch.setattr(config_module.os, "O_NOFOLLOW", 0)
+    monkeypatch.setattr(config_module.os, "O_NOFOLLOW", 0, raising=False)
 
     with pytest.raises(ConfigError, match=r"unsafe link|escapes repository root"):
         Settings.load(repo, environ={}, user_config_path=tmp_path / "missing.toml")
@@ -321,7 +322,7 @@ def test_repository_config_identity_checked_fallback_reads_one_snapshot(
 
     config = tmp_path / ".repolocus.toml"
     config.write_text("max_file_bytes = 7000\n", encoding="utf-8")
-    monkeypatch.setattr(config_module.os, "O_NOFOLLOW", 0)
+    monkeypatch.setattr(config_module.os, "O_NOFOLLOW", 0, raising=False)
 
     settings = Settings.load(
         tmp_path,
@@ -330,6 +331,62 @@ def test_repository_config_identity_checked_fallback_reads_one_snapshot(
     )
 
     assert settings.max_file_bytes == 7000
+
+
+def test_repository_config_compares_path_and_handle_metadata_portably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repolocus import config as config_module
+
+    config = tmp_path / ".repolocus.toml"
+    config.write_text("max_file_bytes = 7000\n", encoding="utf-8")
+    monkeypatch.setattr(config_module.os, "O_NOFOLLOW", 0, raising=False)
+    original_fstat = config_module.os.fstat
+
+    def windows_like_fstat(descriptor: int) -> SimpleNamespace:
+        metadata = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=metadata.st_ctime_ns + 1,
+        )
+
+    monkeypatch.setattr(config_module.os, "fstat", windows_like_fstat)
+
+    settings = Settings.load(
+        tmp_path,
+        environ={},
+        user_config_path=tmp_path / "missing.toml",
+    )
+
+    assert settings.max_file_bytes == 7000
+
+
+def test_repository_config_read_error_after_open_is_reported_as_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repolocus import config as config_module
+
+    config = tmp_path / ".repolocus.toml"
+    config.write_text("max_file_bytes = 7000\n", encoding="utf-8")
+    monkeypatch.setattr(config_module.os, "O_NOFOLLOW", 0, raising=False)
+
+    def fail_read(_descriptor: int) -> bytes:
+        raise OSError(32, "file is in use")
+
+    monkeypatch.setattr(config_module, "_read_config_descriptor", fail_read)
+
+    with pytest.raises(ConfigError, match="changed while being read"):
+        Settings.load(
+            tmp_path,
+            environ={},
+            user_config_path=tmp_path / "missing.toml",
+        )
 
 
 @pytest.mark.parametrize("value", ["sometimes", "", "2"])

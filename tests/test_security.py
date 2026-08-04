@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import stat
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from platformdirs import user_state_dir
@@ -34,6 +36,40 @@ def test_filesystem_identity_fails_closed_without_stable_ids() -> None:
     with pytest.raises(ValueError, match="stable object identity"):
         filesystem_identity(metadata)  # type: ignore[arg-type]
     assert descriptor_path(-1) is None
+
+
+def test_descriptor_path_uses_darwin_f_getpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from repolocus.security import identity as identity_module
+
+    source = tmp_path / "opened.txt"
+    source.write_text("content\n", encoding="utf-8")
+    expected = source.resolve()
+    encoded = os.fsencode(expected)
+    fake_fcntl = SimpleNamespace(
+        F_GETPATH=50,
+        fcntl=lambda _descriptor, _command, buffer: (encoded + b"\0").ljust(len(buffer), b"\0"),
+    )
+    monkeypatch.setattr(identity_module.sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "fcntl", fake_fcntl)
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert identity_module.descriptor_path(descriptor) == expected
+    finally:
+        os.close(descriptor)
+
+
+def test_descriptor_path_resolves_a_real_open_file(tmp_path: Path) -> None:
+    source = tmp_path / "opened.txt"
+    source.write_text("content\n", encoding="utf-8")
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        opened_path = descriptor_path(descriptor)
+        assert opened_path is not None
+        assert opened_path.samefile(source)
+    finally:
+        os.close(descriptor)
 
 
 def test_canonical_path_check_accepts_descendants(tmp_path: Path) -> None:

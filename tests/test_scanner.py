@@ -553,6 +553,20 @@ def test_safe_read_compares_metadata_from_matching_sources(
     assert payload == b"VALUE = 1\n"
     assert error is None
 
+    expected = source.lstat()
+    payload, returned_metadata, reason = scanner_repository._safe_read_at(
+        source.name,
+        100,
+        expected,
+        directory=tmp_path,
+        directory_fd=None,
+        root=tmp_path.resolve(),
+    )
+    assert payload == b"VALUE = 1\n"
+    assert reason is None
+    assert returned_metadata is not None
+    assert returned_metadata.st_ctime_ns == source.lstat().st_ctime_ns
+
 
 def test_safe_read_keeps_handle_and_path_content_states_linked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

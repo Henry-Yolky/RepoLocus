@@ -360,7 +360,7 @@ def test_provider_requires_json_content_type_and_bounded_json_depth() -> None:
             )
         ),
     )
-    with pytest.raises(ProviderResponseError, match="invalid JSON"):
+    with pytest.raises(ProviderResponseError, match=r"(?:invalid|overly complex) JSON"):
         recursive.generate("System", "Question")
 
 

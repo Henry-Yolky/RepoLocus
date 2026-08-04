@@ -461,6 +461,16 @@ def _same_config_state(first: os.stat_result, second: os.stat_result) -> bool:
     )
 
 
+def _same_config_identity_and_content(first: os.stat_result, second: os.stat_result) -> bool:
+    """Compare metadata collected from a path and an open handle."""
+
+    return (
+        (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+    )
+
+
 def _is_reparse_point(metadata: os.stat_result) -> bool:
     marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(getattr(metadata, "st_file_attributes", 0) & marker)
@@ -548,6 +558,7 @@ def _read_repository_config_bytes(root: Path, path: Path) -> bytes | None:
                     os.close(descriptor)
     else:
         candidate = root.joinpath(*relative.parts)
+        file_opened = False
         try:
             expected = candidate.lstat()
         except FileNotFoundError:
@@ -580,13 +591,14 @@ def _read_repository_config_bytes(root: Path, path: Path) -> bytes | None:
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
             descriptor = os.open(candidate, flags)
+            file_opened = True
             try:
                 opened = os.fstat(descriptor)
                 opened_path = descriptor_path(descriptor)
                 if (
                     not stat.S_ISREG(opened.st_mode)
                     or _is_reparse_point(opened)
-                    or not _same_config_state(expected, opened)
+                    or (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino)
                     or opened_path is None
                     or not opened_path.is_relative_to(root)
                 ):
@@ -600,18 +612,21 @@ def _read_repository_config_bytes(root: Path, path: Path) -> bytes | None:
             finally:
                 os.close(descriptor)
             current = candidate.lstat()
+            if stat.S_ISLNK(current.st_mode) or _is_reparse_point(current):
+                raise ConfigError(f"repository config changed while being read: {path}")
             current_resolved = candidate.resolve(strict=True)
             current_resolved.relative_to(root)
             if (
-                stat.S_ISLNK(current.st_mode)
-                or _is_reparse_point(current)
-                or not _same_config_state(opened, finished)
-                or not _same_config_state(finished, current)
+                not _same_config_state(opened, finished)
+                or not _same_config_identity_and_content(finished, current)
+                or not _same_config_state(expected, current)
             ):
                 raise ConfigError(f"repository config changed while being read: {path}")
         except ConfigError:
             raise
         except (OSError, ValueError) as exc:
+            if file_opened:
+                raise ConfigError(f"repository config changed while being read: {path}") from exc
             raise ConfigError(
                 f"repository config escapes repository root or uses an unsafe link: {path}"
             ) from exc
