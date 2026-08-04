@@ -595,6 +595,66 @@ def test_safe_read_keeps_handle_and_path_content_states_linked(
     assert error == "changed_during_scan"
 
 
+@pytest.mark.parametrize(
+    ("mtime_delta", "ctime_delta", "expected_error"),
+    [(0, 1, None), (1, 0, "changed_during_scan")],
+)
+def test_safe_read_revalidates_metadata_collected_after_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mtime_delta: int,
+    ctime_delta: int,
+    expected_error: str | None,
+) -> None:
+    source = _write(tmp_path, "app.py", "VALUE = 1\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    original_close = scanner_repository.os.close
+    original_stat = scanner_repository.os.stat
+    descriptor_closed = False
+
+    def close_and_mark(descriptor: int) -> None:
+        nonlocal descriptor_closed
+        original_close(descriptor)
+        descriptor_closed = True
+
+    def windows_like_stat(path: str | os.PathLike[str], *args, **kwargs):  # type: ignore[no-untyped-def]
+        metadata = original_stat(path, *args, **kwargs)
+        if not descriptor_closed or Path(path) != source:
+            return metadata
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns + mtime_delta,
+            st_ctime_ns=metadata.st_ctime_ns + ctime_delta,
+        )
+
+    monkeypatch.setattr(scanner_repository, "_IS_WINDOWS", True)
+    monkeypatch.setattr(scanner_repository.os, "close", close_and_mark)
+    monkeypatch.setattr(scanner_repository.os, "stat", windows_like_stat)
+    expected = source.lstat()
+
+    payload, returned_metadata, reason = scanner_repository._safe_read_at(
+        source.name,
+        100,
+        expected,
+        directory=tmp_path,
+        directory_fd=None,
+    )
+
+    if expected_error is not None:
+        assert payload is None
+        assert returned_metadata is None
+        assert reason == expected_error
+    else:
+        assert payload == b"VALUE = 1\n"
+        assert reason is None
+        assert returned_metadata is not None
+        assert returned_metadata.st_ctime_ns == expected.st_ctime_ns + ctime_delta
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows file identity semantics")
 def test_windows_path_and_handle_metadata_are_compared_consistently(tmp_path: Path) -> None:
     _write(tmp_path, ".gitignore", "*.tmp\n")
@@ -763,6 +823,9 @@ def test_trusted_incremental_cache_skips_unchanged_file_reads(
     source = _write(tmp_path, "one.py", "VALUE = 1\n")
     scanner = RepositoryScanner()
     first = scanner.scan(tmp_path)
+    settled = source.lstat()
+    assert first.files[0].mtime_ns == settled.st_mtime_ns
+    assert first.files[0].ctime_ns == settled.st_ctime_ns
     from repolocus.scanner import repository as scanner_repository
 
     original_read = scanner_repository._safe_read_at

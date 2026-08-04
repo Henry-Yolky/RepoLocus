@@ -34,6 +34,7 @@ DEFAULT_MAX_REPOSITORY_SYMBOLS = 500_000
 DEFAULT_MAX_SCAN_SECONDS = 120
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_IS_WINDOWS = os.name == "nt"
 _USE_DIRECTORY_FDS = (
     os.name == "posix"
     and os.open in os.supports_dir_fd
@@ -123,6 +124,14 @@ def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
     return _same_content_state(first, second) and first.st_ctime_ns == second.st_ctime_ns
 
 
+def _same_post_close_state(first: os.stat_result, second: os.stat_result) -> bool:
+    """Compare path metadata across the Windows handle-close boundary."""
+
+    return _same_content_state(first, second) and (
+        _IS_WINDOWS or first.st_ctime_ns == second.st_ctime_ns
+    )
+
+
 def _is_stable_unpinned_directory(
     directory: Path,
     root: Path,
@@ -198,6 +207,8 @@ def _safe_read_at(
             else "unreadable"
         )
         return None, None, reason
+    accepted_payload: bytes | None = None
+    preclose_path: os.stat_result | None = None
     try:
         try:
             opened = os.fstat(descriptor)
@@ -237,11 +248,27 @@ def _safe_read_at(
             or not _same_file_state(expected, current)
         ):
             return None, None, "changed_during_scan"
-        # Persist path-derived timestamps. On Windows, handle and path ctime
-        # semantics differ, and the next trusted-cache comparison is path-based.
-        return payload, current, None
+        accepted_payload = payload
+        preclose_path = current
     finally:
         os.close(descriptor)
+
+    if accepted_payload is None or preclose_path is None:  # pragma: no cover - control flow
+        raise RuntimeError("safe read completed without an accepted snapshot")
+    try:
+        if directory_fd is None:
+            persisted = os.stat(target, follow_symlinks=False)
+        else:
+            persisted = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return None, None, "changed_during_scan"
+    if (
+        not stat.S_ISREG(persisted.st_mode)
+        or _is_reparse_point(persisted)
+        or not _same_post_close_state(preclose_path, persisted)
+    ):
+        return None, None, "changed_during_scan"
+    return accepted_payload, persisted, None
 
 
 def _safe_read(path: Path, limit: int) -> tuple[bytes | None, str | None]:
