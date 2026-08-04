@@ -124,8 +124,8 @@ def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
     return _same_content_state(first, second) and first.st_ctime_ns == second.st_ctime_ns
 
 
-def _same_post_close_state(first: os.stat_result, second: os.stat_result) -> bool:
-    """Compare path metadata across the Windows handle-close boundary."""
+def _same_portable_path_state(first: os.stat_result, second: os.stat_result) -> bool:
+    """Compare path metadata without treating Windows ctime as a change token."""
 
     return _same_content_state(first, second) and (
         _IS_WINDOWS or first.st_ctime_ns == second.st_ctime_ns
@@ -265,7 +265,7 @@ def _safe_read_at(
     if (
         not stat.S_ISREG(persisted.st_mode)
         or _is_reparse_point(persisted)
-        or not _same_post_close_state(preclose_path, persisted)
+        or not _same_portable_path_state(preclose_path, persisted)
     ):
         return None, None, "changed_during_scan"
     return accepted_payload, persisted, None
@@ -309,7 +309,7 @@ def _metadata_still_matches_at(
     return (
         stat.S_ISREG(current.st_mode)
         and not _is_reparse_point(current)
-        and _same_file_state(expected, current)
+        and _same_portable_path_state(expected, current)
     )
 
 

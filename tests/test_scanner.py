@@ -655,6 +655,48 @@ def test_safe_read_revalidates_metadata_collected_after_close(
         assert returned_metadata.st_ctime_ns == expected.st_ctime_ns + ctime_delta
 
 
+@pytest.mark.parametrize(
+    ("is_windows", "mtime_delta", "expected_match"),
+    [(True, 0, True), (False, 0, False), (True, 1, False)],
+)
+def test_cache_revalidation_tolerates_only_windows_ctime_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    is_windows: bool,
+    mtime_delta: int,
+    expected_match: bool,
+) -> None:
+    source = _write(tmp_path, "app.py", "VALUE = 1\n")
+    from repolocus.scanner import repository as scanner_repository
+
+    expected = source.lstat()
+    original_stat = scanner_repository.os.stat
+
+    def changed_stat(path: str | os.PathLike[str], *args, **kwargs):  # type: ignore[no-untyped-def]
+        metadata = original_stat(path, *args, **kwargs)
+        return SimpleNamespace(
+            st_mode=metadata.st_mode,
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns + mtime_delta,
+            st_ctime_ns=metadata.st_ctime_ns + 1,
+        )
+
+    monkeypatch.setattr(scanner_repository, "_IS_WINDOWS", is_windows)
+    monkeypatch.setattr(scanner_repository.os, "stat", changed_stat)
+
+    assert (
+        scanner_repository._metadata_still_matches_at(
+            source.name,
+            expected,
+            directory=tmp_path,
+            directory_fd=None,
+        )
+        is expected_match
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows file identity semantics")
 def test_windows_path_and_handle_metadata_are_compared_consistently(tmp_path: Path) -> None:
     _write(tmp_path, ".gitignore", "*.tmp\n")
