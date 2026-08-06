@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from repolocus.analysis import AnalysisFingerprints
+
 Confidence = Literal["confirmed", "inferred", "needs_review"]
 Provenance = Literal["source", "generated"]
 ANALYSIS_VERSION = "3"
@@ -79,6 +81,8 @@ class ScannedFile:
     stale: bool = False
     cached_chunk_count: int = 0
     cached_symbol_count: int = 0
+    cached_dependency_count: int = 0
+    facts_materialized: bool = True
 
 
 @dataclass(slots=True)
@@ -90,6 +94,8 @@ class ScanStats:
     indexed_bytes: int = 0
     languages: dict[str, int] = field(default_factory=dict)
     skipped: dict[str, int] = field(default_factory=dict)
+    content_reads: int = 0
+    parsed_files: int = 0
 
     def skip(self, reason: str) -> None:
         self.skipped[reason] = self.skipped.get(reason, 0) + 1
@@ -107,6 +113,9 @@ class ScanResult:
     temporarily_unreadable: tuple[str, ...] = ()
     base_generation: int | None = None
     repository_identity: str = ""
+    base_scan_revision: int | None = None
+    fingerprints: AnalysisFingerprints | None = None
+    refresh_mode: Literal["auto", "always", "never", "rebuild"] = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +129,7 @@ class Evidence:
     score: float
     symbol: str = ""
     reason: str = "full-text match"
+    generation: int = 0
 
     @property
     def citation(self) -> str:
@@ -137,19 +147,45 @@ class IndexUpdate:
     removed: int
     chunks: int
     stale: int = 0
-    generation: int = 0
+    content_generation: int = 0
+    scan_revision: int = 0
+
+    @property
+    def generation(self) -> int:
+        """Deprecated compatibility alias for ``content_generation``."""
+
+        return self.content_generation
 
 
 @dataclass(frozen=True, slots=True)
 class IndexSnapshot:
     """One transactionally consistent index state used to seed a scan."""
 
-    generation: int
-    analysis_version: str
+    content_generation: int
+    scan_revision: int
+    fingerprints: AnalysisFingerprints | None
     files: tuple[ScannedFile, ...]
     skipped: tuple[tuple[str, int], ...] = ()
     warnings: tuple[str, ...] = ()
     temporarily_unreadable: tuple[str, ...] = ()
+
+    @property
+    def generation(self) -> int:
+        """Deprecated compatibility alias for ``content_generation``."""
+
+        return self.content_generation
+
+    @property
+    def analysis_version(self) -> str:
+        """Deprecated composite identity retained for older integrations."""
+
+        if self.fingerprints is None:
+            return ""
+        return (
+            f"scan={self.fingerprints.scan[:16]}:"
+            f"parser={self.fingerprints.parser[:16]}:"
+            f"terms={self.fingerprints.term_index[:16]}"
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -70,6 +72,7 @@ def test_evaluation_reports_complete_ranked_and_no_answer_metrics() -> None:
     assert metrics["by_language"]["en"]["cases"] == 2  # type: ignore[index]
     assert metrics["by_language"]["zh"]["answerable_cases"] == 0  # type: ignore[index]
     assert metrics["by_language"]["zh"]["macro_recall_at_k"] is None  # type: ignore[index]
+    assert metrics["by_repository"]["unspecified"]["cases"] == 4  # type: ignore[index]
     assert metrics["by_query_type"]["unspecified"]["cases"] == 4  # type: ignore[index]
 
 
@@ -169,3 +172,68 @@ def test_repository_question_set_keeps_top_five_path_hit_rate(
     assert metrics["by_language"]["zh"]["macro_recall_at_k"] == 1.0  # type: ignore[index]
     assert metrics["by_query_type"]["identifier"]["answerable_cases"] >= 1  # type: ignore[index,operator]
     assert all(outcome["language"] in {"en", "zh"} for outcome in outcomes)
+
+
+def test_external_multi_repository_release_gate_is_reproducible() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    command = [
+        sys.executable,
+        str(repository / "scripts" / "evaluate_external_repositories.py"),
+        str(repository / "evaluation"),
+    ]
+    results = [
+        subprocess.run(
+            command,
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        for _ in range(2)
+    ]
+
+    assert all(result.returncode == 0 for result in results), "\n".join(
+        result.stderr or result.stdout for result in results
+    )
+    assert results[0].stdout == results[1].stdout
+    reports = [json.loads(result.stdout) for result in results]
+    assert reports[0] == reports[1]
+    report = reports[0]
+    metrics = report["metrics"]
+    assert report["manifest"] == "external-manifest.json"
+    assert report["fixture_count"] == 6
+    assert report["qrels"] == 18
+    assert report["answerable_qrels"] == 12
+    assert report["no_answer_qrels"] == 6
+    assert report["citation_qrels"] == 12
+    assert report["gate"] == {
+        "passed": True,
+        "thresholds": {
+            "maximum_must_not_return_rate": 0.0,
+            "minimum_citation_recall": 1.0,
+            "minimum_hit_rate": 0.9,
+            "minimum_macro_recall": 0.8,
+            "minimum_mrr": 0.75,
+            "minimum_no_answer_f1": 0.8,
+        },
+    }
+    assert metrics["any_expected_path_rate"] >= 0.90
+    assert metrics["macro_recall_at_k"] >= 0.80
+    assert metrics["mrr"] >= 0.75
+    assert metrics["citation_recall"] >= 1.0
+    assert metrics["no_answer_f1"] >= 0.80
+    assert metrics["must_not_return_violation_rate"] == 0.0
+    assert set(metrics["by_repository"]) == {
+        "cpp-cmake",
+        "go-service",
+        "java-gradle",
+        "python-small",
+        "rust-cli",
+        "typescript-web",
+    }
+    assert all(bucket["cases"] == 3 for bucket in metrics["by_repository"].values())
+    assert all(fixture["revision"] == "fixture-v1" for fixture in report["fixtures"])
+    assert all(fixture["content_generation"] == 1 for fixture in report["fixtures"])
+    assert all(fixture["scan_revision"] == 1 for fixture in report["fixtures"])
+    assert all(outcome["qrel_line"] for outcome in report["outcomes"])

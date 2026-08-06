@@ -548,8 +548,10 @@ def test_v2_index_migration_invalidates_untrusted_existing_facts(tmp_path: Path)
         assert migrated.search_chunks("VALUE") == []
         assert migrated.generation() == 1
         assert metadata["analysis_version"] == ""
-        assert metadata["schema_version"] == "4"
-        assert metadata["index_format_version"] == "4"
+        assert metadata["schema_version"] == "5"
+        assert metadata["index_format_version"] == "5"
+        assert metadata["content_generation"] == "1"
+        assert metadata["scan_revision"] == "1"
         assert len(metadata["repository_identity"]) == 64
         indexes = {
             str(row[1]) for row in migrated._connection.execute("PRAGMA index_list('chunk_terms')")

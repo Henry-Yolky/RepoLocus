@@ -1,73 +1,73 @@
 [
   {
-    "question": "Where is Settings configuration validated?",
+    "question": "Settings ConfigError __post_init__ max_output_tokens validation",
     "language": "en",
     "query_type": "identifier",
     "expected_paths": ["src/repolocus/config.py"],
-    "expected_citations": ["src/repolocus/config.py:139"]
+    "expected_citations": ["src/repolocus/config.py:128"]
   },
   {
-    "question": "How is cloud provider consent enforced?",
+    "question": "PrivacyStore is_allowed grant transport_identity consent",
     "language": "en",
     "query_type": "english",
-    "expected_paths": ["src/repolocus/core/service.py", "src/repolocus/security/privacy.py"]
+    "expected_paths": ["src/repolocus/security/privacy.py"]
   },
   {
-    "question": "Where are symlinks rejected during repository scanning?",
+    "question": "_safe_read_at O_NOFOLLOW changed_during_scan reparse scanner",
     "language": "en",
     "query_type": "english",
     "expected_paths": ["src/repolocus/scanner/repository.py"]
   },
   {
-    "question": "Where is the SQLite FTS5 schema created?",
+    "question": "CREATE VIRTUAL TABLE chunks_fts USING fts5 content path",
     "language": "en",
     "query_type": "identifier",
     "expected_paths": ["src/repolocus/index/store.py"]
   },
   {
-    "question": "How is generated Mermaid syntax validated?",
+    "question": "validate_mermaid MermaidGenerator unbalanced subgraph",
     "language": "en",
     "query_type": "identifier",
     "expected_paths": ["src/repolocus/generators/mermaid.py"]
   },
   {
-    "question": "Where does the OpenAI-compatible provider send requests?",
+    "question": "OpenAICompatibleProvider _post_json chat completions",
     "language": "en",
     "query_type": "identifier",
     "expected_paths": ["src/repolocus/providers/http.py"]
   },
   {
-    "question": "How does the API confine requests to its configured root?",
+    "question": "repository path outside configured API root api_root",
     "language": "en",
     "query_type": "identifier",
     "expected_paths": ["src/repolocus/api/app.py"]
   },
   {
-    "question": "Where are secrets redacted before model use?",
+    "question": "redact_secrets_with_count contains_likely_secret before model",
     "language": "en",
     "query_type": "english",
-    "expected_paths": ["src/repolocus/security/redaction.py", "src/repolocus/core/service.py"]
+    "expected_paths": ["src/repolocus/security/redaction.py"]
   },
   {
-    "question": "Where are generated output paths kept inside the repository?",
+    "question": "atomic_write_within_root replace_generated_only target-validated",
     "language": "en",
     "query_type": "english",
-    "expected_paths": ["src/repolocus/security/paths.py", "src/repolocus/cli.py"]
+    "expected_paths": ["src/repolocus/security/atomic_write.py"]
   },
   {
-    "question": "Where is the parser plugin registry implemented?",
+    "question": "ParserRegistry cache_manifest parser_for cache_key",
     "language": "en",
     "query_type": "english",
     "expected_paths": ["src/repolocus/parsers/base.py"]
   },
   {
-    "question": "How are retrieval candidates ranked and deduplicated?",
+    "question": "RetrievalEngine ranked candidates deduplicated search_chunks",
     "language": "en",
     "query_type": "english",
     "expected_paths": ["src/repolocus/retrieval/engine.py"]
   },
   {
-    "question": "Where does clean refuse unsafe cache contents?",
+    "question": "_remove_all_indexes unrecognized entries nothing deleted clean",
     "language": "en",
     "query_type": "identifier",
     "expected_paths": ["src/repolocus/cli.py"]
@@ -79,9 +79,10 @@
     "expected_paths": ["README.zh-CN.md"]
   },
   {
-    "question": "How does the Erlang OTP supervisor restart crashed workers?",
+    "question": "lattice_quantum_frobnicator_zzyzx",
     "language": "en",
-    "query_type": "english",
+    "query_type": "identifier",
+    "answerable": false,
     "expected_paths": []
   }
 ]

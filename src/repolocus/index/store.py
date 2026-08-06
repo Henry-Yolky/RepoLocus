@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 
 from platformdirs import user_cache_path
 
+from repolocus.analysis import DEFAULT_ANALYSIS_FINGERPRINTS, AnalysisFingerprints
 from repolocus.models import (
     Chunk,
     Dependency,
@@ -32,9 +33,10 @@ from repolocus.models import (
 )
 from repolocus.security.identity import filesystem_identity
 
-SCHEMA_VERSION = 4
-INDEX_FORMAT_VERSION = "4"
+SCHEMA_VERSION = 5
+INDEX_FORMAT_VERSION = "5"
 _PROVENANCE_SCHEMA_VERSION = 3
+_IDENTITY_SCHEMA_VERSION = 4
 # The product rename did not change the SQLite schema. Keep the original format
 # magic so existing valid indexes remain recognizable when explicitly opened.
 APPLICATION_ID = 0x4456504C  # "DVPL"
@@ -201,8 +203,14 @@ def _validate_scanned_file(file: ScannedFile) -> None:
         raise ValueError(f"negative file metadata for {file.path}")
     if file.mtime_ns < 0 or file.ctime_ns < 0:
         raise ValueError(f"negative file timestamp for {file.path}")
-    if file.cached_chunk_count < 0 or file.cached_symbol_count < 0:
+    if (
+        file.cached_chunk_count < 0
+        or file.cached_symbol_count < 0
+        or file.cached_dependency_count < 0
+    ):
         raise ValueError(f"negative cached fact count for {file.path}")
+    if not isinstance(file.facts_materialized, bool):
+        raise ValueError(f"invalid fact materialization marker for {file.path}")
     if file.provenance not in {"source", "generated"}:
         raise ValueError(f"invalid provenance for {file.path}")
     if file.stale:
@@ -319,18 +327,63 @@ def _decode_snapshot_state(
     return tuple(skipped), tuple(warnings_value), tuple(incomplete)
 
 
+def _metadata_fingerprints(metadata: Mapping[str, str]) -> AnalysisFingerprints | None:
+    try:
+        return AnalysisFingerprints.from_metadata(dict(metadata))
+    except ValueError as exc:
+        raise IndexFormatError("index component fingerprint metadata is invalid") from exc
+
+
 def _effective_chunks(file: ScannedFile) -> tuple[Chunk, ...]:
     if file.chunks or not file.text:
         return file.chunks
-    return (
-        Chunk(
-            path=file.path,
-            start_line=1,
-            end_line=max(1, file.line_count),
-            content=file.text,
-            language=file.language,
-        ),
+    from repolocus.parsers.chunking import semantic_chunks
+
+    return semantic_chunks(
+        path=file.path,
+        text=file.text,
+        language=file.language,
+        max_lines=160,
+        max_chars=16_000,
     )
+
+
+def _file_fact_digest(file: ScannedFile) -> str:
+    """Hash retrieval-visible facts while excluding diagnostic file metadata."""
+
+    chunks = _effective_chunks(file)
+    payload = {
+        "path": file.path,
+        "language": file.language,
+        "size_bytes": file.size_bytes,
+        "sha256": file.sha256.casefold(),
+        "line_count": file.line_count,
+        "is_entry_point": file.is_entry_point,
+        "provenance": file.provenance,
+        "symbols": [
+            [item.name, item.kind, item.start_line, item.end_line, item.signature]
+            for item in file.symbols
+        ],
+        "dependencies": [[item.target, item.kind, item.line] for item in file.dependencies],
+        "chunks": [
+            [
+                item.start_line,
+                item.end_line,
+                item.content,
+                item.language,
+                item.symbol,
+            ]
+            for item in chunks
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class RepositoryIndex:
@@ -420,6 +473,19 @@ class RepositoryIndex:
         else:
             self._connection.commit()
 
+    @contextmanager
+    def _read_transaction(self) -> Iterator[None]:
+        """Pin all reads in one cross-process-consistent SQLite snapshot."""
+
+        self._connection.execute("BEGIN")
+        try:
+            yield
+        except BaseException:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
     def _initialize_or_validate(self) -> None:
         try:
             application_id = int(self._connection.execute("PRAGMA application_id").fetchone()[0])
@@ -454,6 +520,12 @@ class RepositoryIndex:
                         missing = ", ".join(sorted(_REQUIRED_TABLES - tables))
                         raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
                     self._migrate_v3_to_v4()
+                    version = _IDENTITY_SCHEMA_VERSION
+                if version == _IDENTITY_SCHEMA_VERSION:
+                    if not _REQUIRED_TABLES.issubset(tables):
+                        missing = ", ".join(sorted(_REQUIRED_TABLES - tables))
+                        raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
+                    self._migrate_v4_to_v5()
                     version = SCHEMA_VERSION
                 elif version != SCHEMA_VERSION:
                     raise IndexFormatError(
@@ -482,7 +554,11 @@ class RepositoryIndex:
                 # Another process may have completed the migration while this
                 # connection waited for BEGIN IMMEDIATE.
                 current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-                if current_version in {_PROVENANCE_SCHEMA_VERSION, SCHEMA_VERSION}:
+                if current_version in {
+                    _PROVENANCE_SCHEMA_VERSION,
+                    _IDENTITY_SCHEMA_VERSION,
+                    SCHEMA_VERSION,
+                }:
                     return
                 if current_version != 2:
                     raise IndexFormatError(
@@ -561,7 +637,7 @@ class RepositoryIndex:
         try:
             with self._transaction():
                 current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-                if current_version == SCHEMA_VERSION:
+                if current_version in {_IDENTITY_SCHEMA_VERSION, SCHEMA_VERSION}:
                     return
                 if current_version != _PROVENANCE_SCHEMA_VERSION:
                     raise IndexFormatError(
@@ -576,26 +652,80 @@ class RepositoryIndex:
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                     """,
                     (
-                        ("schema_version", str(SCHEMA_VERSION)),
-                        ("index_format_version", INDEX_FORMAT_VERSION),
+                        ("schema_version", str(_IDENTITY_SCHEMA_VERSION)),
+                        ("index_format_version", str(_IDENTITY_SCHEMA_VERSION)),
                         ("analysis_version", ""),
                         ("generation", str(generation + 1)),
                         ("repository_identity", self._repository_identity),
                     ),
                 )
-                self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._connection.execute(f"PRAGMA user_version = {_IDENTITY_SCHEMA_VERSION}")
         except sqlite3.Error as exc:
             raise IndexFormatError(f"could not migrate v3 index: {exc}") from exc
 
-    def _generation_in_transaction(self) -> int:
-        row = self._connection.execute("SELECT value FROM meta WHERE key = 'generation'").fetchone()
+    def _migrate_v4_to_v5(self) -> None:
+        """Add dual revisions, component fingerprints, and per-file fact digests."""
+
         try:
-            generation = int(row["value"]) if row else 0
+            with self._transaction():
+                current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+                if current_version == SCHEMA_VERSION:
+                    return
+                if current_version != _IDENTITY_SCHEMA_VERSION:
+                    raise IndexFormatError(
+                        f"unsupported index schema {current_version}; "
+                        f"expected {_IDENTITY_SCHEMA_VERSION}"
+                    )
+                generation = self._generation_in_transaction()
+                columns = {
+                    str(row["name"]) for row in self._connection.execute("PRAGMA table_info(files)")
+                }
+                if "facts_sha256" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE files ADD COLUMN facts_sha256 TEXT NOT NULL DEFAULT ''"
+                    )
+                for file in self.get_files():
+                    self._connection.execute(
+                        "UPDATE files SET facts_sha256 = ? WHERE path = ?",
+                        (_file_fact_digest(file), file.path),
+                    )
+                self._connection.executemany(
+                    """
+                    INSERT INTO meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
+                        ("schema_version", str(SCHEMA_VERSION)),
+                        ("index_format_version", INDEX_FORMAT_VERSION),
+                        ("content_generation", str(generation)),
+                        ("scan_revision", str(generation)),
+                        ("generation", str(generation)),
+                        ("scan_fingerprint", ""),
+                        ("parser_fingerprint", ""),
+                        ("term_index_fingerprint", ""),
+                        ("retrieval_fingerprint", ""),
+                    ),
+                )
+                self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except sqlite3.Error as exc:
+            raise IndexFormatError(f"could not migrate v4 index: {exc}") from exc
+
+    def _generation_in_transaction(self) -> int:
+        return self._revision_in_transaction("content_generation", fallback="generation")
+
+    def _revision_in_transaction(self, key: str, *, fallback: str | None = None) -> int:
+        row = self._connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        if row is None and fallback is not None:
+            row = self._connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (fallback,)
+            ).fetchone()
+        try:
+            revision = int(row["value"]) if row else 0
         except (TypeError, ValueError) as exc:
-            raise IndexFormatError("index generation metadata is invalid") from exc
-        if generation < 0:
-            raise IndexFormatError("index generation metadata is invalid")
-        return generation
+            raise IndexFormatError(f"index {key} metadata is invalid") from exc
+        if revision < 0:
+            raise IndexFormatError(f"index {key} metadata is invalid")
+        return revision
 
     def _clear_repository_facts(self) -> None:
         self._connection.execute("DELETE FROM files")
@@ -614,6 +744,7 @@ class RepositoryIndex:
             if metadata.get("repository_identity") == identity:
                 return
             generation = self._generation_in_transaction()
+            scan_revision = self._revision_in_transaction("scan_revision")
             self._clear_repository_facts()
             self._connection.executemany(
                 """
@@ -623,6 +754,12 @@ class RepositoryIndex:
                 (
                     ("analysis_version", ""),
                     ("generation", str(generation + 1)),
+                    ("content_generation", str(generation + 1)),
+                    ("scan_revision", str(scan_revision + 1)),
+                    ("scan_fingerprint", ""),
+                    ("parser_fingerprint", ""),
+                    ("term_index_fingerprint", ""),
+                    ("retrieval_fingerprint", ""),
                     ("repository_identity", identity),
                 ),
             )
@@ -678,7 +815,8 @@ class RepositoryIndex:
                 mtime_ns INTEGER NOT NULL CHECK (mtime_ns >= 0),
                 ctime_ns INTEGER NOT NULL CHECK (ctime_ns >= 0),
                 provenance TEXT NOT NULL CHECK (provenance IN ('source', 'generated')),
-                stale INTEGER NOT NULL CHECK (stale IN (0, 1))
+                stale INTEGER NOT NULL CHECK (stale IN (0, 1)),
+                facts_sha256 TEXT NOT NULL
             ) WITHOUT ROWID
             """,
             """
@@ -773,6 +911,12 @@ class RepositoryIndex:
                         ("index_format_version", INDEX_FORMAT_VERSION),
                         ("analysis_version", ""),
                         ("generation", "0"),
+                        ("content_generation", "0"),
+                        ("scan_revision", "0"),
+                        ("scan_fingerprint", ""),
+                        ("parser_fingerprint", ""),
+                        ("term_index_fingerprint", ""),
+                        ("retrieval_fingerprint", ""),
                         ("repository_identity", self._repository_identity),
                     ),
                 )
@@ -783,8 +927,92 @@ class RepositoryIndex:
                 "SQLite FTS5 support is required to create a RepoLocus index"
             ) from exc
 
+    def auto_cache_hit(self, scan: ScanResult) -> IndexUpdate | None:
+        """Return a no-write update when an ``auto`` scan is an exact cache hit."""
+
+        self._ensure_open()
+        self._ensure_repository_identity()
+        scan_root = _canonical_root(scan.root)
+        if scan_root != self._root:
+            raise ValueError(f"scan root {scan_root} does not match index root {self._root}")
+        scan_identity = scan.repository_identity or _repository_identity(scan_root)
+        if scan_identity != self._repository_identity:
+            raise StaleScanError("repository identity changed after the scan started")
+        if scan.refresh_mode != "auto" or scan.stats.content_reads or scan.stats.parsed_files:
+            return None
+        incoming = {file.path: file for file in scan.files}
+        if len(incoming) != len(scan.files):
+            raise ValueError("duplicate scanned path")
+        skipped_summary, warning_summary = _snapshot_scan_metadata(scan)
+        incomplete_paths = tuple(sorted(set(scan.temporarily_unreadable)))
+        with self._lock, self._read_transaction():
+            metadata = self.get_metadata()
+            current_generation = self._read_revision(metadata, "content_generation", "generation")
+            scan_revision = self._read_revision(metadata, "scan_revision")
+            if (
+                scan.base_generation is not None and scan.base_generation != current_generation
+            ) or (scan.base_scan_revision is not None and scan.base_scan_revision != scan_revision):
+                return None
+            if scan.fingerprints is None or _metadata_fingerprints(metadata) != scan.fingerprints:
+                return None
+            current_rows = self._connection.execute(
+                """
+                SELECT path, language, size_bytes, sha256, line_count, is_entry_point,
+                       mtime_ns, ctime_ns, provenance, stale
+                FROM files ORDER BY path
+                """
+            ).fetchall()
+            if len(current_rows) != len(incoming):
+                return None
+            for row in current_rows:
+                file = incoming.get(str(row["path"]))
+                if file is None or (
+                    file.language != str(row["language"])
+                    or file.size_bytes != int(row["size_bytes"])
+                    or file.sha256.casefold() != str(row["sha256"]).casefold()
+                    or file.line_count != int(row["line_count"])
+                    or file.is_entry_point != bool(row["is_entry_point"])
+                    or file.mtime_ns != int(row["mtime_ns"])
+                    or file.ctime_ns != int(row["ctime_ns"])
+                    or file.provenance != str(row["provenance"])
+                    or file.stale != bool(row["stale"])
+                ):
+                    return None
+            previous_skipped, previous_warnings, previous_incomplete = _decode_snapshot_state(
+                metadata
+            )
+            if (
+                skipped_summary != previous_skipped
+                or warning_summary != previous_warnings
+                or incomplete_paths != previous_incomplete
+            ):
+                return None
+        if _repository_identity(self._root) != scan_identity:
+            raise StaleScanError("repository identity changed while checking the scan cache")
+        return IndexUpdate(
+            added=0,
+            changed=0,
+            unchanged=len(incoming),
+            removed=0,
+            chunks=0,
+            stale=sum(file.stale for file in incoming.values()),
+            content_generation=current_generation,
+            scan_revision=scan_revision,
+        )
+
+    @staticmethod
+    def _read_revision(metadata: Mapping[str, str], key: str, fallback: str | None = None) -> int:
+        raw = metadata.get(key, metadata.get(fallback, "0") if fallback is not None else "0")
+        try:
+            revision = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise IndexFormatError(f"index {key} metadata is invalid") from exc
+        if revision < 0:
+            raise IndexFormatError(f"index {key} metadata is invalid")
+        return revision
+
     def update(self, scan: ScanResult) -> IndexUpdate:
-        """Apply a complete scan using SHA256 values for incremental invalidation."""
+        """Atomically apply one completed scan and advance only changed fact state."""
 
         self._ensure_open()
         self._ensure_repository_identity()
@@ -795,14 +1023,19 @@ class RepositoryIndex:
         if scan_identity != self._repository_identity:
             raise StaleScanError("repository identity changed after the scan started")
         incoming: dict[str, ScannedFile] = {}
+        incoming_digests: dict[str, str] = {}
         incomplete_paths = tuple(sorted(set(scan.temporarily_unreadable)))
         skipped_summary, warning_summary = _snapshot_scan_metadata(scan)
-        if not scan.analysis_version or len(scan.analysis_version) > 128:
+        if not scan.analysis_version or len(scan.analysis_version) > 256:
             raise ValueError("scan analysis version must be a short non-empty string")
-        if scan.base_generation is not None and (
-            isinstance(scan.base_generation, bool) or scan.base_generation < 0
+        for name, revision in (
+            ("base generation", scan.base_generation),
+            ("base scan revision", scan.base_scan_revision),
         ):
-            raise ValueError("scan base generation must be a non-negative integer or None")
+            if revision is not None and (
+                isinstance(revision, bool) or not isinstance(revision, int) or revision < 0
+            ):
+                raise ValueError(f"scan {name} must be a non-negative integer or None")
         for path in incomplete_paths:
             _validate_scan_path(path)
         for file in scan.files:
@@ -810,66 +1043,108 @@ class RepositoryIndex:
             if file.path in incoming:
                 raise ValueError(f"duplicate scanned path: {file.path}")
             incoming[file.path] = file
+            if file.facts_materialized:
+                incoming_digests[file.path] = _file_fact_digest(file)
 
         with self._lock, self._transaction():
-            # BEGIN IMMEDIATE precedes both the comparison and mutations.  Two
-            # index instances in one process therefore cannot calculate deltas
-            # from the same stale snapshot and race on inserts.
-            generation_row = self._connection.execute(
-                "SELECT value FROM meta WHERE key = 'generation'"
-            ).fetchone()
-            try:
-                current_generation = int(generation_row["value"]) if generation_row else 0
-            except (TypeError, ValueError) as exc:
-                raise IndexFormatError("index generation metadata is invalid") from exc
-            if current_generation < 0:
-                raise IndexFormatError("index generation metadata is invalid")
+            current_generation = self._revision_in_transaction(
+                "content_generation", fallback="generation"
+            )
+            current_scan_revision = self._revision_in_transaction("scan_revision")
             if scan.base_generation is not None and scan.base_generation != current_generation:
                 raise StaleScanError(
-                    f"scan generation {scan.base_generation} is stale; "
-                    f"current generation is {current_generation}"
+                    f"scan content generation {scan.base_generation} is stale; "
+                    f"current content generation is {current_generation}"
+                )
+            if (
+                scan.base_scan_revision is not None
+                and scan.base_scan_revision != current_scan_revision
+            ):
+                raise StaleScanError(
+                    f"scan revision {scan.base_scan_revision} is stale; "
+                    f"current scan revision is {current_scan_revision}"
                 )
             if _repository_identity(self._root) != scan_identity:
                 raise StaleScanError("repository identity changed while committing the scan")
+            metadata_before = {
+                str(row["key"]): str(row["value"])
+                for row in self._connection.execute("SELECT key, value FROM meta")
+            }
+            prior_fingerprints = _metadata_fingerprints(metadata_before)
+            committed_fingerprints = (
+                scan.fingerprints or prior_fingerprints or DEFAULT_ANALYSIS_FINGERPRINTS
+            )
             current = {
-                str(row["path"]): (
-                    str(row["sha256"]).casefold(),
-                    str(row["provenance"]),
-                    bool(row["stale"]),
-                )
+                str(row["path"]): {
+                    "sha256": str(row["sha256"]).casefold(),
+                    "provenance": str(row["provenance"]),
+                    "stale": bool(row["stale"]),
+                    "facts_sha256": str(row["facts_sha256"]),
+                }
                 for row in self._connection.execute(
-                    "SELECT path, sha256, provenance, stale FROM files"
+                    "SELECT path, sha256, provenance, stale, facts_sha256 FROM files"
                 )
             }
             incoming_paths = set(incoming)
             current_paths = set(current)
-            analysis_changed = self.get_metadata().get("analysis_version") != scan.analysis_version
             added = sorted(incoming_paths - current_paths)
+            if any(not incoming[path].facts_materialized for path in added):
+                raise ValueError("new scanned files must include materialized parser facts")
             absent = current_paths - incoming_paths
             retained_stale = sorted(
                 path for path in absent if _covered_by_incomplete_path(path, incomplete_paths)
             )
             removed = sorted(absent - set(retained_stale))
-            changed = sorted(
-                path
-                for path in incoming_paths & current_paths
-                if (
-                    analysis_changed
-                    or incoming[path].sha256.casefold() != current[path][0]
-                    or incoming[path].provenance != current[path][1]
-                    or current[path][2]
-                )
+            changed: list[str] = []
+            for path in sorted(incoming_paths & current_paths):
+                file = incoming[path]
+                row = current[path]
+                if file.facts_materialized:
+                    digest_changed = incoming_digests[path] != row["facts_sha256"]
+                else:
+                    digest_changed = (
+                        file.sha256.casefold() != row["sha256"]
+                        or file.provenance != row["provenance"]
+                    )
+                    if digest_changed:
+                        raise ValueError(
+                            f"changed scanned file {path!r} must include materialized parser facts"
+                        )
+                if digest_changed or row["stale"]:
+                    changed.append(path)
+            changed_set = set(changed)
+            unchanged_paths = sorted((incoming_paths & current_paths) - changed_set)
+            newly_stale = [path for path in retained_stale if not current[path]["stale"]]
+            term_changed = (
+                prior_fingerprints is None
+                or prior_fingerprints.term_index != committed_fingerprints.term_index
             )
-            unchanged_paths = sorted((incoming_paths & current_paths) - set(changed))
-            unchanged = len(unchanged_paths)
-            replaced = added + changed
+            current_has_chunks = (
+                self._connection.execute("SELECT 1 FROM chunks LIMIT 1").fetchone() is not None
+            )
+            incoming_has_chunks = any(
+                bool(_effective_chunks(file))
+                if file.facts_materialized
+                else file.cached_chunk_count > 0
+                for file in incoming.values()
+            )
+            term_fact_changed = term_changed and (current_has_chunks or incoming_has_chunks)
+            fact_changed = bool(added or changed or removed or newly_stale or term_fact_changed)
+            physical_replacements = sorted(
+                set(added)
+                | changed_set
+                | (incoming_paths & current_paths if scan.refresh_mode == "rebuild" else set())
+            )
+            if any(not incoming[path].facts_materialized for path in physical_replacements):
+                raise ValueError("rebuild scans must include materialized parser facts")
             inserted_chunks = 0
-
-            for path in removed + changed:
+            for path in removed + [path for path in physical_replacements if path in current_paths]:
                 self._connection.execute("DELETE FROM files WHERE path = ?", (path,))
-            for path in replaced:
+            for path in physical_replacements:
                 inserted_chunks += self._insert_file(incoming[path])
             for path in unchanged_paths:
+                if path in physical_replacements:
+                    continue
                 file = incoming[path]
                 self._connection.execute(
                     "UPDATE files SET mtime_ns = ?, ctime_ns = ?, stale = 0 WHERE path = ?",
@@ -877,20 +1152,24 @@ class RepositoryIndex:
                 )
             for path in retained_stale:
                 self._connection.execute("UPDATE files SET stale = 1 WHERE path = ?", (path,))
+            if term_changed:
+                self._rebuild_chunk_terms()
+
             scan_digest = hashlib.sha256()
             for path in sorted(incoming):
                 scan_digest.update(path.encode("utf-8", errors="surrogatepass"))
                 scan_digest.update(b"\0")
                 scan_digest.update(incoming[path].sha256.casefold().encode("ascii"))
                 scan_digest.update(b"\0")
-            committed_generation = current_generation + 1
+            committed_generation = current_generation + int(fact_changed)
+            committed_scan_revision = current_scan_revision + 1
             metadata = {
                 "last_scan_digest": scan_digest.hexdigest(),
                 "last_scan_file_count": str(len(incoming)),
                 "last_scan_indexed_bytes": str(sum(file.size_bytes for file in incoming.values())),
                 "last_update_added": str(len(added)),
                 "last_update_changed": str(len(changed)),
-                "last_update_unchanged": str(unchanged),
+                "last_update_unchanged": str(len(unchanged_paths)),
                 "last_update_removed": str(len(removed)),
                 "last_update_stale": str(len(retained_stale)),
                 "last_scan_skipped": json.dumps(
@@ -900,6 +1179,9 @@ class RepositoryIndex:
                 "last_scan_incomplete": json.dumps(incomplete_paths, ensure_ascii=False),
                 "analysis_version": scan.analysis_version,
                 "generation": str(committed_generation),
+                "content_generation": str(committed_generation),
+                "scan_revision": str(committed_scan_revision),
+                **committed_fingerprints.metadata(),
             }
             self._connection.executemany(
                 """
@@ -908,18 +1190,18 @@ class RepositoryIndex:
                 """,
                 sorted(metadata.items()),
             )
-
             if _repository_identity(self._root) != scan_identity:
                 raise StaleScanError("repository identity changed while committing the scan")
 
         return IndexUpdate(
             added=len(added),
             changed=len(changed),
-            unchanged=unchanged,
+            unchanged=len(unchanged_paths),
             removed=len(removed),
             chunks=inserted_chunks,
             stale=len(retained_stale),
-            generation=committed_generation,
+            content_generation=committed_generation,
+            scan_revision=committed_scan_revision,
         )
 
     def _insert_file(self, file: ScannedFile) -> int:
@@ -927,8 +1209,8 @@ class RepositoryIndex:
             """
             INSERT INTO files(
                 path, language, size_bytes, sha256, line_count, text, is_entry_point,
-                mtime_ns, ctime_ns, provenance, stale
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mtime_ns, ctime_ns, provenance, stale, facts_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file.path,
@@ -942,6 +1224,7 @@ class RepositoryIndex:
                 file.ctime_ns,
                 file.provenance,
                 int(file.stale),
+                _file_fact_digest(file),
             ),
         )
         self._connection.executemany(
@@ -1033,16 +1316,43 @@ class RepositoryIndex:
             }
 
     def generation(self) -> int:
-        """Return the current monotonic commit generation."""
+        """Deprecated alias for :meth:`content_generation`."""
 
-        value = self.get_metadata().get("generation", "0")
-        try:
-            generation = int(value)
-        except ValueError as exc:
-            raise IndexFormatError("index generation metadata is invalid") from exc
-        if generation < 0:
-            raise IndexFormatError("index generation metadata is invalid")
-        return generation
+        return self.content_generation()
+
+    def content_generation(self) -> int:
+        """Return the retrieval-visible fact generation."""
+
+        return self._read_revision(self.get_metadata(), "content_generation", "generation")
+
+    def scan_revision(self) -> int:
+        """Return the diagnostic completed-scan revision."""
+
+        return self._read_revision(self.get_metadata(), "scan_revision")
+
+    def fingerprints(self) -> AnalysisFingerprints | None:
+        """Return committed component identities, if this index has been refreshed."""
+
+        return _metadata_fingerprints(self.get_metadata())
+
+    @contextmanager
+    def consistent_read(self) -> Iterator[int]:
+        """Hold one SQLite read snapshot and yield its content generation."""
+
+        self._ensure_open()
+        self._ensure_repository_identity()
+        with self._lock:
+            self._connection.execute("BEGIN")
+            try:
+                generation = self._revision_in_transaction(
+                    "content_generation", fallback="generation"
+                )
+                yield generation
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
 
     def snapshot(self) -> IndexSnapshot:
         """Read full cache facts and their CAS generation from one SQLite snapshot."""
@@ -1073,12 +1383,11 @@ class RepositoryIndex:
             try:
                 metadata = self.get_metadata()
                 try:
-                    generation = int(metadata.get("generation", "0"))
+                    generation = self._read_revision(metadata, "content_generation", "generation")
+                    scan_revision = self._read_revision(metadata, "scan_revision")
                 except ValueError as exc:
-                    raise IndexFormatError("index generation metadata is invalid") from exc
-                if generation < 0:
-                    raise IndexFormatError("index generation metadata is invalid")
-                analysis_version = metadata.get("analysis_version", "")
+                    raise IndexFormatError("index revision metadata is invalid") from exc
+                fingerprints = _metadata_fingerprints(metadata)
                 skipped, warnings, incomplete = _decode_snapshot_state(metadata)
                 files = tuple(
                     self.get_file_manifest(max_files=max_manifest_files)
@@ -1092,7 +1401,8 @@ class RepositoryIndex:
                 self._connection.commit()
         return IndexSnapshot(
             generation,
-            analysis_version,
+            scan_revision,
+            fingerprints,
             files,
             skipped,
             warnings,
@@ -1209,7 +1519,9 @@ class RepositoryIndex:
                    (SELECT count(*) FROM chunks AS c WHERE c.file_path = f.path)
                        AS cached_chunk_count,
                    (SELECT count(*) FROM symbols AS s WHERE s.file_path = f.path)
-                       AS cached_symbol_count
+                       AS cached_symbol_count,
+                   (SELECT count(*) FROM dependencies AS d WHERE d.source_path = f.path)
+                       AS cached_dependency_count
             FROM files AS f
             ORDER BY f.path
         """
@@ -1234,6 +1546,8 @@ class RepositoryIndex:
                 stale=bool(row["stale"]),
                 cached_chunk_count=int(row["cached_chunk_count"]),
                 cached_symbol_count=int(row["cached_symbol_count"]),
+                cached_dependency_count=int(row["cached_dependency_count"]),
+                facts_materialized=False,
             )
             for row in rows
         ]
@@ -1272,6 +1586,8 @@ class RepositoryIndex:
                 stale=bool(row["stale"]),
                 cached_chunk_count=len(chunks_by_path[str(row["path"])]),
                 cached_symbol_count=len(symbols_by_path[str(row["path"])]),
+                cached_dependency_count=len(dependencies_by_path[str(row["path"])]),
+                facts_materialized=True,
             )
             for row in file_rows
         ]

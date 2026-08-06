@@ -91,7 +91,7 @@ def test_path_boundary_rejects_a_regular_file_as_root(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "state",
     [
-        {"version": 4, "repositories": {}},
+        {"version": 5, "repositories": {}},
         {"version": 1, "repositories": []},
     ],
 )
@@ -175,6 +175,8 @@ def test_oversize_ignore_file_fails_closed_and_is_reported(tmp_path: Path) -> No
 def test_parser_plugins_cannot_cross_source_boundaries(tmp_path: Path, invalid_fact: str) -> None:
     class InvalidParser:
         languages = frozenset({"python"})
+        cache_key = "test-invalid:v1"
+        priority = 0
 
         def parse(self, path: str, text: str, language: str, **kwargs: object) -> ParseResult:
             if invalid_fact == "symbol":
@@ -290,7 +292,10 @@ def test_cloud_model_success_can_remember_repository_scoped_consent(
                 "[[src/demo/config.py:1-2]]"
             )
 
-    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr(
+        "repolocus.core.service.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
     privacy = PrivacyStore(isolated_user_dirs / "privacy.json")
     service = RepoLocusService(Settings(model="openai/test-model"), privacy=privacy)
 
@@ -318,7 +323,10 @@ def test_unverifiable_model_response_falls_back_to_source_evidence(
         def generate(self, system_prompt: str, user_prompt: str) -> str:
             return "Trust me: configuration is definitely uploaded elsewhere."
 
-    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr(
+        "repolocus.core.service.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
     service = RepoLocusService(
         Settings(model="openai/test-model"),
         privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
@@ -375,7 +383,10 @@ def test_remote_ollama_can_use_explicitly_remembered_remote_scope(
                 "[[src/demo/config.py:1]]"
             )
 
-    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr(
+        "repolocus.core.service.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
     privacy = PrivacyStore(isolated_user_dirs / "privacy.json")
     privacy.grant(
         sample_repo,

@@ -16,12 +16,14 @@ read-only.
 | Accidental key indexing | Sensitive-name rules, content secret detection, binary/size limits |
 | Prompt injection in source | Source is delimited as untrusted data and providers have no tools |
 | Unapproved cloud upload | Per-call flag or endpoint-bound repository/provider grant; API cloud sends require a single-use approved preview |
+| Ambient or changed HTTP proxy route bypasses consent | Proxy discovery is disabled by default; the exact direct/proxy route is frozen into the preview and consent identity without persisting credentials |
 | Excessive cloud disclosure | Retrieval limit, context budget, immutable request preview, and redaction |
 | Cleartext remote-provider traffic | HTTP is limited to loopback; non-loopback endpoints require HTTPS |
 | Unauthenticated source API access | Random Bearer token, Host allowlist, request-body and concurrency limits, and no-store responses |
 | Fabricated citation addresses or quotes | Every material claim requires the same citation on an immediately following exact `Evidence quote`; the address and quote substring are validated against retrieved ranges |
 | Generated or uncertain old facts reused as evidence | The scanner excludes recognized RepoLocus output; queries admit only non-stale `source` provenance, and incomplete scans retain uncertain facts as excluded `stale` rows |
 | Older concurrent scan overwrites a new index | Monotonic generation compare-and-swap rejects stale commits |
+| Generated-output symlink or replacement race | Descriptor-relative or handle-validated same-directory atomic writes attest parent and target identities and fail closed on races; ambiguous post-commit objects are preserved under reported recovery names rather than deleted |
 | Mermaid links or directives | Deterministic restricted grammar; model output is never diagram source |
 | Index committed to Git | Cache defaults outside the repository; `.repolocus/` is ignored |
 
@@ -41,16 +43,18 @@ that the quote logically supports the model's claim; accepted model text therefo
 `needs_review` confidence.
 
 The default `refresh=auto` query path performs a bounded incremental refresh before reading
-evidence. `refresh=never` is the explicit committed-snapshot mode and fails closed if no compatible
-snapshot exists. Follow-up sessions pin the original generation and stop if another scan changes
-it. Metadata reuse is permitted only for the same repository identity and analysis version;
-changed files are reopened, hashed, and reparsed.
+evidence and writes nothing on an exact cache hit. `refresh=always` rereads all candidate content,
+`refresh=rebuild` reparses it, and `refresh=never` is the explicit committed-snapshot mode.
+Follow-up sessions pin the retrieval-visible content generation; a diagnostic-only scan revision
+does not invalidate the evidence. Metadata reuse is permitted only for the same repository
+identity and compatible component fingerprints; changed files are reopened, hashed, and reparsed.
 
-Remembered-consent state v3 binds the current root-directory and Git-marker identity, canonical
-path, and provider to the destination scheme, host, effective port, and complete request path. It
-does not carry forward legacy v1/v2 path-only grants. A replaced repository or changed endpoint
-therefore requires a new explicit grant. Model names are displayed in previews but are not part of
-the grant identity.
+Remembered-consent state v4 binds the current root-directory and Git-marker identity, canonical
+path, provider, complete destination endpoint, and exact credential-free direct/proxy route
+identity. Proxy credentials are excluded from the digest, state file, and preview. It does not
+carry forward legacy v1-v3 grants. A replaced repository or changed endpoint, proxy policy, or
+route therefore requires a new explicit grant; credential rotation on the same route does not.
+Model names are displayed in previews but are not part of the grant identity.
 
 The self-hosted API accepts only paths below its configured `--root`, binds to loopback by
 default, and rejects cloud models by default. It authenticates every request with a random Bearer

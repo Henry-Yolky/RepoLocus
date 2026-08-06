@@ -24,7 +24,7 @@ flowchart LR
   chunks. Parser output is always a static approximation.
 - `index/` stores repository facts in a schema-versioned SQLite database outside the repository.
   Updates compare content hashes, track source/generated provenance and stale state, and commit
-  against a monotonic generation.
+  against separate content-generation and scan-revision compare-and-swap values.
 - `retrieval/` combines symbol matches, FTS5/BM25 results, deterministic lexical terms, and static
   dependency neighbors. Terms split camelCase, snake_case, and paths and include CJK bigrams and
   trigrams. Bounded user synonyms can come from `REPOLOCUS_QUERY_SYNONYMS`; target-repository
@@ -32,9 +32,10 @@ flowchart LR
 - `generators/` creates `PROJECT_MAP.md` and a restricted Mermaid subset without model output.
   Each rendered cross-node edge retains one concrete import dependency as its evidence witness.
 - `providers/` provides a narrow text-generation contract. It cannot read files or invoke tools;
-  remote adapters prepare a credential-free, immutable serialized request body before approval.
-- `security/` enforces canonical paths, output redaction, and per-repository/provider/endpoint
-  cloud consent.
+  remote adapters prepare a credential-free preview, immutable serialized request body, and exact
+  direct/proxy route before approval. Ambient proxy variables are ignored unless the user opts in.
+- `security/` enforces canonical paths, atomic generated-file output, output redaction, and
+  per-repository/provider/endpoint/transport cloud consent.
 - `core/` is the workflow boundary shared by the CLI and optional API.
 - `api/` authenticates requests, bounds exposure, and holds short-lived single-use preview
   snapshots for two-stage cloud approval.
@@ -57,11 +58,14 @@ body; execution consumes those values rather than retrieving the evidence again.
 ## Snapshot and index lifecycle
 
 The canonical repository path is hashed to choose an opaque database name under the user cache
-directory. The database records its canonical root, directory identity, schema/parser versions,
-and monotonic commit generation. `map`, `diagram`, and `ask` use `refresh=auto` by default and run a
-bounded incremental refresh before querying. `refresh=never` is the explicit snapshot-only mode
-and fails closed without a compatible snapshot. Callers can also pin an expected generation. CLI follow-up sessions pin the first
-answer's generation and use `refresh=never`, so a concurrent generation change ends the session.
+directory. The database records its canonical root, directory identity, schema version, component
+fingerprints, retrieval-visible content generation, and diagnostic scan revision. `map`, `diagram`,
+and `ask` use `refresh=auto` by default and run a bounded incremental refresh before querying;
+an exact cache hit performs no SQLite write. `refresh=always` rereads and hashes every candidate
+while reusing compatible parser facts, `refresh=rebuild` reparses every source, and
+`refresh=never` fails closed without a compatible snapshot. Callers can pin an expected content
+generation. CLI follow-up sessions pin that generation, so diagnostic-only revisions do not end a
+session while retrieval-visible changes do.
 
 Recognized RepoLocus-generated documents are excluded by the scanner. The schema also retains
 `generated` provenance for migrated or explicitly imported rows, and retrieval excludes those
@@ -70,15 +74,19 @@ retained as `stale`; a confirmed deletion removes them. Query snapshots and retr
 only non-stale `source` facts, preventing generated output or uncertain old content from becoming
 evidence.
 
-Each scan starts from one SQLite snapshot and commits with a generation compare-and-swap. An old
-scan cannot overwrite a newer commit. Unpinned scans may retry from the new generation, while a
-caller that pinned a generation fails closed. `repolocus clean` deletes only that database and its
-SQLite sidecars.
+Each scan starts from one transactionally consistent SQLite snapshot and commits with both content
+generation and scan revision compare-and-swap values. An old scan cannot overwrite a newer commit.
+Content generation changes only when retrieval-visible facts or the term index change; diagnostic
+warnings and skip reasons can advance scan revision alone. Unpinned scans may retry from the new
+state, while a caller that pinned a content generation fails closed. `repolocus clean` deletes only
+that database and its SQLite sidecars.
 
-For a compatible analysis version and repository identity, evidence refresh loads a metadata-only
+For compatible component fingerprints and repository identity, evidence refresh loads a metadata-only
 manifest instead of every source body and parser fact. Exact size/mtime/ctime matches reuse the
-stored facts; changed files are opened without following links, hashed, and reparsed. Parser,
-secret-detector, or chunk-policy changes alter the analysis version and force regeneration.
+stored facts; changed files are opened without following links, hashed, and reparsed. Scanner,
+parser, term-index, and retrieval fingerprints independently select the minimum required rebuild.
+Every parser result passes a shared normalizer/finalizer that validates source ownership, line
+ranges, controls, nesting/overlap, bounded text, and per-file/repository budgets before commit.
 Repository scans enforce hard count/size limits for entries/files, total candidate bytes, directory
 depth, chunks, and symbols. A monotonic elapsed-time deadline is checked before and after bounded
 I/O and parser operations; a blocking filesystem call or third-party parser may overrun before the

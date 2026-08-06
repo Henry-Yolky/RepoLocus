@@ -44,18 +44,36 @@ repolocus ask "请求如何进入核心循环？" --model ollama/qwen3-coder
 会将它按远程供应商处理并要求授权。明文 HTTP 仅允许用于回环地址，所有非回环供应商
 端点都必须使用 HTTPS；提示词会在发送前再次脱敏。
 
-云模型调用前，RepoLocus 会展示模型、规范化目的端点、精确序列化 payload 字节数、源码
-片段、文件列表和估算 Token 数。可用 `--allow-cloud` 仅授权本次调用，或同时使用
-`--remember-consent` 为当前仓库记住该供应商端点。v3 授权会绑定当前仓库身份、规范路径、
-供应商、scheme、host、有效端口和完整请求路径；仓库目录或 Git marker 被替换、compatible
-endpoint 变化后都必须重新授权。旧的 v1/v2 路径级授权会按 fail-closed 原则失效。
-`map`、`diagram` 和 `ask` 默认使用 `--refresh auto`：查询前执行有界资源预算的增量刷新，避免同一
-路径下的新内容继承旧证据。只有显式要求固定最近一次兼容 snapshot 时才使用
-`--refresh never`。
+云模型调用前，RepoLocus 会展示模型、规范化目的端点、精确序列化 payload 字节数、无凭据
+传输路由、源码片段、文件列表和估算 Token 数。默认忽略环境中的代理变量；只有显式选择
+`--proxy-mode environment`，或使用 `--proxy-mode explicit --proxy-url URL` 才会走代理，回环
+服务始终直连。可用 `--allow-cloud` 仅授权本次调用，或同时使用 `--remember-consent` 记住精确
+端点与路由。v4 授权绑定仓库身份、规范路径、供应商、完整端点和无凭据代理路由身份；代理
+凭据既不参与授权身份，也不写入预览或授权文件。仓库、端点、代理模式或路由变化后必须重新
+授权；同一路由的凭据轮换不需要重新授权。旧的 v1-v3 授权按 fail-closed 原则失效。
 
-`repolocus ask ... --follow-up` 可在当前进程内继续追问；首次回答会固定 index generation，
-后续问题关闭 refresh 并要求同一 generation，若其他扫描推进 generation 则 fail closed。输入
-空行即结束，问答历史不会落盘。
+`map`、`diagram` 和 `ask` 默认使用 `--refresh auto`：查询前执行有界增量刷新；精确 cache hit
+不读源码正文，也不写 SQLite 事务。`always` 会安全重读并哈希所有候选文件但可复用 parser
+facts，`rebuild` 会重新解析所有源码，`never` 只读取最近一次兼容 snapshot。`repolocus status`
+分别报告影响检索证据的 content generation 与仅诊断变化的 scan revision。
+
+`repolocus ask ... --follow-up` 可在当前进程内继续追问；首次回答会固定 content generation，
+后续问题关闭 refresh 并要求同一 generation。检索可见 facts 变化时 fail closed，仅诊断性的
+scan revision 不会让证据 snapshot 失效。输入空行即结束，问答历史不会落盘。
+
+## 常用命令
+
+| 命令 | 用途 |
+|---|---|
+| `repolocus scan [PATH]` | 安全扫描并增量更新本地索引 |
+| `repolocus status [PATH]` | 查看 content generation、scan revision 和组件指纹 |
+| `repolocus map [PATH]` | 生成 `PROJECT_MAP.md`，或通过 `--stdout` 输出 |
+| `repolocus ask QUESTION [PATH]` | 检索带源码位置的证据，并可选调用模型 |
+| `repolocus diagram [PATH]` | 在 `ARCHITECTURE.md` 中生成经过校验的 Mermaid 图 |
+| `repolocus privacy status` | 查看当前仓库记忆的供应商、端点和路由授权 |
+| `repolocus doctor --security` | 检查运行时、FTS5、cache 权限与本地模型连接 |
+| `repolocus clean` | 经确认后删除当前仓库的外部索引 |
+| `repolocus serve` | 启动可选的自托管 FastAPI 服务 |
 
 ## 已实现能力
 
@@ -72,8 +90,9 @@ endpoint 变化后都必须重新授权。旧的 v1/v2 路径级授权会按 fai
 - 模型适配：无模型提取式回答、Ollama、OpenAI-compatible、Anthropic；
 - 隐私控制：默认关闭遥测，云端逐次授权或按仓库和端点记忆授权，可预览与撤回；
 - 自托管 API：安装 `api` 可选依赖后运行 `repolocus serve`。
-- 评测：输出 recall@k、MRR、nDCG@k、any/all-path、citation recall、no-answer
-  precision/recall/F1/accuracy，以及按语言和查询类型汇总；当前仍只是小型 regression set。
+- 评测：自仓库 smoke set 之外，固定六个独立合成仓库和 18 条 qrels 作为 CI gate；报告
+  recall@k、MRR、nDCG@k、citation、no-answer、`must_not_return` 及按仓库等维度的汇总；
+  release gate 要求 citation recall 达到 1.0。
 
 ## Agent Skill
 
@@ -106,7 +125,7 @@ Copy-Item -Recurse -Force "skills/repolocus-analyze-repo" (Join-Path $env:CODEX_
 复制后请重启 Codex；如果宿主提供 Skill 注册表重载操作，也可以执行重载。之后以
 `$repolocus-analyze-repo` 调用。该 Skill 不暴露云端授权参数，Agent 不能通过这条路径
 静默把仓库内容发送给远程模型。Skill 压缩包只包含 adapter，不内置 RepoLocus runtime；
-必须预先提供兼容的已安装 runtime 或已同步的可信源码环境，adapter 全程 offline/no-sync，
+必须预先提供 `>=0.1.5,<0.2.0` 的已安装 runtime 或已同步的可信源码环境，adapter 全程 offline/no-sync，
 缺失或版本不兼容时直接 fail closed，不会自行下载依赖。
 
 ## 自托管 API
@@ -144,7 +163,8 @@ ACL 检查，因此 `doctor --security` 会明确将 ACL 状态报告为“未�
 
 扫描器默认排除识别出的 RepoLocus 生成文档；索引仍为迁移或显式导入的记录保留
 `generated` provenance。不完整或暂时不可读的扫描会把旧 facts 保留为 `stale`。默认查询只使用 `source` 且非 `stale` 的已提交 snapshot，确认删除后
-才移除对应行。每次提交通过单调 generation 做 compare-and-swap，拒绝旧扫描覆盖新结果。
+才移除对应行。提交分别维护 content generation 与 scan revision，并通过双 compare-and-swap
+拒绝旧扫描覆盖新结果；follow-up 只绑定前者。
 `ask` 的兼容分析版本刷新使用 metadata-only manifest，跳过未变化文件的正文和 parser facts；
 Python API 的 `RepoLocusService.scan()` 对未变化文件同样只返回 metadata 和已缓存的 fact
 计数。需要物化 facts 时应调用 `map()`、`diagram()` 或 `evidence()`。变化文件会安全读取、
@@ -152,6 +172,11 @@ Python API 的 `RepoLocusService.scan()` 对未变化文件同样只返回 metad
 扫描同时限制文件/entry 数、总字节、目录深度、chunks、symbols，并在有界操作前后检查总耗时；
 阻塞的文件系统调用或第三方 parser 可能在下一次检查前超时。检测到预算耗尽时，未完成范围会
 标为 `stale`，而不是确认删除旧 facts。
+
+`map` 和 `diagram` 的文件输出在目标父目录内原子替换。POSIX 使用 descriptor-relative 遍历
+和原子名称交换；Windows 在句柄支持的替换前后检查 reparse point 与目录/目标身份，检测到
+竞态即失败，但不宣称达到 POSIX 的目录句柄级约束。若提交后的对象身份无法确认，RepoLocus
+会报告并保留可恢复的临时或备份名称，而不会删除未经验证的对象。
 
 完整命令、架构、测试与开发说明以英文
 [README.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/README.md) 为准。隐私与安全

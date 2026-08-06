@@ -21,8 +21,13 @@ non-loopback Ollama, OpenAI-compatible, or Anthropic endpoint must use HTTPS. A 
 Ollama endpoint and every cloud provider are disabled until the user either passes
 `--allow-cloud` for one call or records a repository/provider grant. Before every approved
 remote CLI call, RepoLocus displays the exact redacted source content and ranges, fragment count,
-estimated tokens, and redaction count that will be sent, including calls covered by a remembered
-grant. System and user prompts are redacted again immediately before transport, and the final
+estimated tokens, redaction count, and credential-free direct/proxy route that will be used,
+including calls covered by a remembered grant. Ambient proxy variables are ignored by default;
+environment discovery or an explicit proxy URL requires a user-selected proxy policy. The frozen
+credential-free route identity is part of consent, while proxy credentials are excluded from that
+identity and are never persisted or displayed. Rotating credentials on an unchanged route does not
+require fresh consent.
+System and user prompts are redacted again immediately before transport, and the final
 serialized JSON body is scanned fail-closed before a network client is created. Provider responses
 are read with byte, content-type, JSON-depth, per-HTTP-phase timeout, and elapsed-deadline checks
 between streamed chunks. A blocking HTTP phase is bounded by the configured HTTPX phase timeout;

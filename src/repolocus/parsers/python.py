@@ -168,6 +168,8 @@ def _fallback(path: str, text: str) -> tuple[list[Symbol], list[Dependency], boo
 class PythonParser:
     """Extract Python symbols and imports without executing the source."""
 
+    cache_key = "python-ast:v2"
+    priority = 100
     languages = frozenset({"python"})
 
     def parse(

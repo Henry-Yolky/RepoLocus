@@ -109,7 +109,10 @@ def test_remembered_cloud_grant_still_prints_exact_preview(
         "openai",
         "https://api.openai.com/v1/chat/completions",
     )
-    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr(
+        "repolocus.core.service.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
 
     result = runner.invoke(
         app,

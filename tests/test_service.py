@@ -24,6 +24,8 @@ class RecordingScanner(RepositoryScanner):
     def __init__(self, *, analysis_version: str = "service-test") -> None:
         super().__init__(analysis_version=analysis_version)
         self.calls: list[tuple[int | None, tuple[str, ...]]] = []
+        self.scan_revisions: list[int | None] = []
+        self.refresh_modes: list[str] = []
 
     def scan(
         self,
@@ -32,13 +34,19 @@ class RecordingScanner(RepositoryScanner):
         cached_files: Mapping[str, ScannedFile] | None = None,
         trusted_cache: bool = False,
         base_generation: int | None = None,
+        base_scan_revision: int | None = None,
+        refresh_mode: str = "auto",
     ) -> ScanResult:
         self.calls.append((base_generation, tuple(sorted((cached_files or {}).keys()))))
+        self.scan_revisions.append(base_scan_revision)
+        self.refresh_modes.append(refresh_mode)
         return super().scan(
             root,
             cached_files=cached_files,
             trusted_cache=trusted_cache,
             base_generation=base_generation,
+            base_scan_revision=base_scan_revision,
+            refresh_mode=refresh_mode,
         )
 
 
@@ -137,7 +145,9 @@ def test_scan_seeds_cache_and_cas_from_one_index_snapshot(
     assert scanner.calls[0] == (0, ())
     assert scanner.calls[1][0] == first.update.generation
     assert "src/demo/config.py" in scanner.calls[1][1]
-    assert second.update.generation == first.update.generation + 1
+    assert scanner.scan_revisions == [0, first.update.scan_revision]
+    assert second.update.generation == first.update.generation
+    assert second.update.scan_revision == first.update.scan_revision
     assert second.update.unchanged == first.result.stats.indexed_files
 
 
@@ -170,7 +180,101 @@ def test_scan_retries_an_unpinned_stale_generation(
     assert len(scanner.calls) == 2
     assert scanner.calls[0][0] == 0
     assert scanner.calls[1][0] == 1
-    assert operation.update.generation == 2
+    assert scanner.scan_revisions == [0, 1]
+    assert operation.update.generation == 1
+    assert operation.update.scan_revision == 1
+
+
+def test_pinned_scan_retries_scan_revision_only_conflicts(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+    initial = service.scan(sample_repo)
+    original_update = RepositoryIndex.update
+    first_call = True
+
+    def commit_then_report_stale(index: RepositoryIndex, result: ScanResult):
+        nonlocal first_call
+        update = original_update(index, result)
+        if first_call:
+            first_call = False
+            raise StaleScanError("simulated scan-revision-only conflict")
+        return update
+
+    monkeypatch.setattr(RepositoryIndex, "update", commit_then_report_stale)
+
+    operation = service.scan(
+        sample_repo,
+        refresh="always",
+        expected_generation=initial.update.content_generation,
+    )
+
+    assert len(scanner.calls) == 3
+    assert operation.update.content_generation == initial.update.content_generation
+    assert operation.update.scan_revision == initial.update.scan_revision + 2
+
+
+def test_pinned_scan_does_not_retry_when_content_generation_changes(
+    tmp_path: Path,
+    isolated_user_dirs: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = repository / "value.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    scanner = RecordingScanner()
+    service = RepoLocusService(
+        Settings(model="local"),
+        scanner=scanner,
+        privacy=PrivacyStore(isolated_user_dirs / "privacy.json"),
+    )
+    initial = service.scan(repository)
+    original_update = RepositoryIndex.update
+    first_call = True
+
+    def commit_changed_content_then_report_stale(
+        index: RepositoryIndex,
+        result: ScanResult,
+    ):
+        nonlocal first_call
+        if not first_call:
+            return original_update(index, result)
+        first_call = False
+        source.write_text("VALUE = 2\n", encoding="utf-8")
+        snapshot = index.snapshot()
+        competing = RepositoryScanner().scan(
+            repository,
+            cached_files={file.path: file for file in snapshot.files},
+            trusted_cache=False,
+            base_generation=snapshot.content_generation,
+            base_scan_revision=snapshot.scan_revision,
+            refresh_mode="always",
+        )
+        original_update(index, competing)
+        raise StaleScanError("simulated content-generation conflict")
+
+    monkeypatch.setattr(
+        RepositoryIndex,
+        "update",
+        commit_changed_content_then_report_stale,
+    )
+
+    with pytest.raises(StaleScanError, match="expected index generation"):
+        service.scan(
+            repository,
+            refresh="always",
+            expected_generation=initial.update.content_generation,
+        )
+
+    assert len(scanner.calls) == 2
 
 
 def test_refresh_modes_are_shared_by_generation_and_question_workflows(
@@ -189,6 +293,7 @@ def test_refresh_modes_are_shared_by_generation_and_question_workflows(
 
     _project_map, auto = service.map(sample_repo, refresh="auto")
     generation = auto.update.generation
+    scan_revision = auto.update.scan_revision
     assert len(scanner.calls) == 1
 
     service.diagram(sample_repo, refresh="never", expected_generation=generation)
@@ -220,15 +325,18 @@ def test_refresh_modes_are_shared_by_generation_and_question_workflows(
 
     _refreshed_map, refreshed = service.map(sample_repo, refresh="always")
     assert len(scanner.calls) == 2
-    assert refreshed.update.generation == generation + 1
+    assert scanner.refresh_modes[-1] == "always"
+    assert refreshed.update.generation == generation
+    assert refreshed.update.scan_revision == scan_revision + 1
 
+    service.ask(
+        "Where is load_config defined?",
+        sample_repo,
+        refresh="never",
+        expected_generation=generation,
+    )
     with pytest.raises(StaleScanError, match="expected index generation"):
-        service.ask(
-            "Where is load_config defined?",
-            sample_repo,
-            refresh="never",
-            expected_generation=generation,
-        )
+        service.ask("question", sample_repo, refresh="never", expected_generation=generation + 1)
     with pytest.raises(ValueError, match="refresh must be one of"):
         service.map(sample_repo, refresh="sometimes")  # type: ignore[arg-type]
 
@@ -341,7 +449,9 @@ def test_auto_refresh_scans_even_when_committed_snapshot_is_empty(
     _document, cached = service.map(repository, refresh="auto")
 
     assert len(scanner.calls) == 2
-    assert cached.update.generation == first.update.generation + 1
+    assert first.update.generation == 0
+    assert cached.update.generation == first.update.generation
+    assert cached.update.scan_revision == first.update.scan_revision
 
 
 def test_auto_refresh_observes_edits_while_never_is_explicit_snapshot_reuse(
@@ -479,7 +589,7 @@ def test_cloud_send_uses_the_exact_evidence_shown_in_preview(
 
     monkeypatch.setattr(
         "repolocus.core.service.create_provider",
-        lambda model, settings: FakeProvider(),
+        lambda model, settings, **_kwargs: FakeProvider(),
     )
     service = _service(sample_repo, isolated_user_dirs, model="openai/test-model")
     config = sample_repo / "src" / "demo" / "config.py"

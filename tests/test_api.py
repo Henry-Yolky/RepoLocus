@@ -68,6 +68,48 @@ def test_self_hosted_api_health_and_local_workflow(
     assert ask.json()["evidence"]
 
 
+def test_scan_api_exposes_auto_always_and_rebuild_refresh_modes(
+    sample_repo: Path, isolated_user_dirs: Path
+) -> None:
+    application = create_app(sample_repo)
+
+    auto = _request(
+        application,
+        "POST",
+        "/v1/scan",
+        json={"path": str(sample_repo), "refresh": "auto"},
+    )
+    always = _request(
+        application,
+        "POST",
+        "/v1/scan",
+        json={"path": str(sample_repo), "refresh": "always"},
+    )
+    rebuild = _request(
+        application,
+        "POST",
+        "/v1/scan",
+        json={"path": str(sample_repo), "refresh": "rebuild"},
+    )
+    never = _request(
+        application,
+        "POST",
+        "/v1/scan",
+        json={"path": str(sample_repo), "refresh": "never"},
+    )
+
+    assert auto.status_code == 200, auto.text
+    assert always.status_code == 200, always.text
+    assert rebuild.status_code == 200, rebuild.text
+    updates = [response.json()["update"] for response in (auto, always, rebuild)]
+    assert [update["scan_revision"] for update in updates] == [1, 2, 3]
+    assert len({update["content_generation"] for update in updates}) == 1
+    assert always.json()["scan"]["content_reads"] == always.json()["scan"]["indexed_files"]
+    assert always.json()["scan"]["parsed_files"] == 0
+    assert rebuild.json()["scan"]["parsed_files"] == rebuild.json()["scan"]["indexed_files"]
+    assert never.status_code == 422
+
+
 def test_self_hosted_api_enforces_cloud_consent(
     sample_repo: Path, isolated_user_dirs: Path
 ) -> None:
@@ -212,7 +254,10 @@ def test_cloud_api_uses_single_use_immutable_preview_and_cannot_remember_consent
                 "[[src/demo/config.py:1]]"
             )
 
-    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr(
+        "repolocus.core.service.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
     application = create_app(sample_repo, allow_cloud_requests=True)
     preview = _request(
         application,
@@ -293,10 +338,10 @@ def test_api_concurrency_limit_rejects_excess_work(
     started = threading.Event()
     release = threading.Event()
 
-    def slow_scan(self, root):  # type: ignore[no-untyped-def]
+    def slow_scan(self, root, *, refresh="auto"):  # type: ignore[no-untyped-def]
         started.set()
         release.wait(timeout=5)
-        return original_scan(self, root)
+        return original_scan(self, root, refresh=refresh)
 
     monkeypatch.setattr(RepoLocusService, "scan", slow_scan)
     application = create_app(sample_repo, max_concurrent_requests=1)

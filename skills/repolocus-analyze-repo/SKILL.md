@@ -20,7 +20,7 @@ returned on stdout instead of written into the target repository.
   ```
 
 - The Skill does not bundle RepoLocus itself. Require a compatible runtime
-  (`>=0.1.4,<0.2.0`). The adapter resolves the module in isolated Python, validates its origin and
+  (`>=0.1.5,<0.2.0`). The adapter resolves the module in isolated Python, validates its origin and
   distribution version, and then runs that same module; it does not blindly execute a
   `repolocus` command found on `PATH`.
 - If running from a RepoLocus source checkout, prepare its environment ahead of time with

@@ -301,14 +301,17 @@ def create_app(
 
         path: str = Field(default=".", min_length=1, max_length=4096)
 
+    class ScanRequest(RepositoryRequest):
+        refresh: Literal["auto", "always", "rebuild"] = "auto"
+
     class OutputRequest(RepositoryRequest):
-        refresh: Literal["auto", "always", "never"] = "auto"
+        refresh: Literal["auto", "always", "never", "rebuild"] = "auto"
 
     class AskRequest(RepositoryRequest):
         question: str = Field(min_length=1, max_length=4000)
         model: str | None = Field(default=None, min_length=1, max_length=512)
         limit: int = Field(default=8, ge=1, le=20)
-        refresh: Literal["auto", "always", "never"] = "auto"
+        refresh: Literal["auto", "always", "never", "rebuild"] = "auto"
 
     application = FastAPI(
         title="RepoLocus",
@@ -369,10 +372,10 @@ def create_app(
         return {"status": "ok", "version": __version__}
 
     @application.post("/v1/scan")
-    def scan(payload: RepositoryRequest) -> dict[str, object]:
+    def scan(payload: ScanRequest) -> dict[str, object]:
         try:
             repository_root, instance = service(payload.path)
-            return instance.scan(repository_root).to_dict()
+            return instance.scan(repository_root, refresh=payload.refresh).to_dict()
         except (OSError, ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

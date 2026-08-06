@@ -56,9 +56,12 @@ repolocus ask "How does a request reach the core loop?" --model ollama/qwen3-cod
 ```
 
 Every remote CLI call first prints the model, canonical destination endpoint, exact serialized
-payload size, and redacted source fragments selected for that send, including calls covered by a
-remembered grant. Use `--allow-cloud` for one call, or add `--remember-consent` to remember that
-provider endpoint for the current repository:
+payload size, credential-free transport route, and redacted source fragments selected for that
+send, including calls covered by a remembered grant. Ambient `HTTP_PROXY`, `HTTPS_PROXY`, and
+`ALL_PROXY` variables are ignored by default. Select `--proxy-mode environment` to opt in to
+environment discovery, or provide `--proxy-mode explicit --proxy-url URL`; loopback providers
+remain direct. Use `--allow-cloud` for one call, or add `--remember-consent` to remember that exact
+provider endpoint and transport route for the current repository:
 
 ```bash
 export OPENAI_API_KEY=...
@@ -66,10 +69,12 @@ repolocus ask "Where is configuration validated?" \
   --model openai/gpt-4.1-mini --allow-cloud
 ```
 
-Remembered-consent format v3 binds a grant to the current repository identity, canonical path,
-provider, scheme, host, effective port, and complete request path. Replacing the directory or its
-Git marker, or changing a compatible-provider endpoint, therefore requires fresh consent. Legacy
-path-only v1/v2 grants are intentionally ignored after upgrade.
+Remembered-consent format v4 binds a grant to the current repository identity, canonical path,
+provider, complete destination endpoint, and exact credential-free direct/proxy route identity.
+Proxy credentials are excluded from both that identity and the consent file or preview. Replacing
+the directory or its Git marker, or changing an endpoint, proxy mode, or proxy route therefore
+requires fresh consent; rotating credentials for the same route does not. Legacy v1-v3 grants are
+intentionally ignored after upgrade.
 
 ## What it produces
 
@@ -101,6 +106,7 @@ supports the claim. A model answer that passes these checks is still labeled `ne
 | Command | Purpose |
 |---|---|
 | `repolocus scan [PATH]` | Securely scan and incrementally update the local index |
+| `repolocus status [PATH]` | Show content generation, scan revision, and component fingerprints |
 | `repolocus map [PATH]` | Generate `PROJECT_MAP.md` or print it with `--stdout` |
 | `repolocus ask QUESTION [PATH]` | Retrieve source-backed evidence and optionally use a model |
 | `repolocus diagram [PATH]` | Generate validated Mermaid in `ARCHITECTURE.md` |
@@ -113,14 +119,18 @@ supports the claim. A model answer that passes these checks is still labeled `ne
 
 Every command accepts `--help`. Use `--json` on automation-friendly commands where available.
 `map`, `diagram`, and `ask` default to `--refresh auto`: they perform a bounded incremental refresh
-before querying, so edits or a repository replaced at the same path cannot inherit old evidence.
-Use `--refresh never` only when explicitly pinning the last compatible committed snapshot.
+before querying, while an exact cache hit reads no source content and writes no SQLite transaction.
+`--refresh always` securely rereads and hashes every candidate but can reuse compatible parser
+facts; `--refresh rebuild` reparses every source file. Use `--refresh never` only when explicitly
+pinning the last compatible committed snapshot. `repolocus status` reports the retrieval-visible
+content generation separately from the diagnostic scan revision.
 The Python `RepoLocusService.scan()` result keeps unchanged files metadata-only (including cached
 fact counts); use `map()`, `diagram()`, or `evidence()` when materialized facts are required.
 
 Add `--follow-up` to `ask` for a non-persistent in-memory question session; entering a blank line
-ends it. The first answer pins an index generation, and every follow-up uses that exact generation
-with refresh disabled. The session fails closed if another scan advances the generation.
+ends it. The first answer pins the content generation, and every follow-up uses that exact
+generation with refresh disabled. The session fails closed if retrieval-visible facts change, but
+a diagnostics-only scan revision does not invalidate the evidence snapshot.
 Follow-up context is never written to the repository or consent state.
 
 ## Agent Skill
@@ -155,7 +165,7 @@ Restart Codex after copying the directory, or reload its Skill registry when the
 that action. Then invoke the Skill as `$repolocus-analyze-repo`. It intentionally exposes no
 cloud-consent flags; an agent cannot silently send repository content to a remote provider
 through this path. The Skill archive contains the adapter, not a RepoLocus runtime. A compatible
-installed runtime or pre-synchronized trusted source checkout must already exist; adapter
+`>=0.1.5,<0.2.0` installed runtime or pre-synchronized trusted source checkout must already exist; adapter
 operations stay offline and fail closed instead of downloading or synchronizing dependencies.
 
 ## Self-hosted API
@@ -217,7 +227,11 @@ The source mount is read-only and API cloud access remains disabled in this exam
 - Plain HTTP provider endpoints are limited to loopback addresses. Every non-loopback endpoint
   requires HTTPS, and provider prompts are redacted again immediately before transport.
 - `map` and `diagram` are the only normal commands that write in the repository, and only to
-  the output path requested by the user.
+  the output path requested by the user. Their same-directory atomic writer rejects symlinked
+  components. POSIX uses descriptor-relative traversal plus atomic name exchange; Windows uses
+  reparse-point and identity checks before and after its handle-backed replacement and fails when
+  it detects a race. If post-commit identity becomes ambiguous, RepoLocus reports and preserves
+  the recoverable temporary or backup name instead of deleting an unverified object.
 
 See [PRIVACY.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/PRIVACY.md),
 [SECURITY.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/SECURITY.md), and
@@ -260,15 +274,17 @@ uv sync --all-extras
 uv run ruff check .
 uv run pytest --cov=repolocus --cov-report=term-missing
 uv run python scripts/evaluate_retrieval.py evaluation/questions.dataset .
+uv run python scripts/evaluate_external_repositories.py evaluation
 uv build
 ```
 
 The retrieval report includes per-case recall@k, reciprocal rank, nDCG@k, expected-path coverage,
 and citation recall, plus aggregate macro recall, MRR, mean nDCG, any/all-path rates,
-no-answer precision/recall/F1/accuracy, and per-language/per-query-type breakdowns. Answerable retrieval and
-no-answer classification are aggregated separately. The CLI can enforce minimum
-any-path hit rate, macro recall, and MRR. These metrics describe the checked-in regression cases,
-not the planned release-scale evaluation.
+no-answer precision/recall/F1/accuracy, `must_not_return` violations, and per-language,
+per-repository, and per-query-type breakdowns. Answerable retrieval and no-answer classification
+are aggregated separately. The self dataset remains a smoke test; the fixed six-repository,
+18-qrel fixture set is the v0.1.5 CI gate, including citation recall >= 1.0. It is still smaller
+than the planned 100+ reviewed qrels.
 
 Architecture decisions live in
 [`docs/adr/`](https://github.com/Henry-Yolky/RepoLocus/tree/main/docs/adr). Contributions are
@@ -279,11 +295,12 @@ welcome; start with
 
 ## Roadmap and limits
 
-The repository includes a reproducible synthetic scan harness under `benchmarks/` and a small
-source-citation regression set under `evaluation/`; neither substitutes for the planned
-multi-repository, 100-question release evaluation. The next milestones are Tree-sitter adapters,
-stronger graph resolution, a public-repository-only Web Demo, and an opt-in GitHub Action. The project will not
-claim a complete dynamic call graph from static source. See
+The repository includes a reproducible synthetic scan harness under `benchmarks/`, a self-
+retrieval smoke set, and a fixed multi-repository release gate under `evaluation/`. Fixture source,
+revision, license, tree digest, and qrel digest are recorded, but the initial 18 qrels do not
+substitute for the planned 100+ reviewed set. The next milestones are Tree-sitter adapters,
+stronger graph resolution, a public-repository-only Web Demo, and an opt-in GitHub Action. The
+project will not claim a complete dynamic call graph from static source. See
 [ROADMAP.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/ROADMAP.md) for scope.
 
 On the recorded Jetson Orin NX synthetic fixture, 10,000 small Python files scanned in 7.54 s

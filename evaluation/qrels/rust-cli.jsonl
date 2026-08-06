@@ -1,0 +1,3 @@
+{"question":"Where is config_path defined?","language":"en","query_type":"definition","answerable":true,"relevant":[{"path":"src/config.rs","start":1,"end":3,"grade":3}],"must_not_return":[]}
+{"question":"Rust CLI 的 main 入口在哪里？","language":"zh","query_type":"entry_point","answerable":true,"relevant":[{"path":"src/main.rs","start":3,"end":5,"grade":3}],"must_not_return":[]}
+{"question":"Where is the PostgreSQL migration runner implemented?","language":"en","query_type":"hard_negative","answerable":false,"relevant":[],"must_not_return":[]}
