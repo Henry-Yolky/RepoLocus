@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -99,14 +100,27 @@ def test_parser_postconditions_reject_unsafe_or_inconsistent_facts(
         )
 
 
-def test_scanner_accepts_crlf_source_without_weakening_bare_cr_controls(tmp_path: Path) -> None:
-    (tmp_path / "value.py").write_bytes(b"VALUE = 1\r\n")
+def test_scanner_normalizes_parser_newlines_without_changing_raw_digests(
+    tmp_path: Path,
+) -> None:
+    lf = b"VALUE = 1\n"
+    crlf = b"VALUE = 1\r\n"
+    (tmp_path / "lf.py").write_bytes(lf)
+    (tmp_path / "crlf.py").write_bytes(crlf)
 
     result = RepositoryScanner().scan(tmp_path)
+    files = {file.path: file for file in result.files}
 
-    assert [file.path for file in result.files] == ["value.py"]
+    assert set(files) == {"crlf.py", "lf.py"}
     assert result.stats.skipped.get("parse_error", 0) == 0
-    assert result.files[0].chunks[0].content == "VALUE = 1\r\n"
+    assert files["lf.py"].size_bytes == len(lf)
+    assert files["crlf.py"].size_bytes == len(crlf)
+    assert files["lf.py"].sha256 == hashlib.sha256(lf).hexdigest()
+    assert files["crlf.py"].sha256 == hashlib.sha256(crlf).hexdigest()
+    assert files["lf.py"].sha256 != files["crlf.py"].sha256
+    assert files["lf.py"].text == files["crlf.py"].text == "VALUE = 1\n"
+    assert files["lf.py"].chunks[0].content == "VALUE = 1\n"
+    assert files["crlf.py"].chunks[0].content == "VALUE = 1\n"
 
 
 def test_per_file_fact_limits_fail_closed_before_indexing() -> None:

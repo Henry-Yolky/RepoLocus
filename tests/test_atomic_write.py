@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path, PurePosixPath
 
@@ -15,7 +16,7 @@ def test_atomic_write_creates_nested_output_and_replaces_only_generated(tmp_path
     root.mkdir()
     relative = PurePosixPath("docs/generated/PROJECT_MAP.md")
 
-    atomic_write_within_root(
+    created = atomic_write_within_root(
         root,
         relative,
         _GENERATED,
@@ -23,15 +24,22 @@ def test_atomic_write_creates_nested_output_and_replaces_only_generated(tmp_path
     )
     output = root / "docs" / "generated" / "PROJECT_MAP.md"
     assert output.read_bytes() == _GENERATED
+    assert created.recovery_path is None
 
     replacement = _GENERATED.replace(b"new", b"replacement")
-    atomic_write_within_root(
+    replaced = atomic_write_within_root(
         root,
         relative,
         replacement,
         replace_generated_only=True,
     )
     assert output.read_bytes() == replacement
+    if os.name == "nt":
+        assert replaced.recovery_path is None
+    else:
+        assert replaced.recovery_path is not None
+        assert replaced.recovery_path.read_bytes() == _GENERATED
+        assert replaced.recovery_path.suffix == ".rollback"
     assert not list(output.parent.glob(f".{output.name}.*.tmp"))
 
 
@@ -88,7 +96,7 @@ def test_fallback_generated_marker_read_is_bounded(tmp_path: Path) -> None:
 
     output = tmp_path / "PROJECT_MAP.md"
     output.write_bytes(_GENERATED + (b"x" * 1_000_000))
-    expected = output.lstat()
+    expected = writer._capture_fallback_state(output, directory=False)
 
     payload = writer._read_fallback_marker(output, expected)
 
@@ -130,7 +138,9 @@ def test_parent_symlink_swap_fails_without_writing_outside(
 
     assert swapped
     assert not (outside / "PROJECT_MAP.md").exists()
-    assert not list(moved.glob(".*.tmp"))
+    preserved = list(moved.glob(".*.tmp"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == _GENERATED
 
 
 def test_target_file_to_symlink_race_fails_closed(
@@ -158,7 +168,10 @@ def test_target_file_to_symlink_race_fails_closed(
 
     monkeypatch.setattr(writer, "_checkpoint", swap)
 
-    with pytest.raises(AtomicWriteError, match=r"non-regular|safe regular"):
+    with pytest.raises(
+        AtomicWriteError,
+        match=r"non-regular|safe regular|changed while it was inspected",
+    ):
         atomic_write_within_root(
             root,
             PurePosixPath("PROJECT_MAP.md"),
@@ -168,7 +181,12 @@ def test_target_file_to_symlink_race_fails_closed(
 
     assert swapped
     assert outside.read_bytes() == b"outside\n"
-    assert not list(root.glob(".*.tmp"))
+    if os.name == "nt":
+        assert not list(root.glob(".*.tmp"))
+    else:
+        preserved = list(root.glob(".*.rollback"))
+        assert len(preserved) == 1
+        assert preserved[0].read_bytes() == _GENERATED
 
 
 def test_temporary_file_swap_at_commit_cannot_publish_a_symlink(
@@ -181,9 +199,10 @@ def test_temporary_file_swap_at_commit_cannot_publish_a_symlink(
     outside = tmp_path / "outside.md"
     outside.write_bytes(b"outside\n")
     swapped = False
+    swapped_temporary: Path | None = None
 
     def swap(stage: str, _root: Path, _relative: PurePosixPath) -> None:
-        nonlocal swapped
+        nonlocal swapped, swapped_temporary
         if stage == "commit-ready" and not swapped:
             temporary = next(root.glob(".PROJECT_MAP.md.*.tmp"))
             temporary.unlink()
@@ -191,6 +210,7 @@ def test_temporary_file_swap_at_commit_cannot_publish_a_symlink(
                 temporary.symlink_to(outside)
             except OSError as exc:  # pragma: no cover - Windows policy dependent
                 pytest.skip(f"symlinks unavailable: {exc}")
+            swapped_temporary = temporary
             swapped = True
 
     monkeypatch.setattr(writer, "_checkpoint", swap)
@@ -207,9 +227,14 @@ def test_temporary_file_swap_at_commit_cannot_publish_a_symlink(
         )
 
     assert swapped
-    assert (root / "PROJECT_MAP.md").is_symlink()
     assert outside.read_bytes() == b"outside\n"
-    assert list(root.glob(".*.tmp"))
+    assert swapped_temporary is not None
+    if os.name == "nt":
+        assert not (root / "PROJECT_MAP.md").exists()
+        assert swapped_temporary.is_symlink()
+    else:
+        assert (root / "PROJECT_MAP.md").is_symlink()
+        assert not list(root.glob(".*.tmp"))
 
 
 def test_generated_only_commit_preserves_a_last_moment_target_swap(
@@ -233,7 +258,10 @@ def test_generated_only_commit_preserves_a_last_moment_target_swap(
 
     monkeypatch.setattr(writer, "_checkpoint", swap)
 
-    with pytest.raises(AtomicWriteError, match="changed during atomic replacement"):
+    with pytest.raises(
+        AtomicWriteError,
+        match=r"changed during atomic replacement|changed before it could be hashed",
+    ):
         atomic_write_within_root(
             root,
             PurePosixPath("PROJECT_MAP.md"),
@@ -242,10 +270,14 @@ def test_generated_only_commit_preserves_a_last_moment_target_swap(
         )
 
     assert swapped
-    assert output.read_bytes() == _GENERATED.replace(b"new", b"replacement")
-    recovery = list(root.glob(".*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == raced_content
+    if os.name == "nt":
+        assert output.read_bytes() == raced_content
+        assert list(root.iterdir()) == [output]
+    else:
+        assert output.read_bytes() == _GENERATED.replace(b"new", b"replacement")
+        recovery = [path for path in root.iterdir() if path != output]
+        assert len(recovery) == 1
+        assert recovery[0].read_bytes() == raced_content
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires atomic POSIX name exchange")
@@ -319,10 +351,11 @@ def test_post_exchange_target_race_preserves_the_competing_file(
 
     assert raced
     assert output.read_bytes() == raced_content
-    assert _GENERATED in {path.read_bytes() for path in root.glob(".*.tmp") if path.is_file()}
+    assert _GENERATED in {path.read_bytes() for path in root.glob(".*.rollback") if path.is_file()}
 
 
-def test_post_link_target_race_preserves_the_competing_file(
+@pytest.mark.skipif(os.name != "posix", reason="requires descriptor-relative POSIX rename")
+def test_post_noreplace_target_race_preserves_the_competing_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from repolocus.security import atomic_write as writer
@@ -357,6 +390,7 @@ def test_post_link_target_race_preserves_the_competing_file(
     assert not list(root.glob(".*.tmp"))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file identity")
 def test_windows_new_commit_mismatch_preserves_the_competing_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -365,7 +399,7 @@ def test_windows_new_commit_mismatch_preserves_the_competing_file(
     temporary = tmp_path / ".PROJECT_MAP.md.tmp"
     destination = tmp_path / "PROJECT_MAP.md"
     temporary.write_bytes(_GENERATED)
-    expected = temporary.lstat()
+    expected = writer._capture_fallback_state(temporary, directory=False)
     raced_content = b"windows competitor after move\n"
 
     def move_then_race(source: Path, target: Path) -> None:
@@ -376,11 +410,17 @@ def test_windows_new_commit_mismatch_preserves_the_competing_file(
     monkeypatch.setattr(writer, "_move_file_windows", move_then_race)
 
     with pytest.raises(AtomicWriteError, match="preserved"):
-        writer._windows_commit_new(temporary, destination, expected)
+        writer._windows_commit_new(
+            temporary,
+            destination,
+            expected,
+            hashlib.sha256(_GENERATED).digest(),
+        )
 
     assert destination.read_bytes() == raced_content
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file identity")
 def test_windows_exchange_mismatch_preserves_destination_and_backup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -390,8 +430,8 @@ def test_windows_exchange_mismatch_preserves_destination_and_backup(
     temporary = tmp_path / ".PROJECT_MAP.md.tmp"
     destination.write_bytes(_GENERATED)
     temporary.write_bytes(_GENERATED.replace(b"new", b"replacement"))
-    expected_target = destination.lstat()
-    expected_temporary = temporary.lstat()
+    expected_target = writer._capture_fallback_state(destination, directory=False)
+    expected_temporary = writer._capture_fallback_state(temporary, directory=False)
     raced_content = b"windows competitor after replace\n"
 
     def replace_then_race(target: Path, replacement: Path, backup: Path) -> None:
@@ -408,6 +448,8 @@ def test_windows_exchange_mismatch_preserves_destination_and_backup(
             temporary,
             expected_temporary,
             expected_target,
+            hashlib.sha256(_GENERATED.replace(b"new", b"replacement")).digest(),
+            hashlib.sha256(_GENERATED).digest(),
         )
 
     assert destination.read_bytes() == raced_content
@@ -442,6 +484,9 @@ def test_unsupported_atomic_exchange_fails_without_replacing_the_target(
 
     assert output.read_bytes() == _GENERATED
     assert not list(root.glob(".*.tmp"))
+    recovery = list(root.glob(".*.rollback"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == _GENERATED.replace(b"new", b"replacement")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO semantics")
@@ -472,12 +517,66 @@ def test_target_file_to_fifo_race_fails_without_blocking(
 
     assert stat_is_fifo(output)
     assert not list(root.glob(".*.tmp"))
+    recovery = list(root.glob(".*.rollback"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == _GENERATED
 
 
 def stat_is_fifo(path: Path) -> bool:
     import stat
 
     return stat.S_ISFIFO(path.lstat().st_mode)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor helpers")
+def test_posix_atomic_helpers_fail_closed_on_missing_or_unsupported_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repolocus.security import atomic_write as writer
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"source")
+    destination.write_bytes(b"destination")
+    parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        assert writer._raw_state_at(parent_fd, "missing") is None
+        with pytest.raises(FileNotFoundError):
+            writer._open_directory_at(parent_fd, "missing", create=False)
+        with pytest.raises(AtomicWriteError, match="appeared before it could be created"):
+            writer._rename_noreplace_at(parent_fd, source.name, destination.name)
+        assert source.read_bytes() == b"source"
+        assert destination.read_bytes() == b"destination"
+        with pytest.raises(AtomicWriteError, match="safe regular file"):
+            writer._capture_fallback_descriptor_state(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+    source_state = writer._safe_fallback_state(source, directory=False)
+    assert writer._same_fallback_state(source_state, source_state, published=True)
+    assert writer._same_fallback_object_after_close(source_state, source_state)
+    with pytest.raises(AtomicWriteError, match="cannot inspect output path"):
+        writer._safe_fallback_state(tmp_path / "missing", directory=False)
+    with pytest.raises(AtomicWriteError, match="safe regular file"):
+        writer._safe_fallback_state(tmp_path, directory=False)
+    with pytest.raises(AtomicWriteError, match="cannot validate existing"):
+        writer._read_fallback_marker(tmp_path / "missing", source_state)
+
+    monkeypatch.setattr(writer.sys, "platform", "unsupported")
+    with pytest.raises(AtomicWriteError, match="replacement is unavailable"):
+        writer._rename_exchange_at(-1, "first", "second")
+    with pytest.raises(AtomicWriteError, match=r"create-if-absent.*unavailable"):
+        writer._rename_noreplace_at(-1, "source", "destination")
+
+    monkeypatch.setattr(writer.os, "supports_dir_fd", frozenset())
+    with pytest.raises(AtomicWriteError, match=r"descriptor-bound.*unavailable"):
+        atomic_write_within_root(
+            tmp_path,
+            PurePosixPath("PROJECT_MAP.md"),
+            _GENERATED,
+            replace_generated_only=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -488,6 +587,16 @@ def stat_is_fifo(path: Path) -> bool:
         PurePosixPath("."),
         PurePosixPath("bad\\name.md"),
         PurePosixPath("bad\0name.md"),
+        PurePosixPath("C:/outside.md"),
+        PurePosixPath("docs/C:/outside.md"),
+        PurePosixPath("PROJECT_MAP.md:stream"),
+        PurePosixPath(".. /outside.md"),
+        PurePosixPath("docs./PROJECT_MAP.md"),
+        PurePosixPath("NUL.md"),
+        PurePosixPath("COM¹.md"),
+        PurePosixPath("bad|name.md"),
+        PurePosixPath("bad\x1fname.md"),
+        PurePosixPath("safe\u202eevil.md"),
     ],
 )
 def test_atomic_write_rejects_non_relative_paths(tmp_path: Path, relative: PurePosixPath) -> None:

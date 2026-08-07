@@ -516,11 +516,16 @@ class RepositoryIndex:
                     version = _PROVENANCE_SCHEMA_VERSION
                     tables.add("chunk_terms")
                 if version == _PROVENANCE_SCHEMA_VERSION:
-                    if not _REQUIRED_TABLES.issubset(tables):
-                        missing = ", ".join(sorted(_REQUIRED_TABLES - tables))
+                    missing_tables = _REQUIRED_TABLES - tables
+                    if missing_tables and (
+                        missing_tables != {"chunk_terms"}
+                        or not self._is_recognized_legacy_v3_layout()
+                    ):
+                        missing = ", ".join(sorted(missing_tables))
                         raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
                     self._migrate_v3_to_v4()
                     version = _IDENTITY_SCHEMA_VERSION
+                    tables.add("chunk_terms")
                 if version == _IDENTITY_SCHEMA_VERSION:
                     if not _REQUIRED_TABLES.issubset(tables):
                         missing = ", ".join(sorted(_REQUIRED_TABLES - tables))
@@ -631,6 +636,100 @@ class RepositoryIndex:
         except sqlite3.Error as exc:
             raise IndexFormatError(f"could not migrate v2 index: {exc}") from exc
 
+    def _is_recognized_legacy_v3_layout(self) -> bool:
+        """Recognize the pre-release v3 layout that retained the v2 search schema."""
+
+        tables = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if not _V2_REQUIRED_TABLES.issubset(tables) or "chunk_terms" in tables:
+            return False
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in self._connection.execute("SELECT key, value FROM meta")
+        }
+        if (
+            metadata.get("schema_version") != str(_PROVENANCE_SCHEMA_VERSION)
+            or metadata.get("index_format_version") != str(_PROVENANCE_SCHEMA_VERSION)
+            or metadata.get("repository_root") != str(self._root)
+        ):
+            return False
+        try:
+            generation = int(metadata["generation"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if generation < 0:
+            return False
+        file_columns = {
+            str(row["name"]) for row in self._connection.execute("PRAGMA table_info(files)")
+        }
+        expected_file_columns = {
+            "path",
+            "language",
+            "size_bytes",
+            "sha256",
+            "line_count",
+            "text",
+            "is_entry_point",
+            "mtime_ns",
+            "ctime_ns",
+            "provenance",
+            "stale",
+        }
+        if file_columns != expected_file_columns:
+            return False
+        fts_columns = tuple(
+            str(row["name"]) for row in self._connection.execute("PRAGMA table_info(chunks_fts)")
+        )
+        if fts_columns != ("path", "symbol", "content"):
+            return False
+        trigger_names = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'chunks'"
+            )
+        }
+        return {
+            "chunks_after_insert",
+            "chunks_after_delete",
+            "chunks_after_update",
+        }.issubset(trigger_names)
+
+    def _replace_legacy_v3_search_layout(self) -> None:
+        """Replace the recognized v2-style search schema after facts are invalidated."""
+
+        self._connection.execute("DROP TRIGGER chunks_after_insert")
+        self._connection.execute("DROP TRIGGER chunks_after_delete")
+        self._connection.execute("DROP TRIGGER chunks_after_update")
+        self._connection.execute("DROP TABLE chunks_fts")
+        self._connection.execute(
+            """
+            CREATE TABLE chunk_terms (
+                term TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                PRIMARY KEY (term, chunk_id)
+            ) WITHOUT ROWID
+            """
+        )
+        self._connection.execute("CREATE INDEX chunk_terms_chunk_idx ON chunk_terms(chunk_id)")
+        self._connection.execute(
+            """
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                file_path,
+                symbol,
+                content,
+                content = 'chunks',
+                content_rowid = 'id',
+                tokenize = 'unicode61 remove_diacritics 2'
+            )
+            """
+        )
+        self._create_fts_triggers()
+        self._connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+
     def _migrate_v3_to_v4(self) -> None:
         """Invalidate path-only facts before binding the index to this directory."""
 
@@ -644,8 +743,20 @@ class RepositoryIndex:
                         f"unsupported index schema {current_version}; "
                         f"expected {_PROVENANCE_SCHEMA_VERSION}"
                     )
+                tables = {
+                    str(row[0])
+                    for row in self._connection.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                    )
+                }
+                legacy_search_layout = "chunk_terms" not in tables
+                if legacy_search_layout and not self._is_recognized_legacy_v3_layout():
+                    raise IndexFormatError("unrecognized legacy v3 index layout")
                 generation = self._generation_in_transaction()
                 self._clear_repository_facts()
+                if legacy_search_layout:
+                    self._replace_legacy_v3_search_layout()
                 self._connection.executemany(
                     """
                     INSERT INTO meta(key, value) VALUES (?, ?)

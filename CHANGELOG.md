@@ -35,8 +35,10 @@ Semantic Versioning while the project is in alpha.
 
 ### Security
 
-- Generated Markdown uses descriptor-relative atomic name exchange on supported POSIX systems;
-  Windows uses handle-backed replacement plus pre/post reparse-point and identity checks.
+- Generated Markdown uses descriptor-relative no-replace publication on POSIX. Replacements use
+  atomic name exchange and retain the previous document as an explicitly reported `.rollback`
+  recovery file rather than risking a cleanup race. Windows uses 128-bit handle identity,
+  pre/post content hashes, recoverable replacement, and handle-bound deletion.
 - HTTP providers ignore ambient proxy variables by default. Environment or explicit proxy use
   requires an explicit user policy, appears credential-free in previews, and is cryptographically
   bound to remembered consent without persisting proxy credentials.

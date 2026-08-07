@@ -89,6 +89,10 @@ intentionally ignored after upgrade.
 validated AST-like subset, not accepted directly from a model. The evidence tables keep a
 representative source for each node and one concrete import witness for every rendered edge.
 
+On POSIX, replacing an existing output preserves its previous contents in a reported hidden
+`.rollback` file. Remove that recovery file manually only when other repository writers are
+quiescent. New documents use atomic create-if-absent publication and do not leave a recovery file.
+
 `repolocus ask` combines exact symbols, SQLite FTS5/BM25, a deterministic term index, and
 dependency-neighbor evidence. The term index splits camelCase, snake_case, and path components,
 and adds bigrams and trigrams for contiguous CJK text. Users can add explicit retrieval synonyms

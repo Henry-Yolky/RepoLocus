@@ -1,0 +1,5 @@
+# The external evaluation manifest hashes exact fixture bytes. Keep Git from
+# rewriting controlled source and qrel line endings on Windows checkouts.
+evaluation/repos/** text eol=lf
+evaluation/qrels/** text eol=lf
+evaluation/external-manifest.json text eol=lf

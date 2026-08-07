@@ -924,10 +924,11 @@ class RepositoryScanner:
                 stats.skip("binary")
                 warnings.append(f"non-UTF-8 file skipped: {display_path}")
                 continue
-            if _IS_WINDOWS:
-                # Binary descriptor reads preserve on-disk bytes for size and hashing;
-                # normalize the CRLF translation previously supplied by the CRT.
-                text = text.replace("\r\n", "\n")
+            # Binary descriptor reads preserve on-disk bytes for size, hashing,
+            # and binary detection. Detector- and parser-facing decoded text uses
+            # one cross-platform newline convention; a bare CR remains untouched
+            # and is still rejected by parser postcondition checks.
+            text = text.replace("\r\n", "\n")
             if is_generated_document(text, language):
                 stats.skip("generated")
                 continue

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 SCAN_POLICY_VERSION = 6
+SOURCE_TEXT_NORMALIZATION_VERSION = 1
 SECRET_DETECTOR_VERSION = 4
 GENERATED_DETECTOR_VERSION = 3
 CHUNKER_VERSION = 4
@@ -94,6 +95,7 @@ def build_analysis_fingerprints(
         "scan",
         {
             "scanner_policy": SCAN_POLICY_VERSION,
+            "source_text_normalization": SOURCE_TEXT_NORMALIZATION_VERSION,
             "secret_detector": SECRET_DETECTOR_VERSION,
             "generated_detector": GENERATED_DETECTOR_VERSION,
             "limits": dict(sorted(scan_limits.items())),
@@ -105,6 +107,7 @@ def build_analysis_fingerprints(
         {
             "chunker": CHUNKER_VERSION,
             "finalizer": PARSER_FINALIZER_VERSION,
+            "source_text_normalization": SOURCE_TEXT_NORMALIZATION_VERSION,
             "limits": dict(sorted(chunk_limits.items())),
             "parsers": parser_manifest,
             "legacy_cache_key": legacy_cache_key,

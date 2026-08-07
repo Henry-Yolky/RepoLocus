@@ -237,3 +237,12 @@ def test_external_multi_repository_release_gate_is_reproducible() -> None:
     assert all(fixture["content_generation"] == 1 for fixture in report["fixtures"])
     assert all(fixture["scan_revision"] == 1 for fixture in report["fixtures"])
     assert all(outcome["qrel_line"] for outcome in report["outcomes"])
+
+
+def test_external_fixture_bytes_are_lf_pinned_for_cross_platform_git_checkouts() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    attributes = (repository / ".gitattributes").read_text(encoding="utf-8").splitlines()
+
+    assert "evaluation/repos/** text eol=lf" in attributes
+    assert "evaluation/qrels/** text eol=lf" in attributes
+    assert "evaluation/external-manifest.json text eol=lf" in attributes

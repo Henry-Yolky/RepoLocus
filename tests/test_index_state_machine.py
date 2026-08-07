@@ -38,8 +38,8 @@ class IndexRevisionStateMachine(RuleBasedStateMachine):
             scanner=self.scanner,
             privacy=PrivacyStore(base / "privacy.json"),
         )
-        self.disk: dict[str, str] = {}
-        self.committed: dict[str, str] = {}
+        self.disk: dict[str, tuple[str, bytes]] = {}
+        self.committed: dict[str, tuple[str, bytes]] = {}
         self.content_generation = 0
         self.scan_revision = 0
         self.has_scanned = False
@@ -54,7 +54,7 @@ class IndexRevisionStateMachine(RuleBasedStateMachine):
         target = self.root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        self.disk[path] = content
+        self.disk[path] = (content, target.read_bytes())
 
     @rule(path=sampled_from(("a.py", "b.py", "nested/c.py")))
     def delete_file(self, path: str) -> None:
@@ -144,8 +144,8 @@ class IndexRevisionStateMachine(RuleBasedStateMachine):
             return
         indexed = {file.path: file for file in snapshot.files if not file.stale}
         assert set(indexed) == set(self.committed)
-        for path, content in self.committed.items():
-            assert indexed[path].sha256 == hashlib.sha256(content.encode()).hexdigest()
+        for path, (content, raw) in self.committed.items():
+            assert indexed[path].sha256 == hashlib.sha256(raw).hexdigest()
             assert indexed[path].text == content
 
     def _snapshot(self):  # type: ignore[no-untyped-def]

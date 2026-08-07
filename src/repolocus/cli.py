@@ -160,12 +160,24 @@ def _generated_file(root: Path, requested: Path, content: str, force: bool) -> P
     requested_destination = requested if requested.is_absolute() else root / requested
     destination = ensure_within_root(root, requested_destination)
     relative = PurePosixPath(destination.relative_to(root).as_posix())
-    atomic_write_within_root(
+    result = atomic_write_within_root(
         root,
         relative,
         content.encode("utf-8"),
         replace_generated_only=not force,
     )
+    if result.recovery_path is not None:
+        try:
+            recovery_display = result.recovery_path.relative_to(root).as_posix()
+        except ValueError:  # pragma: no cover - writer only returns repository paths
+            recovery_display = str(result.recovery_path)
+        error_console.print(
+            "Warning: previous output preserved at "
+            f"{escape_untrusted_display(recovery_display)}. Remove it manually only "
+            "while repository writers are quiescent.",
+            markup=False,
+            highlight=False,
+        )
     return destination
 
 
