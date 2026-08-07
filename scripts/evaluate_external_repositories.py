@@ -215,7 +215,11 @@ def main() -> int:
         <= arguments.maximum_must_not_return_rate
     )
     report["gate"] = {"passed": passed, "thresholds": thresholds}
-    encoded = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    # Keep stdout and persisted reports independent of the host console code page.
+    # In particular, Windows runners commonly expose cp1252 even when the qrels
+    # contain CJK text. JSON escapes preserve the exact Unicode values while
+    # making the serialized release artifact portable ASCII.
+    encoded = json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
     if arguments.output is not None:
         arguments.output.write_text(encoded, encoding="utf-8")
     print(encoded, end="")

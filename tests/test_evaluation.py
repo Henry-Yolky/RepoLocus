@@ -196,6 +196,7 @@ def test_external_multi_repository_release_gate_is_reproducible() -> None:
     assert all(result.returncode == 0 for result in results), "\n".join(
         result.stderr or result.stdout for result in results
     )
+    assert results[0].stdout.isascii()
     assert results[0].stdout == results[1].stdout
     reports = [json.loads(result.stdout) for result in results]
     assert reports[0] == reports[1]

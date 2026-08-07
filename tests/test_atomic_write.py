@@ -217,7 +217,10 @@ def test_temporary_file_swap_at_commit_cannot_publish_a_symlink(
 
     with pytest.raises(
         AtomicWriteError,
-        match=r"appeared before it could be created|temporary changed|atomic replacement",
+        match=(
+            r"appeared before it could be created|temporary changed|atomic replacement|"
+            r"not a safe regular file"
+        ),
     ):
         atomic_write_within_root(
             root,
