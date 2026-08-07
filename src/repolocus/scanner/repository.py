@@ -7,12 +7,13 @@ import hashlib
 import os
 import stat
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
-from time import monotonic
 
-from repolocus.models import ANALYSIS_VERSION, ScannedFile, ScanResult, ScanStats
-from repolocus.parsers import DEFAULT_REGISTRY, ParseResult, ParserRegistry
+from repolocus.analysis import build_analysis_fingerprints
+from repolocus.models import ScannedFile, ScanResult, ScanStats
+from repolocus.parsers import DEFAULT_REGISTRY, ParserRegistry
+from repolocus.scanner.budget import FactCounts, ScanBudget, deadline_after
 from repolocus.scanner.filters import (
     contains_likely_secret,
     detect_language,
@@ -22,6 +23,15 @@ from repolocus.scanner.filters import (
     is_sensitive_path,
 )
 from repolocus.scanner.ignore import IgnoreRules
+from repolocus.scanner.validation import (
+    DEFAULT_MAX_CHUNKS_PER_FILE,
+    DEFAULT_MAX_DEPENDENCIES_PER_FILE,
+    DEFAULT_MAX_REPOSITORY_DEPENDENCIES,
+    DEFAULT_MAX_SYMBOLS_PER_FILE,
+    HARD_MAX_REPOSITORY_DEPENDENCIES,
+    ParseLimits,
+    finalize_parse_result,
+)
 from repolocus.security.identity import descriptor_path, filesystem_identity
 
 DEFAULT_MAX_FILE_BYTES = 1_000_000
@@ -41,57 +51,6 @@ _USE_DIRECTORY_FDS = (
     and os.stat in os.supports_dir_fd
     and os.scandir in os.supports_fd
 )
-
-
-@dataclass(slots=True)
-class _ScanBudget:
-    max_entries: int
-    max_bytes: int
-    max_chunks: int
-    max_symbols: int
-    deadline: float
-    entries: int = 0
-    bytes_seen: int = 0
-    chunks: int = 0
-    symbols: int = 0
-    exhausted_reason: str | None = None
-    reported: bool = False
-
-    def check_deadline(self) -> bool:
-        if self.exhausted_reason is None and monotonic() > self.deadline:
-            self.exhausted_reason = "scan deadline"
-        return self.exhausted_reason is None
-
-    def observe_entry(self) -> bool:
-        if not self.check_deadline():
-            return False
-        if self.entries + 1 > self.max_entries:
-            self.exhausted_reason = "repository file/entry count"
-            return False
-        self.entries += 1
-        return True
-
-    def observe_bytes(self, size: int) -> bool:
-        if not self.check_deadline():
-            return False
-        if self.bytes_seen + size > self.max_bytes:
-            self.exhausted_reason = "repository byte count"
-            return False
-        self.bytes_seen += size
-        return True
-
-    def observe_facts(self, chunks: int, symbols: int) -> bool:
-        if not self.check_deadline():
-            return False
-        if self.chunks + chunks > self.max_chunks:
-            self.exhausted_reason = "repository chunk count"
-            return False
-        if self.symbols + symbols > self.max_symbols:
-            self.exhausted_reason = "repository symbol count"
-            return False
-        self.chunks += chunks
-        self.symbols += symbols
-        return True
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -342,43 +301,6 @@ def _open_directory_at(
     return descriptor, None
 
 
-def _validate_parse_result(
-    parsed: ParseResult,
-    *,
-    path: str,
-    text: str,
-    language: str,
-    max_chunk_lines: int,
-    max_chunk_chars: int,
-) -> None:
-    """Reject plugin facts that cannot be traced to the supplied source."""
-
-    source_lines = text.splitlines(keepends=True)
-    line_count = len(source_lines)
-
-    def valid_range(start: int, end: int) -> bool:
-        return 1 <= start <= end <= line_count
-
-    for symbol in parsed.symbols:
-        if symbol.path != path or not valid_range(symbol.start_line, symbol.end_line):
-            raise ValueError("parser emitted an invalid symbol source range")
-    for dependency in parsed.dependencies:
-        if dependency.source_path != path or not 1 <= dependency.line <= line_count:
-            raise ValueError("parser emitted an invalid dependency source line")
-    for chunk in parsed.chunks:
-        if chunk.path != path or chunk.language != language:
-            raise ValueError("parser emitted a chunk for a different source")
-        if not valid_range(chunk.start_line, chunk.end_line):
-            raise ValueError("parser emitted an invalid chunk source range")
-        if chunk.end_line - chunk.start_line + 1 > max_chunk_lines:
-            raise ValueError("parser emitted a chunk beyond the line budget")
-        if len(chunk.content) > max_chunk_chars:
-            raise ValueError("parser emitted a chunk beyond the character budget")
-        source_region = "".join(source_lines[chunk.start_line - 1 : chunk.end_line])
-        if chunk.content not in source_region:
-            raise ValueError("parser emitted chunk content not present in its source range")
-
-
 class RepositoryScanner:
     """Scan supported repository text without following links or running code."""
 
@@ -394,9 +316,13 @@ class RepositoryScanner:
         max_directory_depth: int = DEFAULT_MAX_DIRECTORY_DEPTH,
         max_repository_chunks: int = DEFAULT_MAX_REPOSITORY_CHUNKS,
         max_repository_symbols: int = DEFAULT_MAX_REPOSITORY_SYMBOLS,
+        max_repository_dependencies: int = DEFAULT_MAX_REPOSITORY_DEPENDENCIES,
+        max_dependencies_per_file: int = DEFAULT_MAX_DEPENDENCIES_PER_FILE,
+        max_symbols_per_file: int = DEFAULT_MAX_SYMBOLS_PER_FILE,
+        max_chunks_per_file: int = DEFAULT_MAX_CHUNKS_PER_FILE,
         max_scan_seconds: int = DEFAULT_MAX_SCAN_SECONDS,
         parser_registry: ParserRegistry | None = None,
-        analysis_version: str = ANALYSIS_VERSION,
+        analysis_version: str | None = None,
     ) -> None:
         if max_file_bytes <= 0:
             raise ValueError("max_file_bytes must be positive")
@@ -410,11 +336,20 @@ class RepositoryScanner:
             ("max_directory_depth", max_directory_depth),
             ("max_repository_chunks", max_repository_chunks),
             ("max_repository_symbols", max_repository_symbols),
+            ("max_repository_dependencies", max_repository_dependencies),
+            ("max_dependencies_per_file", max_dependencies_per_file),
+            ("max_symbols_per_file", max_symbols_per_file),
+            ("max_chunks_per_file", max_chunks_per_file),
             ("max_scan_seconds", max_scan_seconds),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if not analysis_version or len(analysis_version) > 96:
+        if max_repository_dependencies > HARD_MAX_REPOSITORY_DEPENDENCIES:
+            raise ValueError(
+                "max_repository_dependencies exceeds the global safety ceiling of "
+                f"{HARD_MAX_REPOSITORY_DEPENDENCIES}"
+            )
+        if analysis_version is not None and (not analysis_version or len(analysis_version) > 96):
             raise ValueError("analysis_version must be a short non-empty string")
         self.max_file_bytes = max_file_bytes
         self.max_ignore_bytes = max_ignore_bytes
@@ -425,10 +360,46 @@ class RepositoryScanner:
         self.max_directory_depth = max_directory_depth
         self.max_repository_chunks = max_repository_chunks
         self.max_repository_symbols = max_repository_symbols
+        self.max_repository_dependencies = max_repository_dependencies
+        self.parse_limits = ParseLimits(
+            max_chunk_lines=max_chunk_lines,
+            max_chunk_chars=max_chunk_chars,
+            max_dependencies_per_file=max_dependencies_per_file,
+            max_symbols_per_file=max_symbols_per_file,
+            max_chunks_per_file=max_chunks_per_file,
+        )
         self.max_scan_seconds = max_scan_seconds
-        self.parser_registry = parser_registry or DEFAULT_REGISTRY
+        self.parser_registry = (parser_registry or DEFAULT_REGISTRY).frozen_copy()
+        self.fingerprints = build_analysis_fingerprints(
+            parser_manifest=self.parser_registry.cache_manifest(),
+            scan_limits={
+                "max_directory_depth": max_directory_depth,
+                "max_file_bytes": max_file_bytes,
+                "max_ignore_bytes": max_ignore_bytes,
+                "max_repository_bytes": max_repository_bytes,
+                "max_repository_files": max_repository_files,
+                "max_scan_seconds": max_scan_seconds,
+            },
+            chunk_limits={
+                "max_chunk_chars": max_chunk_chars,
+                "max_chunk_lines": max_chunk_lines,
+                "max_repository_chunks": max_repository_chunks,
+                "max_repository_symbols": max_repository_symbols,
+                "max_repository_dependencies": max_repository_dependencies,
+                "max_dependencies_per_file": max_dependencies_per_file,
+                "max_symbols_per_file": max_symbols_per_file,
+                "max_chunks_per_file": max_chunks_per_file,
+            },
+            legacy_cache_key=analysis_version or "",
+        )
         self.analysis_version = (
             f"{analysis_version}:lines={max_chunk_lines}:chars={max_chunk_chars}"
+            if analysis_version is not None
+            else (
+                f"components-v1:scan={self.fingerprints.scan[:16]}:"
+                f"parser={self.fingerprints.parser[:16]}:"
+                f"terms={self.fingerprints.term_index[:16]}"
+            )
         )
 
     def scan(
@@ -438,6 +409,8 @@ class RepositoryScanner:
         cached_files: Mapping[str, ScannedFile] | None = None,
         trusted_cache: bool = False,
         base_generation: int | None = None,
+        base_scan_revision: int | None = None,
+        refresh_mode: str = "auto",
     ) -> ScanResult:
         """Return a stable scan of *root*.
 
@@ -450,8 +423,15 @@ class RepositoryScanner:
             isinstance(base_generation, bool) or base_generation < 0
         ):
             raise ValueError("base_generation must be a non-negative integer or None")
+        if base_scan_revision is not None and (
+            isinstance(base_scan_revision, bool) or base_scan_revision < 0
+        ):
+            raise ValueError("base_scan_revision must be a non-negative integer or None")
+        if refresh_mode not in {"auto", "always", "rebuild"}:
+            raise ValueError("scanner refresh_mode must be auto, always, or rebuild")
         if not isinstance(trusted_cache, bool):
             raise ValueError("trusted_cache must be true or false")
+        self.parser_registry.require_stable()
         supplied_root = Path(root).expanduser().absolute()
         try:
             root_metadata = supplied_root.lstat()
@@ -472,12 +452,13 @@ class RepositoryScanner:
         warnings: list[str] = []
         temporarily_unreadable: set[str] = set()
         reusable = cached_files or {}
-        budget = _ScanBudget(
+        budget = ScanBudget(
             max_entries=self.max_repository_files,
             max_bytes=self.max_repository_bytes,
             max_chunks=self.max_repository_chunks,
             max_symbols=self.max_repository_symbols,
-            deadline=monotonic() + self.max_scan_seconds,
+            max_dependencies=self.max_repository_dependencies,
+            deadline=deadline_after(self.max_scan_seconds),
         )
         root_fd: int | None = None
         if _USE_DIRECTORY_FDS:
@@ -513,6 +494,7 @@ class RepositoryScanner:
                 temporarily_unreadable,
                 reusable,
                 trusted_cache,
+                refresh_mode,
                 budget,
             )
         finally:
@@ -534,6 +516,7 @@ class RepositoryScanner:
             temporarily_unreadable = {"."}
         files.sort(key=lambda item: item.path)
         warnings.sort()
+        self.parser_registry.require_stable()
         return ScanResult(
             root=resolved_root,
             files=files,
@@ -543,6 +526,9 @@ class RepositoryScanner:
             temporarily_unreadable=tuple(sorted(temporarily_unreadable)),
             base_generation=base_generation,
             repository_identity=root_identity,
+            base_scan_revision=base_scan_revision,
+            fingerprints=self.fingerprints,
+            refresh_mode=refresh_mode,  # type: ignore[arg-type]
         )
 
     def _load_local_ignore(
@@ -610,17 +596,21 @@ class RepositoryScanner:
         temporarily_unreadable: set[str],
         cached_files: Mapping[str, ScannedFile],
         trusted_cache: bool,
-        budget: _ScanBudget,
+        refresh_mode: str,
+        budget: ScanBudget,
     ) -> None:
         file_checkpoint = len(files)
         warning_checkpoint = len(warnings)
         unreadable_checkpoint = set(temporarily_unreadable)
+        budget_checkpoint = budget.checkpoint()
         stats_checkpoint = (
             stats.discovered_files,
             stats.indexed_files,
             stats.indexed_bytes,
             dict(stats.languages),
             dict(stats.skipped),
+            stats.content_reads,
+            stats.parsed_files,
         )
         directory_location = relative_directory.as_posix() or "."
 
@@ -644,11 +634,14 @@ class RepositoryScanner:
                 stats.indexed_bytes,
                 languages,
                 skipped,
+                stats.content_reads,
+                stats.parsed_files,
             ) = stats_checkpoint
             stats.languages.clear()
             stats.languages.update(languages)
             stats.skipped.clear()
             stats.skipped.update(skipped)
+            budget.restore(budget_checkpoint)
             stats.skip("changed_during_scan")
             warnings.append(f"directory changed during scan: {directory_location}")
             temporarily_unreadable.add(directory_location)
@@ -800,6 +793,7 @@ class RepositoryScanner:
                         temporarily_unreadable,
                         cached_files,
                         trusted_cache,
+                        refresh_mode,
                         budget,
                     )
                 finally:
@@ -876,13 +870,15 @@ class RepositoryScanner:
                     directory_fd=directory_fd,
                 )
             ):
-                cached_chunks = (
-                    len(cached.chunks) or cached.cached_chunk_count or int(bool(cached.text))
+                cached_counts = FactCounts(
+                    chunks=len(cached.chunks) or cached.cached_chunk_count,
+                    symbols=len(cached.symbols) or cached.cached_symbol_count,
+                    dependencies=(len(cached.dependencies) or cached.cached_dependency_count),
                 )
-                cached_symbols = len(cached.symbols) or cached.cached_symbol_count
-                if not budget.observe_facts(cached_chunks, cached_symbols):
+                if not budget.require_capacity(cached_counts):
                     stop_for_global_budget()
                     return
+                budget.commit_facts(cached_counts)
                 if not directory_is_stable():
                     discard_changed_directory()
                     return
@@ -914,6 +910,7 @@ class RepositoryScanner:
                 if read_error in {"unreadable", "changed_during_scan"}:
                     temporarily_unreadable.add(display_path)
                 continue
+            stats.content_reads += 1
             if post_read_metadata is None:  # pragma: no cover - helper invariant
                 raise RuntimeError("safe read returned no metadata")
             digest = hashlib.sha256(payload).hexdigest()
@@ -927,10 +924,11 @@ class RepositoryScanner:
                 stats.skip("binary")
                 warnings.append(f"non-UTF-8 file skipped: {display_path}")
                 continue
-            if _IS_WINDOWS:
-                # Binary descriptor reads preserve on-disk bytes for size and hashing;
-                # normalize the CRLF translation previously supplied by the CRT.
-                text = text.replace("\r\n", "\n")
+            # Binary descriptor reads preserve on-disk bytes for size, hashing,
+            # and binary detection. Detector- and parser-facing decoded text uses
+            # one cross-platform newline convention; a bare CR remains untouched
+            # and is still rejected by parser postcondition checks.
+            text = text.replace("\r\n", "\n")
             if is_generated_document(text, language):
                 stats.skip("generated")
                 continue
@@ -942,20 +940,23 @@ class RepositoryScanner:
                 warnings.append(f"file with likely secret skipped: {display_path}")
                 continue
             if (
-                cached is not None
+                refresh_mode != "rebuild"
+                and cached is not None
                 and cached.provenance == "source"
                 and not cached.stale
                 and cached.language == language
                 and cached.size_bytes == len(payload)
                 and cached.sha256.casefold() == digest
             ):
-                cached_chunks = (
-                    len(cached.chunks) or cached.cached_chunk_count or int(bool(cached.text))
+                cached_counts = FactCounts(
+                    chunks=len(cached.chunks) or cached.cached_chunk_count,
+                    symbols=len(cached.symbols) or cached.cached_symbol_count,
+                    dependencies=(len(cached.dependencies) or cached.cached_dependency_count),
                 )
-                cached_symbols = len(cached.symbols) or cached.cached_symbol_count
-                if not budget.observe_facts(cached_chunks, cached_symbols):
+                if not budget.require_capacity(cached_counts):
                     stop_for_global_budget()
                     return
+                budget.commit_facts(cached_counts)
                 files.append(
                     replace(
                         cached,
@@ -978,6 +979,14 @@ class RepositoryScanner:
                     max_chunk_lines=self.max_chunk_lines,
                     max_chunk_chars=self.max_chunk_chars,
                 )
+                stats.parsed_files += 1
+                parsed, parsed_counts = finalize_parse_result(
+                    parsed,
+                    path=display_path,
+                    text=text,
+                    language=language,
+                    limits=self.parse_limits,
+                )
             except Exception as exc:  # Parser plugins are an isolation boundary.
                 stats.skip("parse_error")
                 warnings.append(f"parse failed ({type(exc).__name__}) for file: {display_path}")
@@ -987,24 +996,10 @@ class RepositoryScanner:
             if not budget.check_deadline():
                 stop_for_global_budget()
                 return
-            parsed_chunks = len(parsed.chunks) or int(bool(text))
-            if not budget.observe_facts(parsed_chunks, len(parsed.symbols)):
+            if not budget.require_capacity(parsed_counts):
                 stop_for_global_budget()
                 return
-            try:
-                _validate_parse_result(
-                    parsed,
-                    path=display_path,
-                    text=text,
-                    language=language,
-                    max_chunk_lines=self.max_chunk_lines,
-                    max_chunk_chars=self.max_chunk_chars,
-                )
-            except Exception as exc:  # Parser plugins are an isolation boundary.
-                stats.skip("parse_error")
-                warnings.append(f"parse failed ({type(exc).__name__}) for file: {display_path}")
-                temporarily_unreadable.add(display_path)
-                continue
+            budget.commit_facts(parsed_counts)
 
             scanned = ScannedFile(
                 path=display_path,

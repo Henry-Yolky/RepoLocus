@@ -221,6 +221,8 @@ def test_registry_is_deterministic_and_supports_plugins() -> None:
     @dataclass(frozen=True)
     class CustomParser:
         languages = frozenset({"custom"})
+        cache_key = "test-custom:v1"
+        priority = 0
 
         def parse(
             self,

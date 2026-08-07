@@ -5,6 +5,49 @@ Semantic Versioning while the project is in alpha.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-07
+
+### Added
+
+- Added distinct retrieval-visible `content_generation` and diagnostic `scan_revision` counters,
+  a `status` command, and explicit `auto`, `always`, `never`, and `rebuild` refresh behavior.
+- Added deterministic component fingerprints and parser cache identities so scanner, parser,
+  term-index, and retrieval changes invalidate only the facts they affect.
+- Added a parser finalizer with normalized ranges, bounded fields and collections, transactional
+  repository budgets, and hard resource ceilings around parser output.
+- Added a fixed six-repository, 18-qrel synthetic retrieval gate with graded citations, a citation
+  recall gate, explicit no-answer truth, per-repository metrics, provenance, fixture and qrel
+  digests, and `must_not_return` checks.
+- Added state-machine, race, cross-process, parser-boundary, proxy-route, and workflow-policy tests.
+
+### Changed
+
+- `refresh=auto` now performs no database write on an exact cache hit; `always` securely rereads
+  every candidate while reusing compatible parser facts, and `rebuild` reparses every source file.
+- Python 3.10 configuration now uses `tomli`, while Python 3.11 and newer use `tomllib`; the
+  previous partial TOML implementation has been removed.
+- The bundled Skill now requires a RepoLocus `>=0.1.5,<0.2.0` runtime so its parser budgets,
+  component fingerprints, and refresh semantics cannot silently fall back to v0.1.4 behavior.
+- CI now covers Python 3.10 through the supported latest Python 3.14, runs the external retrieval
+  gate, pins every third-party Action to a full commit SHA, and uses exact uv and Hatchling
+  versions. The existing required `package` check now fails instead of becoming skipped when any
+  prerequisite gate fails.
+
+### Security
+
+- Generated Markdown uses descriptor-relative no-replace publication on POSIX. Replacements use
+  atomic name exchange and retain the previous document as an explicitly reported `.rollback`
+  recovery file rather than risking a cleanup race. Windows uses 128-bit handle identity,
+  pre/post content hashes, recoverable replacement, and handle-bound deletion.
+- HTTP providers ignore ambient proxy variables by default. Environment or explicit proxy use
+  requires an explicit user policy, appears credential-free in previews, and is cryptographically
+  bound to remembered consent without persisting proxy credentials.
+- Privacy consent state v4 invalidates earlier grants and uses an operating-system cross-process
+  lock on Windows as well as POSIX so concurrent grant/revoke updates cannot be lost.
+- Release wheel, sdist, Skill ZIP, CycloneDX SBOM, and checksums receive GitHub/Sigstore build
+  provenance; a separate clean job verifies checksums and every attestation, installs the wheel,
+  and runs the security doctor before PyPI publication.
+
 ## [0.1.4] - 2026-08-04
 
 ### Changed

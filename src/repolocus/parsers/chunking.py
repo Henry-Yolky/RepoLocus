@@ -25,6 +25,7 @@ def _split_region(
     region: Region,
     max_lines: int,
     max_chars: int,
+    max_chunks: int | None,
 ) -> list[Chunk]:
     chunks: list[Chunk] = []
     parts: list[str] = []
@@ -36,6 +37,8 @@ def _split_region(
         nonlocal parts, chars, part_start, part_end
         if not parts:
             return
+        if max_chunks is not None and len(chunks) >= max_chunks:
+            raise ValueError("semantic chunking exceeded the configured chunk limit")
         chunks.append(
             Chunk(
                 path=path,
@@ -51,10 +54,9 @@ def _split_region(
 
     for line_number in range(region.start_line, region.end_line + 1):
         line = lines[line_number - 1]
-        pieces = [line[index : index + max_chars] for index in range(0, len(line), max_chars)]
-        if not pieces:
-            pieces = [""]
-        for piece in pieces:
+        piece_offsets = range(0, len(line), max_chars) if line else (0,)
+        for index in piece_offsets:
+            piece = line[index : index + max_chars]
             exceeds_lines = bool(parts) and line_number - part_start + 1 > max_lines
             exceeds_chars = bool(parts) and chars + len(piece) > max_chars
             if exceeds_lines or exceeds_chars:
@@ -78,6 +80,7 @@ def semantic_chunks(
     regions: Iterable[Region] = (),
     max_lines: int = 160,
     max_chars: int = 16_000,
+    max_chunks: int | None = None,
 ) -> tuple[Chunk, ...]:
     """Build bounded chunks around symbols or document sections.
 
@@ -89,6 +92,10 @@ def semantic_chunks(
 
     if max_lines <= 0 or max_chars <= 0:
         raise ValueError("chunk limits must be positive")
+    if max_chunks is not None and (
+        isinstance(max_chunks, bool) or not isinstance(max_chunks, int) or max_chunks <= 0
+    ):
+        raise ValueError("max_chunks must be a positive integer or None")
     lines = text.splitlines(keepends=True)
     if not lines:
         return ()
@@ -121,6 +128,9 @@ def semantic_chunks(
 
     chunks: list[Chunk] = []
     for region in ordered:
+        remaining_chunks = None if max_chunks is None else max_chunks - len(chunks)
+        if remaining_chunks is not None and remaining_chunks <= 0:
+            raise ValueError("semantic chunking exceeded the configured chunk limit")
         chunks.extend(
             _split_region(
                 path=path,
@@ -129,6 +139,7 @@ def semantic_chunks(
                 region=region,
                 max_lines=max_lines,
                 max_chars=max_chars,
+                max_chunks=remaining_chunks,
             )
         )
     return tuple(

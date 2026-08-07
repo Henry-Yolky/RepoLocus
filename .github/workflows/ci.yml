@@ -14,25 +14,27 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+          version: "0.9.18"
       - run: uv sync --all-extras --locked
       - run: uv run pytest
 
   coverage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.10"
           enable-cache: true
+          version: "0.9.18"
       - run: uv sync --all-extras --locked
       - run: uv run ruff format --check .
       - run: uv run ruff check .
@@ -41,10 +43,11 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.12"
+          version: "0.9.18"
       - run: uv sync --all-extras --locked
       - run: uv run repolocus doctor --security --json
       - name: Scan Python for medium/high-severity security issues
@@ -69,7 +72,7 @@ jobs:
           uv run python scripts/check_licenses.py licenses.json
       - name: Upload supply-chain reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: supply-chain-reports
           path: |
@@ -78,14 +81,57 @@ jobs:
             requirements-audit.txt
           if-no-files-found: warn
 
-  package:
-    needs: [test, coverage, security]
+  external-evaluation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.12"
+          enable-cache: true
+          version: "0.9.18"
+      - run: uv sync --all-extras --locked
+      - name: Run fixed multi-repository retrieval gate
+        run: >-
+          uv run python scripts/evaluate_external_repositories.py evaluation
+          --minimum-hit-rate 0.90
+          --minimum-macro-recall 0.80
+          --minimum-mrr 0.75
+          --minimum-citation-recall 1.0
+          --minimum-no-answer-f1 0.80
+          --maximum-must-not-return-rate 0.0
+          --output external-evaluation.json
+      - name: Upload external evaluation report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: external-evaluation
+          path: external-evaluation.json
+          if-no-files-found: error
+
+  package:
+    needs: [test, coverage, security, external-evaluation]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI gate to succeed
+        env:
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          EVALUATION_RESULT: ${{ needs.external-evaluation.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          for result in "$TEST_RESULT" "$COVERAGE_RESULT" "$SECURITY_RESULT" "$EVALUATION_RESULT"; do
+            if [[ "$result" != "success" ]]; then
+              echo "Required CI gate did not succeed: $result" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          python-version: "3.12"
+          version: "0.9.18"
       - run: uv build
       - name: Install wheel in a clean environment
         run: |

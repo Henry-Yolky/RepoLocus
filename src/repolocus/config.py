@@ -7,7 +7,6 @@ the provider adapters directly from their documented environment variables.
 
 from __future__ import annotations
 
-import ast
 import json
 import math
 import os
@@ -15,7 +14,7 @@ import re
 import stat
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -39,6 +38,8 @@ _DEFAULTS: dict[str, object] = {
     "openai_base_url": "https://api.openai.com/v1",
     "anthropic_base_url": "https://api.anthropic.com",
     "request_timeout": 30.0,
+    "proxy_mode": "disabled",
+    "proxy_url": "",
     "max_output_tokens": 2048,
     "max_file_bytes": 1_000_000,
     "context_char_budget": 24_000,
@@ -47,6 +48,10 @@ _DEFAULTS: dict[str, object] = {
     "max_directory_depth": 64,
     "max_repository_chunks": 500_000,
     "max_repository_symbols": 500_000,
+    "max_repository_dependencies": 1_000_000,
+    "max_dependencies_per_file": 10_000,
+    "max_symbols_per_file": 10_000,
+    "max_chunks_per_file": 10_000,
     "max_scan_seconds": 120,
     "query_synonyms": "{}",
 }
@@ -63,6 +68,8 @@ _ENV_KEYS = {
     "REPOLOCUS_OPENAI_BASE_URL": "openai_base_url",
     "REPOLOCUS_ANTHROPIC_BASE_URL": "anthropic_base_url",
     "REPOLOCUS_REQUEST_TIMEOUT": "request_timeout",
+    "REPOLOCUS_PROXY_MODE": "proxy_mode",
+    "REPOLOCUS_PROXY_URL": "proxy_url",
     "REPOLOCUS_MAX_OUTPUT_TOKENS": "max_output_tokens",
     "REPOLOCUS_MAX_FILE_BYTES": "max_file_bytes",
     "REPOLOCUS_CONTEXT_CHAR_BUDGET": "context_char_budget",
@@ -71,6 +78,10 @@ _ENV_KEYS = {
     "REPOLOCUS_MAX_DIRECTORY_DEPTH": "max_directory_depth",
     "REPOLOCUS_MAX_REPOSITORY_CHUNKS": "max_repository_chunks",
     "REPOLOCUS_MAX_REPOSITORY_SYMBOLS": "max_repository_symbols",
+    "REPOLOCUS_MAX_REPOSITORY_DEPENDENCIES": "max_repository_dependencies",
+    "REPOLOCUS_MAX_DEPENDENCIES_PER_FILE": "max_dependencies_per_file",
+    "REPOLOCUS_MAX_SYMBOLS_PER_FILE": "max_symbols_per_file",
+    "REPOLOCUS_MAX_CHUNKS_PER_FILE": "max_chunks_per_file",
     "REPOLOCUS_MAX_SCAN_SECONDS": "max_scan_seconds",
     "REPOLOCUS_QUERY_SYNONYMS": "query_synonyms",
 }
@@ -92,6 +103,10 @@ _REPOSITORY_LIMIT_KEYS = frozenset(
         "max_directory_depth",
         "max_repository_chunks",
         "max_repository_symbols",
+        "max_repository_dependencies",
+        "max_dependencies_per_file",
+        "max_symbols_per_file",
+        "max_chunks_per_file",
         "max_scan_seconds",
     }
 )
@@ -124,6 +139,8 @@ class Settings:
     openai_base_url: str = "https://api.openai.com/v1"
     anthropic_base_url: str = "https://api.anthropic.com"
     request_timeout: float = 30.0
+    proxy_mode: str = "disabled"
+    proxy_url: str = field(default="", repr=False)
     max_output_tokens: int = 2048
     max_file_bytes: int = 1_000_000
     context_char_budget: int = 24_000
@@ -132,6 +149,10 @@ class Settings:
     max_directory_depth: int = 64
     max_repository_chunks: int = 500_000
     max_repository_symbols: int = 500_000
+    max_repository_dependencies: int = 1_000_000
+    max_dependencies_per_file: int = 10_000
+    max_symbols_per_file: int = 10_000
+    max_chunks_per_file: int = 10_000
     max_scan_seconds: int = 120
     query_synonyms: str = "{}"
 
@@ -151,6 +172,17 @@ class Settings:
             or self.request_timeout <= 0
         ):
             raise ConfigError("request_timeout must be greater than zero")
+        if self.proxy_mode not in {"disabled", "environment", "explicit"}:
+            raise ConfigError("proxy_mode must be disabled, environment, or explicit")
+        if self.proxy_mode == "explicit":
+            try:
+                from repolocus.providers.transport import proxy_transport
+
+                proxy_transport("explicit", self.proxy_url)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
+        elif self.proxy_url:
+            raise ConfigError("proxy_url may only be set when proxy_mode is explicit")
         for field_name in (
             "max_output_tokens",
             "max_file_bytes",
@@ -160,6 +192,10 @@ class Settings:
             "max_directory_depth",
             "max_repository_chunks",
             "max_repository_symbols",
+            "max_repository_dependencies",
+            "max_dependencies_per_file",
+            "max_symbols_per_file",
+            "max_chunks_per_file",
             "max_scan_seconds",
         ):
             value = getattr(self, field_name)
@@ -172,6 +208,12 @@ class Settings:
         """Compatibility alias with an explicit boolean name."""
 
         return self.telemetry
+
+    @property
+    def trust_env(self) -> bool:
+        """Whether the user explicitly selected environment proxy discovery."""
+
+        return self.proxy_mode == "environment"
 
     @property
     def query_synonym_map(self) -> dict[str, tuple[str, ...]]:
@@ -226,8 +268,6 @@ class Settings:
                 raw = _read_repository_config_bytes(repo_root, path)
                 if raw is None:
                     continue
-            if path.name == "pyproject.toml" and not _pyproject_declares_repolocus(raw, path):
-                continue
             table = _parse_config(raw, path, source="repository")
             # A pyproject is relevant only when it contains [tool.repolocus].
             if path.name == "pyproject.toml" and not _has_repolocus_table(table):
@@ -296,14 +336,6 @@ def _has_repolocus_table(data: Mapping[str, Any]) -> bool:
     return isinstance(tool, Mapping) and isinstance(tool.get("repolocus"), Mapping)
 
 
-def _pyproject_declares_repolocus(raw: bytes, path: Path) -> bool:
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ConfigError(f"cannot inspect repository config {path}: {exc}") from exc
-    return bool(re.search(r"(?m)^\s*\[tool\.repolocus\]\s*(?:#.*)?$", text))
-
-
 def _extract_table(data: Mapping[str, Any]) -> Mapping[str, Any]:
     tool = data.get("tool")
     if isinstance(tool, Mapping) and isinstance(tool.get("repolocus"), Mapping):
@@ -358,6 +390,13 @@ def _coerce_value(key: str, value: object, source: str) -> object:
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{source}: request_timeout must be a number") from exc
         return parsed
+    if key == "proxy_mode":
+        if not isinstance(value, str):
+            raise ConfigError(f"{source}: proxy_mode must be a string")
+        mode = value.strip().casefold()
+        if mode not in {"disabled", "environment", "explicit"}:
+            raise ConfigError(f"{source}: proxy_mode must be disabled, environment, or explicit")
+        return mode
     if key in {
         "max_output_tokens",
         "max_file_bytes",
@@ -367,6 +406,10 @@ def _coerce_value(key: str, value: object, source: str) -> object:
         "max_directory_depth",
         "max_repository_chunks",
         "max_repository_symbols",
+        "max_repository_dependencies",
+        "max_dependencies_per_file",
+        "max_symbols_per_file",
+        "max_chunks_per_file",
         "max_scan_seconds",
     }:
         if isinstance(value, bool) or not isinstance(value, (int, str)):
@@ -438,13 +481,10 @@ def _parse_config(raw: bytes, path: Path, *, source: str) -> Mapping[str, Any]:
     try:
         try:
             import tomllib  # type: ignore[import-not-found]
-
-            parsed = tomllib.loads(raw.decode("utf-8"))
         except ModuleNotFoundError:
-            text = raw.decode("utf-8")
-            if path.name == "pyproject.toml":
-                text = _repolocus_pyproject_subset(text)
-            parsed = _parse_toml_subset(text)
+            import tomli as tomllib  # type: ignore[no-redef]
+
+        parsed = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise ConfigError(f"invalid TOML in {source} config {path}: {exc}") from exc
     if not isinstance(parsed, Mapping):
@@ -650,99 +690,3 @@ def _read_config_bytes(path: Path, *, source: str) -> bytes:
     if len(raw) > MAX_CONFIG_BYTES:
         raise ConfigError(f"{source} config exceeds the {MAX_CONFIG_BYTES}-byte limit: {path}")
     return raw
-
-
-def _parse_toml_subset(text: str) -> dict[str, Any]:
-    """Parse the scalar TOML subset used by RepoLocus on Python 3.10.
-
-    Python 3.11 and newer use the standard-library parser.  Keeping this tiny
-    fallback avoids making Python 3.10 silently unsupported solely for config.
-    """
-
-    result: dict[str, Any] = {}
-    current = result
-    for line_number, original in enumerate(text.splitlines(), start=1):
-        line = _strip_toml_comment(original).strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip()
-            if not section or section.startswith("["):
-                raise ValueError(f"unsupported table declaration on line {line_number}")
-            current = result
-            for part in section.split("."):
-                key = part.strip().strip("\"'")
-                if not key:
-                    raise ValueError(f"empty table name on line {line_number}")
-                child = current.setdefault(key, {})
-                if not isinstance(child, dict):
-                    raise ValueError(f"table conflicts with value on line {line_number}")
-                current = child
-            continue
-        if "=" not in line:
-            raise ValueError(f"expected key = value on line {line_number}")
-        raw_key, raw_value = line.split("=", 1)
-        key = raw_key.strip().strip("\"'")
-        if not key:
-            raise ValueError(f"empty key on line {line_number}")
-        current[key] = _parse_toml_scalar(raw_value.strip(), line_number)
-    return result
-
-
-def _repolocus_pyproject_subset(text: str) -> str:
-    """Extract [tool.repolocus] so the Python 3.10 parser skips unrelated TOML."""
-
-    selected: list[str] = []
-    in_section = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_section = stripped == "[tool.repolocus]"
-        if in_section:
-            selected.append(line)
-    return "\n".join(selected)
-
-
-def _strip_toml_comment(line: str) -> str:
-    quote: str | None = None
-    escaped = False
-    for index, char in enumerate(line):
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and quote == '"':
-            escaped = True
-            continue
-        if char in {'"', "'"}:
-            if quote == char:
-                quote = None
-            elif quote is None:
-                quote = char
-        elif char == "#" and quote is None:
-            return line[:index]
-    return line
-
-
-def _parse_toml_scalar(value: str, line_number: int) -> object:
-    lowered = value.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if value.startswith('"'):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid string on line {line_number}") from exc
-    if value.startswith("'"):
-        try:
-            return ast.literal_eval(value)
-        except (SyntaxError, ValueError) as exc:
-            raise ValueError(f"invalid string on line {line_number}") from exc
-    try:
-        return int(value.replace("_", ""))
-    except ValueError:
-        try:
-            return float(value.replace("_", ""))
-        except ValueError as exc:
-            raise ValueError(f"unsupported value on line {line_number}") from exc

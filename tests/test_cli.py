@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from urllib.parse import unquote
@@ -109,7 +110,10 @@ def test_remembered_cloud_grant_still_prints_exact_preview(
         "openai",
         "https://api.openai.com/v1/chat/completions",
     )
-    monkeypatch.setattr("repolocus.core.service.create_provider", lambda *_args: FakeProvider())
+    monkeypatch.setattr(
+        "repolocus.core.service.create_provider",
+        lambda *_args, **_kwargs: FakeProvider(),
+    )
 
     result = runner.invoke(
         app,
@@ -232,6 +236,12 @@ def test_generated_output_migrates_the_pre_rename_marker(
     generated = output.read_text(encoding="utf-8")
     assert "Generator: RepoLocus" in generated
     assert "Generator: DevPilot" not in generated
+    if os.name != "nt":
+        assert "previous output preserved at" in result.output
+        assert "repository writers are quiescent" in result.output
+        recovery = list(sample_repo.glob(".PROJECT_MAP.md.*.rollback"))
+        assert len(recovery) == 1
+        assert "Generator: DevPilot" in recovery[0].read_text(encoding="utf-8")
 
 
 def test_generated_commands_require_markdown_outputs_and_fix_nested_links(

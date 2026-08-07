@@ -440,6 +440,7 @@ def test_empty_directory_deadline_is_checked_after_enumeration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from repolocus.scanner import budget as scanner_budget
     from repolocus.scanner import repository as scanner_repository
 
     now = [0.0]
@@ -457,7 +458,7 @@ def test_empty_directory_deadline_is_checked_after_enumeration(
             now[0] = 2.0
             return result
 
-    monkeypatch.setattr(scanner_repository, "monotonic", lambda: now[0])
+    monkeypatch.setattr(scanner_budget, "monotonic", lambda: now[0])
     monkeypatch.setattr(scanner_repository.os, "scandir", TimedScandir)
 
     result = RepositoryScanner(max_scan_seconds=1).scan(tmp_path)
@@ -479,6 +480,8 @@ def test_directory_rollback_preserves_a_global_budget_diagnostic(
 
     class ChangeAfterSecondParse:
         languages = frozenset({"python"})
+        cache_key = "test-change-after-parse:v1"
+        priority = 0
 
         def __init__(self) -> None:
             self.calls = 0
@@ -764,6 +767,8 @@ def test_invalid_gitignore_fails_closed_without_scanning_siblings(tmp_path: Path
 def test_parse_plugin_failure_isolated_to_one_file(tmp_path: Path) -> None:
     class BrokenParser:
         languages = frozenset({"python"})
+        cache_key = "test-broken:v1"
+        priority = 0
 
         def parse(self, *args: object, **kwargs: object) -> ParseResult:
             raise RuntimeError("repository content must not escape through errors")
@@ -783,6 +788,8 @@ def test_parse_plugin_failure_isolated_to_one_file(tmp_path: Path) -> None:
 def test_parser_cannot_fabricate_source_ranges_or_content(tmp_path: Path) -> None:
     class FabricatingParser:
         languages = frozenset({"python"})
+        cache_key = "test-fabricating:v1"
+        priority = 0
 
         def parse(self, *args: object, **kwargs: object) -> ParseResult:
             return ParseResult(chunks=(Chunk("one.py", 99, 100, "fabricated", "python"),))
@@ -800,6 +807,8 @@ def test_parser_cannot_fabricate_source_ranges_or_content(tmp_path: Path) -> Non
 def test_unchanged_files_reuse_versioned_parser_results(tmp_path: Path) -> None:
     class CountingParser:
         languages = frozenset({"python"})
+        cache_key = "test-counting:v1"
+        priority = 0
 
         def __init__(self) -> None:
             self.calls = 0
@@ -925,11 +934,11 @@ def test_scan_wall_clock_deadline_marks_the_repository_incomplete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from repolocus.scanner import repository as scanner_repository
+    from repolocus.scanner import budget as scanner_budget
 
     _write(tmp_path, "one.py", "VALUE = 1\n")
     readings = iter((10.0, 12.0))
-    monkeypatch.setattr(scanner_repository, "monotonic", lambda: next(readings))
+    monkeypatch.setattr(scanner_budget, "monotonic", lambda: next(readings))
 
     result = RepositoryScanner(max_scan_seconds=1).scan(tmp_path)
 
@@ -941,6 +950,8 @@ def test_scan_wall_clock_deadline_marks_the_repository_incomplete(
 def test_stale_cached_file_is_never_reused(tmp_path: Path) -> None:
     class CountingParser:
         languages = frozenset({"python"})
+        cache_key = "test-counting-stale:v1"
+        priority = 0
 
         def __init__(self) -> None:
             self.calls = 0

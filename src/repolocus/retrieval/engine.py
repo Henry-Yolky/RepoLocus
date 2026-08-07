@@ -37,6 +37,10 @@ class RetrievalEngine:
 
         if limit <= 0 or not isinstance(query, str) or not query.strip():
             return []
+        with self._index.consistent_read() as generation:
+            return self._search_snapshot(query, limit, generation)
+
+    def _search_snapshot(self, query: str, limit: int, generation: int) -> list[Evidence]:
         candidate_limit = min(max(limit * 8, 32), 500)
         fts_hits = self._index.search_chunks(
             query,
@@ -106,6 +110,7 @@ class RetrievalEngine:
                 score=round(candidate.score, 6),
                 symbol=candidate.chunk.symbol,
                 reason="; ".join(sorted(candidate.reasons)),
+                generation=generation,
             )
             for candidate in ranked
         ]

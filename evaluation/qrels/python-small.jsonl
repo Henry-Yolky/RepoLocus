@@ -1,0 +1,3 @@
+{"question":"Where is load_settings defined?","language":"en","query_type":"definition","answerable":true,"relevant":[{"path":"src/config.py","start":1,"end":3,"grade":3}],"must_not_return":["tests/fixture_fake_config.py"]}
+{"question":"Where is the build_application entry point?","language":"en","query_type":"exact_symbol","answerable":true,"relevant":[{"path":"src/app.py","start":4,"end":5,"grade":3}],"must_not_return":[]}
+{"question":"Where is the Erlang OTP supervisor configured in python-small?","language":"en","query_type":"hard_negative","answerable":false,"relevant":[],"must_not_return":[]}

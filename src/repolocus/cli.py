@@ -12,8 +12,8 @@ import sqlite3
 import sys
 import tempfile
 from collections.abc import Iterable
-from dataclasses import asdict
-from pathlib import Path
+from dataclasses import asdict, replace
+from pathlib import Path, PurePosixPath
 from typing import Annotated
 
 import httpx
@@ -26,12 +26,12 @@ from rich.text import Text
 from repolocus import __version__
 from repolocus.config import Settings
 from repolocus.core import PrivacyRequiredError, RepoLocusService
-from repolocus.index import cache_root, index_path_for
+from repolocus.index import RepositoryIndex, cache_root, index_path_for
 from repolocus.models import Evidence
-from repolocus.scanner import is_generated_document
 from repolocus.security import (
     CloudSendPreview,
     PrivacyStore,
+    atomic_write_within_root,
     ensure_within_root,
     escape_untrusted_display,
     is_loopback_url,
@@ -107,8 +107,22 @@ def _settings(root: Path) -> Settings:
     return Settings.load(root)
 
 
-def _service(root: Path) -> RepoLocusService:
-    return RepoLocusService(_settings(root))
+def _service(
+    root: Path,
+    *,
+    proxy_mode: str | None = None,
+    proxy_url: str | None = None,
+) -> RepoLocusService:
+    settings = _settings(root)
+    if proxy_url is not None and proxy_mode is None:
+        proxy_mode = "explicit"
+    if proxy_mode is not None or proxy_url is not None:
+        settings = replace(
+            settings,
+            proxy_mode=proxy_mode or settings.proxy_mode,
+            proxy_url=proxy_url if proxy_url is not None else settings.proxy_url,
+        )
+    return RepoLocusService(settings)
 
 
 def _index_cache_permission_status(path: Path, platform_name: str) -> tuple[bool, str, bool]:
@@ -144,32 +158,26 @@ def _require_markdown_output(requested: Path) -> None:
 def _generated_file(root: Path, requested: Path, content: str, force: bool) -> Path:
     _require_markdown_output(requested)
     requested_destination = requested if requested.is_absolute() else root / requested
-    if requested_destination.is_symlink():
-        raise ValueError(f"refusing to replace symlink output: {requested_destination}")
     destination = ensure_within_root(root, requested_destination)
-    if destination.exists():
-        if destination.is_symlink() or not destination.is_file():
-            raise ValueError(f"refusing to replace non-regular output: {destination}")
-        with destination.open("r", encoding="utf-8", errors="replace") as handle:
-            prior = handle.read(4096)
-        generated = is_generated_document(prior)
-        if not (force or generated):
-            raise ValueError(
-                f"output already exists and is not recognized as generated: {destination}; "
-                "pass --force to replace it"
-            )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    relative = PurePosixPath(destination.relative_to(root).as_posix())
+    result = atomic_write_within_root(
+        root,
+        relative,
+        content.encode("utf-8"),
+        replace_generated_only=not force,
     )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        Path(temporary_name).replace(destination)
-    finally:
-        Path(temporary_name).unlink(missing_ok=True)
+    if result.recovery_path is not None:
+        try:
+            recovery_display = result.recovery_path.relative_to(root).as_posix()
+        except ValueError:  # pragma: no cover - writer only returns repository paths
+            recovery_display = str(result.recovery_path)
+        error_console.print(
+            "Warning: previous output preserved at "
+            f"{escape_untrusted_display(recovery_display)}. Remove it manually only "
+            "while repository writers are quiescent.",
+            markup=False,
+            highlight=False,
+        )
     return destination
 
 
@@ -237,11 +245,15 @@ def scan(
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit machine-readable JSON.")
     ] = False,
+    refresh: Annotated[
+        str,
+        typer.Option("--refresh", help="Index refresh mode: auto, always, or rebuild."),
+    ] = "auto",
 ) -> None:
     """Securely scan a repository and incrementally update its local index."""
 
     try:
-        operation = _service(path).scan(path)
+        operation = _service(path).scan(path, refresh=refresh)  # type: ignore[arg-type]
     except (OSError, ValueError, RuntimeError) as exc:
         _fail(exc)
     if json_output:
@@ -257,6 +269,8 @@ def scan(
     table.add_row(
         "Unchanged / removed", f"{operation.update.unchanged} / {operation.update.removed}"
     )
+    table.add_row("Content generation", str(operation.update.content_generation))
+    table.add_row("Scan revision", str(operation.update.scan_revision))
     table.add_row("Index", Text(escape_untrusted_display(str(operation.index_path))))
     console.print(table)
     if stats.skipped:
@@ -267,6 +281,54 @@ def scan(
             markup=False,
             highlight=False,
         )
+
+
+@app.command()
+def status(
+    path: RepoArgument = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show the retrieval-visible generation and diagnostic scan revision."""
+
+    try:
+        root = path.resolve(strict=True)
+        database = index_path_for(root)
+        if not database.is_file() or database.is_symlink():
+            raise ValueError("no RepoLocus index exists for this repository")
+        with RepositoryIndex.open(root) as index:
+            snapshot = index.manifest_snapshot()
+            data = {
+                "repository": str(root),
+                "index_path": str(index.db_path),
+                "content_generation": snapshot.content_generation,
+                "scan_revision": snapshot.scan_revision,
+                "generation": snapshot.content_generation,
+                "content_generation_detail": ("changes only when retrieval-visible facts change"),
+                "scan_revision_detail": ("changes when a non-cache-hit scan or rebuild completes"),
+                "fingerprints": (
+                    snapshot.fingerprints.metadata() if snapshot.fingerprints is not None else {}
+                ),
+            }
+    except (OSError, ValueError, RuntimeError) as exc:
+        _fail(exc)
+    if json_output:
+        _json(data)
+        return
+    table = Table(title="RepoLocus index status")
+    table.add_column("Revision")
+    table.add_column("Value", justify="right")
+    table.add_column("Meaning")
+    table.add_row(
+        "Content generation",
+        str(data["content_generation"]),
+        str(data["content_generation_detail"]),
+    )
+    table.add_row(
+        "Scan revision",
+        str(data["scan_revision"]),
+        str(data["scan_revision_detail"]),
+    )
+    console.print(table)
 
 
 @app.command("map")
@@ -283,7 +345,7 @@ def map_command(
     ] = False,
     refresh: Annotated[
         str,
-        typer.Option("--refresh", help="Index refresh mode: auto, always, or never."),
+        typer.Option("--refresh", help="Index refresh mode: auto, always, never, or rebuild."),
     ] = "auto",
 ) -> None:
     """Generate a stable, source-linked PROJECT_MAP.md."""
@@ -323,7 +385,7 @@ def diagram(
     ] = False,
     refresh: Annotated[
         str,
-        typer.Option("--refresh", help="Index refresh mode: auto, always, or never."),
+        typer.Option("--refresh", help="Index refresh mode: auto, always, never, or rebuild."),
     ] = "auto",
 ) -> None:
     """Generate a deterministic, validated Mermaid architecture graph."""
@@ -377,26 +439,36 @@ def ask(
     ] = False,
     refresh: Annotated[
         str,
-        typer.Option("--refresh", help="Index refresh mode: auto, always, or never."),
+        typer.Option("--refresh", help="Index refresh mode: auto, always, never, or rebuild."),
     ] = "auto",
+    proxy_mode: Annotated[
+        str | None,
+        typer.Option("--proxy-mode", help="HTTP proxy policy: disabled, environment, or explicit."),
+    ] = None,
+    proxy_url: Annotated[
+        str | None,
+        typer.Option("--proxy-url", help="Explicit HTTP(S) proxy URL; credentials stay hidden."),
+    ] = None,
 ) -> None:
     """Answer with retrieved, line-addressable source evidence."""
 
     if follow_up and json_output:
         _fail(ValueError("--follow-up cannot be combined with --json"))
     try:
-        service = _service(path)
+        service = _service(path, proxy_mode=proxy_mode, proxy_url=proxy_url)
 
         def show_preview(
             send_preview: CloudSendPreview,
             fragments: tuple[Evidence, ...],
         ) -> None:
             if send_preview.provider not in {"local", "ollama"}:
+                transport_text = json.dumps(dict(send_preview.transport), sort_keys=True)
                 error_console.print(
                     "Cloud send preview: "
                     f"provider={escape_untrusted_display(send_preview.provider)}, "
                     f"model={escape_untrusted_display(send_preview.model)}, "
                     f"endpoint={escape_untrusted_display(send_preview.endpoint or 'none')}, "
+                    f"transport={escape_untrusted_display(transport_text)}, "
                     f"fragments={send_preview.fragment_count}, "
                     f"estimated_tokens={send_preview.estimated_tokens}, "
                     f"payload_bytes={send_preview.payload_bytes}",
@@ -421,10 +493,12 @@ def ask(
             _json({"error": "cloud_consent_required", "preview": payload})
             raise typer.Exit(2) from None
         error_console.print("[yellow]Cloud send preview[/yellow]")
+        transport_text = json.dumps(payload["transport"], sort_keys=True)
         error_console.print(
             f"Provider: {escape_untrusted_display(str(payload['provider']))}; "
             f"model: {escape_untrusted_display(str(payload['model']))}; "
             f"endpoint: {escape_untrusted_display(str(payload['endpoint']))}; "
+            f"transport: {escape_untrusted_display(transport_text)}; "
             f"fragments: {payload['fragment_count']}; "
             f"estimated tokens: {payload['estimated_tokens']}; "
             f"payload bytes: {payload['payload_bytes']}; "
@@ -540,11 +614,19 @@ def privacy_preview(
     model: Annotated[str | None, typer.Option("--model")] = None,
     limit: Annotated[int, typer.Option("--limit", min=1, max=20)] = 8,
     json_output: Annotated[bool, typer.Option("--json")] = False,
+    proxy_mode: Annotated[
+        str | None, typer.Option("--proxy-mode", help="disabled, environment, or explicit")
+    ] = None,
+    proxy_url: Annotated[str | None, typer.Option("--proxy-url")] = None,
 ) -> None:
     """Preview source fragments selected for a model request without sending them."""
 
     try:
-        preview_data, evidence, _ = _service(path).preview(question, path, model=model, limit=limit)
+        preview_data, evidence, _ = _service(
+            path,
+            proxy_mode=proxy_mode,
+            proxy_url=proxy_url,
+        ).preview(question, path, model=model, limit=limit)
         data = preview_data.to_dict() | {"fragments": _preview_fragments(evidence)}
     except (OSError, ValueError, RuntimeError) as exc:
         _fail(exc)
@@ -558,7 +640,8 @@ def privacy_preview(
     )
     console.print(
         f"Model: {escape_untrusted_display(str(data['model']))}; "
-        f"endpoint: {escape_untrusted_display(str(data['endpoint']))}"
+        f"endpoint: {escape_untrusted_display(str(data['endpoint']))}; "
+        f"transport: {escape_untrusted_display(json.dumps(data['transport'], sort_keys=True))}"
     )
     console.print(
         f"Fragments: {data['fragment_count']}; estimated tokens: {data['estimated_tokens']}; "
@@ -573,6 +656,10 @@ def privacy_preview(
 def privacy_grant(
     provider: Annotated[str, typer.Argument(help="Cloud provider family, e.g. openai.")],
     path: RepoArgument = Path("."),
+    proxy_mode: Annotated[
+        str | None, typer.Option("--proxy-mode", help="disabled, environment, or explicit")
+    ] = None,
+    proxy_url: Annotated[str | None, typer.Option("--proxy-url")] = None,
 ) -> None:
     """Remember an explicit cloud-provider grant for this repository."""
 
@@ -585,10 +672,17 @@ def privacy_grant(
             consent_model = selected_provider
         else:
             consent_model = f"{selected_provider}/consent"
-        service = _service(root)
+        service = _service(root, proxy_mode=proxy_mode, proxy_url=proxy_url)
         scope = service.consent_scope(consent_model)
         endpoint = service.consent_endpoint(consent_model)
-        PrivacyStore().grant(root, scope, endpoint)
+        transport = service.consent_transport(consent_model)
+        PrivacyStore().grant(
+            root,
+            scope,
+            endpoint,
+            transport_identity=transport.identity if transport is not None else None,
+            transport=transport.preview() if transport is not None else None,
+        )
     except (OSError, ValueError, RuntimeError) as exc:
         _fail(exc)
     console.print(

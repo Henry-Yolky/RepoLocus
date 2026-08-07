@@ -40,11 +40,19 @@ def _unique_paths(evidence: Iterable[EvidenceLike]) -> list[str]:
     return paths
 
 
-def _ndcg(returned: Sequence[str], expected: set[str], cutoff: int) -> float:
-    if not expected:
+def _ndcg(returned: Sequence[str], expected: set[str] | Mapping[str, int], cutoff: int) -> float:
+    grades = {path: 1 for path in expected} if isinstance(expected, set) else dict(expected)
+    if not grades:
         return 1.0 if not returned else 0.0
-    dcg = sum(1.0 / math.log2(rank + 2) for rank, path in enumerate(returned) if path in expected)
-    ideal = sum(1.0 / math.log2(rank + 2) for rank in range(min(len(expected), cutoff)))
+    dcg = sum(
+        (2 ** grades[path] - 1) / math.log2(rank + 2)
+        for rank, path in enumerate(returned)
+        if path in grades
+    )
+    ideal = sum(
+        (2**grade - 1) / math.log2(rank + 2)
+        for rank, grade in enumerate(sorted(grades.values(), reverse=True)[:cutoff])
+    )
     return dcg / ideal if ideal else 0.0
 
 
@@ -91,6 +99,8 @@ def evaluate_cases(
     outcomes: list[dict[str, object]] = []
     language_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
     language_case_counts: dict[str, int] = defaultdict(int)
+    repository_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
+    repository_case_counts: dict[str, int] = defaultdict(int)
     query_type_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
     query_type_case_counts: dict[str, int] = defaultdict(int)
     no_answer_true_positive = 0
@@ -98,28 +108,76 @@ def evaluate_cases(
     no_answer_false_negative = 0
     no_answer_true_negative = 0
     citation_scores: list[float] = []
+    must_not_return_cases = 0
+    must_not_return_violations = 0
     for case in cases:
         question = str(case["question"])
-        raw_expected = case.get("expected_paths", [])
+        relevant = case.get("relevant")
+        grades: dict[str, int] = {}
+        derived_citations: list[str] = []
+        if relevant is not None:
+            if not isinstance(relevant, list):
+                raise ValueError("relevant must be a JSON list")
+            raw_expected = []
+            for item in relevant:
+                if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
+                    raise ValueError("each relevant item must contain a path")
+                path = str(item["path"])
+                grade = item.get("grade", 1)
+                if isinstance(grade, bool) or not isinstance(grade, int) or not 1 <= grade <= 3:
+                    raise ValueError("relevance grade must be an integer from 1 to 3")
+                grades[path] = max(grades.get(path, 0), grade)
+                raw_expected.append(path)
+                start = item.get("start")
+                end = item.get("end", start)
+                if start is not None:
+                    if (
+                        isinstance(start, bool)
+                        or isinstance(end, bool)
+                        or not isinstance(start, int)
+                        or not isinstance(end, int)
+                        or not 1 <= start <= end
+                    ):
+                        raise ValueError("relevant citation ranges must be positive and ordered")
+                    suffix = f"-{end}" if end != start else ""
+                    derived_citations.append(f"{path}:{start}{suffix}")
+        else:
+            raw_expected = case.get("expected_paths", [])
         if not isinstance(raw_expected, list):
             raise ValueError("expected_paths must be a JSON list")
         expected = {str(path) for path in raw_expected}
+        if not grades:
+            grades = {path: 1 for path in expected}
+        explicit_answerable = case.get("answerable", bool(expected))
+        if not isinstance(explicit_answerable, bool):
+            raise ValueError("answerable must be true or false")
+        if explicit_answerable != bool(expected):
+            raise ValueError("answerable must agree with the presence of relevant paths")
         evidence = retrieval.search(question, limit=limit)
         returned = _unique_paths(evidence)
-        answerable = bool(expected)
+        answerable = explicit_answerable
         predicted_no_answer = not returned
         relevant_ranks = [rank for rank, path in enumerate(returned, 1) if path in expected]
         recall = len(expected.intersection(returned)) / len(expected) if answerable else None
         reciprocal_rank = (
             (1.0 / relevant_ranks[0] if relevant_ranks else 0.0) if answerable else None
         )
-        ndcg = _ndcg(returned, expected, limit) if answerable else None
-        expected_citations = case.get("expected_citations", [])
+        ndcg = _ndcg(returned, grades, limit) if answerable else None
+        expected_citations = case.get("expected_citations", derived_citations)
         if not isinstance(expected_citations, list):
             raise ValueError("expected_citations must be a JSON list")
         citation_recall = _citation_recall(evidence, [str(item) for item in expected_citations])
         if citation_recall is not None:
             citation_scores.append(citation_recall)
+        raw_must_not_return = case.get("must_not_return", [])
+        if not isinstance(raw_must_not_return, list):
+            raise ValueError("must_not_return must be a JSON list")
+        forbidden = {str(path) for path in raw_must_not_return}
+        forbidden_returned = sorted(forbidden.intersection(returned))
+        if forbidden:
+            must_not_return_cases += 1
+            if forbidden_returned:
+                must_not_return_violations += 1
         if not answerable and predicted_no_answer:
             no_answer_true_positive += 1
         elif answerable and predicted_no_answer:
@@ -130,12 +188,15 @@ def evaluate_cases(
             no_answer_true_negative += 1
         language = str(case.get("language", "unspecified"))
         language_case_counts[language] += 1
+        repository = str(case.get("fixture", "unspecified"))
+        repository_case_counts[repository] += 1
         query_type = str(case.get("query_type", "unspecified"))
         query_type_case_counts[query_type] += 1
         if answerable:
             if recall is None or reciprocal_rank is None or ndcg is None:  # pragma: no cover
                 raise RuntimeError("answerable metric invariant violated")
             language_metrics[language].append((recall, reciprocal_rank, ndcg))
+            repository_metrics[repository].append((recall, reciprocal_rank, ndcg))
             query_type_metrics[query_type].append((recall, reciprocal_rank, ndcg))
         outcomes.append(
             {
@@ -157,6 +218,11 @@ def evaluate_cases(
                 "expected_paths": sorted(expected),
                 "returned_paths": returned,
                 "returned_citations": [str(item.citation) for item in evidence],
+                "must_not_return": sorted(forbidden),
+                "must_not_return_violations": forbidden_returned,
+                "fixture": case.get("fixture"),
+                "fixture_revision": case.get("fixture_revision"),
+                "qrel_line": case.get("qrel_line"),
             }
         )
 
@@ -235,6 +301,14 @@ def evaluate_cases(
         "citation_recall": round(sum(citation_scores) / len(citation_scores), 6)
         if citation_scores
         else None,
+        "citation_cases": len(citation_scores),
+        "must_not_return_cases": must_not_return_cases,
+        "must_not_return_violations": must_not_return_violations,
+        "must_not_return_violation_rate": (
+            round(must_not_return_violations / must_not_return_cases, 6)
+            if must_not_return_cases
+            else 0.0
+        ),
         "no_answer_precision": (
             round(no_answer_precision, 6) if no_answer_precision is not None else None
         ),
@@ -246,6 +320,7 @@ def evaluate_cases(
         if outcomes
         else None,
         "by_language": bucket_summary(language_case_counts, language_metrics),
+        "by_repository": bucket_summary(repository_case_counts, repository_metrics),
         "by_query_type": bucket_summary(query_type_case_counts, query_type_metrics),
     }
     return outcomes, metrics
@@ -259,6 +334,8 @@ def main() -> int:
     parser.add_argument("--minimum-hit-rate", type=float, default=0.9)
     parser.add_argument("--minimum-macro-recall", type=float, default=0.0)
     parser.add_argument("--minimum-mrr", type=float, default=0.0)
+    parser.add_argument("--minimum-no-answer-f1", type=float, default=0.0)
+    parser.add_argument("--maximum-must-not-return-rate", type=float, default=0.0)
     arguments = parser.parse_args()
 
     questions = json.loads(arguments.questions.read_text(encoding="utf-8"))
@@ -288,6 +365,9 @@ def main() -> int:
         hit_rate >= arguments.minimum_hit_rate
         and float(metrics["macro_recall_at_k"]) >= arguments.minimum_macro_recall
         and float(metrics["mrr"]) >= arguments.minimum_mrr
+        and float(metrics["no_answer_f1"] or 0.0) >= arguments.minimum_no_answer_f1
+        and float(metrics["must_not_return_violation_rate"])
+        <= arguments.maximum_must_not_return_rate
     )
     return 0 if passed_thresholds else 1
 

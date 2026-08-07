@@ -22,6 +22,7 @@ from .base import (
     ProviderRequestError,
     ProviderResponseError,
 )
+from .transport import ProviderTransport, direct_transport
 
 _MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -192,6 +193,7 @@ class _HTTPProvider(ModelProvider):
         base_url: str,
         timeout: float,
         transport: httpx.BaseTransport | None = None,
+        transport_route: ProviderTransport | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ProviderConfigurationError("model name must not be empty")
@@ -206,6 +208,9 @@ class _HTTPProvider(ModelProvider):
         self.base_url = _normalise_base_url(base_url)
         self.timeout = float(timeout)
         self._transport = transport
+        self.transport_route = transport_route or direct_transport()
+        if is_loopback_url(self.base_url) and self.transport_route.mode != "direct":
+            raise ProviderConfigurationError("loopback providers must use a direct transport")
 
     def _post_json(
         self,
@@ -217,12 +222,17 @@ class _HTTPProvider(ModelProvider):
         _validate_outbound_body(body)
         deadline = monotonic() + self.timeout
         try:
+            client_options: dict[str, object] = {
+                "timeout": httpx.Timeout(self.timeout),
+                "transport": self._transport,
+                "trust_env": False,
+            }
+            # An injected transport is already the complete test/embedding route;
+            # combining it with HTTPX's proxy mounts would silently replace it.
+            if self.transport_route.proxy_url is not None and self._transport is None:
+                client_options["proxy"] = self.transport_route.proxy_url
             with (
-                httpx.Client(
-                    timeout=httpx.Timeout(self.timeout),
-                    transport=self._transport,
-                    trust_env=not is_loopback_url(self.base_url),
-                ) as client,
+                httpx.Client(**client_options) as client,
                 client.stream("POST", endpoint, headers=headers, content=body) as response,
             ):
                 if monotonic() > deadline:
@@ -292,8 +302,15 @@ class OllamaProvider(_HTTPProvider):
         base_url: str = "http://127.0.0.1:11434",
         timeout: float = 30.0,
         transport: httpx.BaseTransport | None = None,
+        transport_route: ProviderTransport | None = None,
     ) -> None:
-        super().__init__(model=model, base_url=base_url, timeout=timeout, transport=transport)
+        super().__init__(
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+            transport=transport,
+            transport_route=transport_route,
+        )
         self.is_local = is_loopback_url(self.base_url)
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
@@ -341,8 +358,15 @@ class OpenAICompatibleProvider(_HTTPProvider):
         max_output_tokens: int = 2048,
         environ: Mapping[str, str] | None = None,
         transport: httpx.BaseTransport | None = None,
+        transport_route: ProviderTransport | None = None,
     ) -> None:
-        super().__init__(model=model, base_url=base_url, timeout=timeout, transport=transport)
+        super().__init__(
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+            transport=transport,
+            transport_route=transport_route,
+        )
         env = os.environ if environ is None else environ
         api_key = env.get("OPENAI_API_KEY", "").strip()
         if not api_key:
@@ -411,8 +435,15 @@ class AnthropicProvider(_HTTPProvider):
         max_output_tokens: int = 2048,
         environ: Mapping[str, str] | None = None,
         transport: httpx.BaseTransport | None = None,
+        transport_route: ProviderTransport | None = None,
     ) -> None:
-        super().__init__(model=model, base_url=base_url, timeout=timeout, transport=transport)
+        super().__init__(
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+            transport=transport,
+            transport_route=transport_route,
+        )
         env = os.environ if environ is None else environ
         api_key = env.get("ANTHROPIC_API_KEY", "").strip()
         if not api_key:

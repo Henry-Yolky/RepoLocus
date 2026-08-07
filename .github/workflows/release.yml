@@ -11,14 +11,18 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.12"
           enable-cache: true
@@ -55,6 +59,19 @@ jobs:
           uv run ruff check .
           uv run pytest
           uv run repolocus doctor --security --json
+      - name: Run fixed multi-repository retrieval release gate
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p release-assets
+          uv run python scripts/evaluate_external_repositories.py evaluation \
+            --minimum-hit-rate 0.90 \
+            --minimum-macro-recall 0.80 \
+            --minimum-mrr 0.75 \
+            --minimum-citation-recall 1.0 \
+            --minimum-no-answer-f1 0.80 \
+            --maximum-must-not-return-rate 0.0 \
+            --output "release-assets/repolocus-${PROJECT_VERSION}.external-evaluation.json"
       - name: Build and check Python distributions
         run: |
           mkdir -p release-assets
@@ -79,15 +96,56 @@ jobs:
         run: |
           cd release-assets
           LC_ALL=C sha256sum * > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - name: Attest every release asset
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-assets
           path: release-assets/*
           if-no-files-found: error
           retention-days: 14
 
-  publish-pypi:
+  verify-provenance:
     needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+          path: release-assets
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          python-version: "3.14"
+          enable-cache: false
+          version: "0.9.18"
+      - name: Verify checksums and GitHub attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release-assets
+          sha256sum -c SHA256SUMS
+          for asset in *; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Install the wheel and run the security doctor in a clean environment
+        env:
+          PROJECT_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          uv venv --python 3.14 /tmp/repolocus-release-verify
+          wheel="$(find release-assets -maxdepth 1 -name 'repolocus-*.whl' -print -quit)"
+          test -n "$wheel"
+          uv pip install --python /tmp/repolocus-release-verify/bin/python "${wheel}[api]"
+          runtime_version="$(/tmp/repolocus-release-verify/bin/repolocus --version)"
+          test "$runtime_version" = "RepoLocus $PROJECT_VERSION"
+          /tmp/repolocus-release-verify/bin/repolocus doctor --security --json
+
+  publish-pypi:
+    needs: [build, verify-provenance]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -95,7 +153,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-assets
           path: release-assets
@@ -103,17 +161,17 @@ jobs:
         run: |
           mkdir -p dist
           cp release-assets/*.whl release-assets/*.tar.gz dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/
 
   publish-github-release:
-    needs: [build, publish-pypi]
+    needs: [build, verify-provenance, publish-pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-assets
           path: release-assets

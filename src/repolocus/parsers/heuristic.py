@@ -573,6 +573,8 @@ class HeuristicParser:
     languages = frozenset(
         {"javascript", "typescript", "go", "rust", "java", "c", "cpp", "markdown", "config"}
     )
+    cache_key = "heuristic-multilang:v3"
+    priority = 10
 
     def parse(
         self,

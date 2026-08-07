@@ -11,9 +11,10 @@ import tempfile
 import threading
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -22,7 +23,8 @@ from .redaction import redact_secrets_with_count
 
 _STATE_LOCKS_GUARD = threading.Lock()
 _STATE_LOCKS: dict[str, threading.RLock] = {}
-_STATE_VERSION = 3
+_WINDOWS_OVERLAPPED: dict[int, object] = {}
+_STATE_VERSION = 4
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
@@ -172,13 +174,28 @@ class PrivacyStore:
         providers = entry.get("providers", {})
         if not isinstance(providers, dict):
             raise PrivacyStoreError("privacy state contains an invalid providers table")
-        return {
-            str(provider): tuple(sorted(str(endpoint) for endpoint in endpoints))
-            for provider, endpoints in sorted(providers.items())
-            if isinstance(endpoints, dict) and endpoints
-        }
+        details: dict[str, tuple[str, ...]] = {}
+        for provider, grants in sorted(providers.items()):
+            if not isinstance(grants, dict) or not grants:
+                continue
+            endpoints = {
+                str(grant.get("endpoint"))
+                for grant in grants.values()
+                if isinstance(grant, dict) and isinstance(grant.get("endpoint"), str)
+            }
+            if endpoints:
+                details[str(provider)] = tuple(sorted(endpoints))
+        return details
 
-    def grant(self, root: Path | str, provider: str, endpoint: str | None = None) -> None:
+    def grant(
+        self,
+        root: Path | str,
+        provider: str,
+        endpoint: str | None = None,
+        *,
+        transport_identity: str | None = None,
+        transport: Mapping[str, str] | None = None,
+    ) -> None:
         """Remember consent for one provider endpoint and repository."""
 
         family = provider_family(provider)
@@ -187,6 +204,12 @@ class PrivacyStore:
         if endpoint is None:
             raise PrivacyStoreError("a canonical endpoint is required for remembered cloud consent")
         endpoint_identity = canonical_endpoint(endpoint)
+        if transport_identity is not None and transport is None:
+            raise PrivacyStoreError(
+                "transport details are required for a non-default consent route"
+            )
+        route_identity = _validated_transport_identity(transport_identity)
+        route_display = _normalized_transport_display(transport)
         root_path, identity = self._repository_context(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
@@ -198,10 +221,16 @@ class PrivacyStore:
             repository["path"] = str(root_path)
             repository["identity"] = identity
             providers = repository.setdefault("providers", {})
-            endpoints = providers.setdefault(family, {})
-            if not isinstance(endpoints, dict):
+            grants = providers.setdefault(family, {})
+            if not isinstance(grants, dict):
                 raise PrivacyStoreError("privacy state contains an invalid endpoint grants table")
-            endpoints[endpoint_identity] = {"granted_at": datetime.now(timezone.utc).isoformat()}
+            grant_id = _grant_id(endpoint_identity, route_identity)
+            grants[grant_id] = {
+                "endpoint": endpoint_identity,
+                "transport_identity": route_identity,
+                "transport": route_display,
+                "granted_at": datetime.now(timezone.utc).isoformat(),
+            }
             _require_same_repository_identity(root_path, identity)
             self._write(state)
 
@@ -232,6 +261,8 @@ class PrivacyStore:
         root: Path | str,
         provider: str,
         endpoint: str | None = None,
+        *,
+        transport_identity: str | None = None,
     ) -> bool:
         """Return whether local use or remembered cloud consent permits use."""
 
@@ -241,6 +272,7 @@ class PrivacyStore:
         if endpoint is None:
             return False
         endpoint_identity = canonical_endpoint(endpoint)
+        route_identity = _validated_transport_identity(transport_identity)
         root_path, identity = self._repository_context(root)
         self._ensure_outside_repository(root_path)
         with self._locked_state():
@@ -252,10 +284,10 @@ class PrivacyStore:
         providers = entry.get("providers", {})
         if not isinstance(providers, dict):
             raise PrivacyStoreError("privacy state contains an invalid providers table")
-        endpoints = providers.get(family, {})
-        if not isinstance(endpoints, dict):
+        grants = providers.get(family, {})
+        if not isinstance(grants, dict):
             raise PrivacyStoreError("privacy state contains an invalid endpoint grants table")
-        return endpoint_identity in endpoints
+        return _grant_id(endpoint_identity, route_identity) in grants
 
     @staticmethod
     def _repository_context(root: Path | str) -> tuple[Path, dict[str, object]]:
@@ -288,7 +320,7 @@ class PrivacyStore:
 
     @contextmanager
     def _locked_state(self):  # type: ignore[no-untyped-def]
-        """Serialize read-modify-write cycles across threads and POSIX processes."""
+        """Serialize read-modify-write cycles across threads and processes."""
 
         lock_key = str(self.path.expanduser().resolve(strict=False))
         with _STATE_LOCKS_GUARD:
@@ -298,22 +330,20 @@ class PrivacyStore:
             try:
                 lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                with suppress(OSError):
+                    os.chmod(lock_path, 0o600)
             except OSError as exc:
                 raise PrivacyStoreError(
                     f"cannot open privacy state lock {lock_path}: {exc}"
                 ) from exc
             try:
-                if os.name != "nt":
-                    import fcntl
-
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                _lock_file_descriptor(descriptor)
                 yield
             finally:
-                if os.name != "nt":
-                    import fcntl
-
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
+                try:
+                    _unlock_file_descriptor(descriptor)
+                finally:
+                    os.close(descriptor)
 
     def _read(self) -> dict[str, Any]:
         path = self.path.expanduser()
@@ -323,7 +353,12 @@ class PrivacyStore:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PrivacyStoreError(f"cannot read privacy state {path}: {exc}") from exc
-        if not isinstance(data, dict) or data.get("version") not in {1, 2, _STATE_VERSION}:
+        if not isinstance(data, dict) or data.get("version") not in {
+            1,
+            2,
+            3,
+            _STATE_VERSION,
+        }:
             raise PrivacyStoreError("privacy state has an unsupported format")
         repositories = data.get("repositories")
         if not isinstance(repositories, dict):
@@ -334,7 +369,7 @@ class PrivacyStore:
             providers = repository.get("providers", {})
             if not isinstance(providers, dict):
                 raise PrivacyStoreError("privacy state contains an invalid providers table")
-        if data.get("version") in {1, 2}:
+        if data.get("version") in {1, 2, 3}:
             # Older grants were bound only to a path (and v1 only to a provider
             # family). They cannot be safely attached to the repository object
             # currently occupying that path, so migration deliberately drops them.
@@ -345,13 +380,18 @@ class PrivacyStore:
             ):
                 raise PrivacyStoreError("privacy state contains an invalid repository identity")
             providers = repository.get("providers", {})
-            for endpoints in providers.values():
-                if not isinstance(endpoints, dict):
+            for grants in providers.values():
+                if not isinstance(grants, dict):
                     raise PrivacyStoreError(
                         "privacy state contains an invalid endpoint grants table"
                     )
-                for endpoint, grant in endpoints.items():
-                    if not isinstance(endpoint, str) or not isinstance(grant, dict):
+                for grant_id, grant in grants.items():
+                    if not isinstance(grant_id, str) or not isinstance(grant, dict):
+                        raise PrivacyStoreError("privacy state contains an invalid endpoint grant")
+                    endpoint = grant.get("endpoint")
+                    route_identity = grant.get("transport_identity")
+                    transport = grant.get("transport")
+                    if not isinstance(endpoint, str) or not isinstance(route_identity, str):
                         raise PrivacyStoreError("privacy state contains an invalid endpoint grant")
                     try:
                         canonical = canonical_endpoint(endpoint)
@@ -363,6 +403,15 @@ class PrivacyStore:
                         raise PrivacyStoreError(
                             "privacy state contains a non-canonical endpoint identity"
                         )
+                    try:
+                        validated_route = _validated_transport_identity(route_identity)
+                        _normalized_transport_display(transport)
+                    except (TypeError, ValueError) as exc:
+                        raise PrivacyStoreError(
+                            "privacy state contains an invalid transport route"
+                        ) from exc
+                    if grant_id != _grant_id(endpoint, validated_route):
+                        raise PrivacyStoreError("privacy state contains an invalid grant identity")
         return data
 
     def _write(self, state: Mapping[str, Any]) -> None:
@@ -394,6 +443,96 @@ class PrivacyStore:
 
 def _is_reparse_point(metadata: os.stat_result) -> bool:
     return bool(getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _lock_file_descriptor(descriptor: int) -> None:
+    """Acquire an exclusive whole-file lock on POSIX or Windows."""
+
+    if os.name != "nt":
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return
+    _lock_file_descriptor_windows(descriptor)
+
+
+def _lock_file_descriptor_windows(  # pragma: no cover - exercised by Windows CI
+    descriptor: int,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    lock_file_ex = ctypes.windll.kernel32.LockFileEx
+    lock_file_ex.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(Overlapped),
+    ]
+    lock_file_ex.restype = wintypes.BOOL
+    handle = msvcrt.get_osfhandle(descriptor)
+    overlapped = Overlapped()
+    if not lock_file_ex(
+        handle,
+        0x00000002,  # LOCKFILE_EXCLUSIVE_LOCK
+        0,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        ctypes.byref(overlapped),
+    ):
+        raise ctypes.WinError()
+    _WINDOWS_OVERLAPPED[descriptor] = overlapped
+
+
+def _unlock_file_descriptor(descriptor: int) -> None:
+    if os.name != "nt":
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return
+    _unlock_file_descriptor_windows(descriptor)
+
+
+def _unlock_file_descriptor_windows(  # pragma: no cover - exercised by Windows CI
+    descriptor: int,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    overlapped = _WINDOWS_OVERLAPPED.pop(descriptor, None)
+    if overlapped is None:
+        return
+    unlock_file_ex = ctypes.windll.kernel32.UnlockFileEx
+    unlock_file_ex.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    unlock_file_ex.restype = wintypes.BOOL
+    handle = msvcrt.get_osfhandle(descriptor)
+    if not unlock_file_ex(
+        handle,
+        0,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        ctypes.byref(overlapped),
+    ):
+        raise ctypes.WinError()
 
 
 def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
@@ -496,6 +635,73 @@ def _repository_id(root: Path, identity: Mapping[str, object]) -> str:
     return hashlib.sha256(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
+def _default_transport_identity() -> str:
+    payload = json.dumps(
+        {"mode": "direct", "policy": "disabled", "proxy": None},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validated_transport_identity(value: str | None) -> str:
+    identity = _default_transport_identity() if value is None else value
+    if not isinstance(identity, str) or len(identity) != 64:
+        raise ValueError("transport identity must be a SHA-256 digest")
+    try:
+        bytes.fromhex(identity)
+    except ValueError as exc:
+        raise ValueError("transport identity must be a SHA-256 digest") from exc
+    return identity.casefold()
+
+
+def _normalized_transport_display(value: object) -> dict[str, str]:
+    if value is None:
+        return {"mode": "direct", "policy": "disabled"}
+    if not isinstance(value, Mapping):
+        raise TypeError("transport display must be a mapping")
+    mode = value.get("mode")
+    policy = value.get("policy")
+    if mode not in {"direct", "proxy"} or policy not in {
+        "disabled",
+        "environment",
+        "explicit",
+    }:
+        raise ValueError("transport display contains an invalid mode or policy")
+    expected_keys = {"mode", "policy"} if mode == "direct" else {"mode", "policy", "proxy"}
+    if set(value) != expected_keys:
+        raise ValueError("transport display contains unexpected fields")
+    normalized = {"mode": str(mode), "policy": str(policy)}
+    if mode == "proxy":
+        proxy = value.get("proxy")
+        if not isinstance(proxy, str) or not proxy:
+            raise ValueError("proxy transport display is missing its route")
+        parsed = urlsplit(proxy)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("proxy transport display is not credential-free")
+        normalized["proxy"] = proxy.rstrip("/")
+    return normalized
+
+
+def _grant_id(endpoint: str, transport_identity: str) -> str:
+    payload = json.dumps(
+        {"endpoint": endpoint, "transport_identity": transport_identity},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def require_provider_consent(
     root: Path | str,
     provider: str,
@@ -503,10 +709,20 @@ def require_provider_consent(
     *,
     allow_once: bool = False,
     endpoint: str | None = None,
+    transport_identity: str | None = None,
 ) -> None:
     """Enforce cloud consent at the service/CLI boundary."""
 
-    if is_local_provider(provider) or allow_once or store.is_allowed(root, provider, endpoint):
+    if (
+        is_local_provider(provider)
+        or allow_once
+        or store.is_allowed(
+            root,
+            provider,
+            endpoint,
+            transport_identity=transport_identity,
+        )
+    ):
         return
     family = provider_family(provider)
     raise ConsentRequiredError(
@@ -526,6 +742,9 @@ class CloudSendPreview:
     model: str = ""
     endpoint: str | None = None
     payload_bytes: int = 0
+    transport: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({"mode": "direct", "policy": "disabled"})
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider.strip():
@@ -536,6 +755,11 @@ class CloudSendPreview:
             raise ValueError("preview model must be a string")
         if self.endpoint is not None and canonical_endpoint(self.endpoint) != self.endpoint:
             raise ValueError("preview endpoint must be canonical")
+        object.__setattr__(
+            self,
+            "transport",
+            MappingProxyType(_normalized_transport_display(self.transport)),
+        )
         for name in (
             "fragment_count",
             "estimated_tokens",
@@ -563,6 +787,7 @@ class CloudSendPreview:
             "model": self.model,
             "endpoint": self.endpoint,
             "payload_bytes": self.payload_bytes,
+            "transport": dict(self.transport),
         }
 
 

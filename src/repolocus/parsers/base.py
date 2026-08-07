@@ -7,6 +7,7 @@ registered without changing repository traversal or its security policy.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -27,6 +28,8 @@ class SourceParser(Protocol):
     """Protocol implemented by language parser plugins."""
 
     languages: frozenset[str]
+    cache_key: str
+    priority: int
 
     def parse(
         self,
@@ -45,6 +48,7 @@ class ParserRegistry:
 
     def __init__(self) -> None:
         self._parsers: dict[str, SourceParser] = {}
+        self._frozen_manifest: tuple[tuple[str, tuple[str, ...], int], ...] | None = None
 
     def register(self, parser: SourceParser, *, replace: bool = False) -> None:
         """Register *parser* for all of its languages.
@@ -53,13 +57,39 @@ class ParserRegistry:
         never silently change scan results.
         """
 
+        if self._frozen_manifest is not None:
+            raise RuntimeError("a frozen parser registry cannot be modified")
         if not parser.languages:
             raise ValueError("a parser must declare at least one language")
-        collisions = sorted(language for language in parser.languages if language in self._parsers)
+        cache_key = getattr(parser, "cache_key", "")
+        if (
+            not isinstance(cache_key, str)
+            or not cache_key
+            or len(cache_key) > 128
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/-]*", cache_key) is None
+        ):
+            raise ValueError("a parser must declare a stable, bounded cache_key")
+        priority = getattr(parser, "priority", 0)
+        if (
+            isinstance(priority, bool)
+            or not isinstance(priority, int)
+            or not -1000 <= priority <= 1000
+        ):
+            raise ValueError("parser priority must be an integer between -1000 and 1000")
+        languages = frozenset(parser.languages)
+        if any(
+            not isinstance(language, str)
+            or not language
+            or len(language) > 64
+            or re.fullmatch(r"[a-z0-9][a-z0-9_+-]*", language) is None
+            for language in languages
+        ):
+            raise ValueError("parser languages must use bounded normalized identifiers")
+        collisions = sorted(language for language in languages if language in self._parsers)
         if collisions and not replace:
             joined = ", ".join(collisions)
             raise ValueError(f"parser already registered for: {joined}")
-        for language in sorted(parser.languages):
+        for language in sorted(languages):
             self._parsers[language] = parser
 
     def parser_for(self, language: str) -> SourceParser:
@@ -75,6 +105,69 @@ class ParserRegistry:
         """Return registered language names in stable order."""
 
         return tuple(sorted(self._parsers))
+
+    def cache_manifest(self) -> tuple[dict[str, object], ...]:
+        """Return a registration-order-independent parser cache manifest."""
+
+        return tuple(
+            {
+                "cache_key": cache_key,
+                "languages": list(languages),
+                "priority": priority,
+            }
+            for cache_key, languages, priority in self._cache_records()
+        )
+
+    def frozen_copy(self) -> ParserRegistry:
+        """Snapshot parser selection and cache identity for one scanner lifetime."""
+
+        frozen = ParserRegistry()
+        frozen._parsers = dict(self._parsers)
+        frozen._frozen_manifest = self._cache_records()
+        return frozen
+
+    def _cache_records(self) -> tuple[tuple[str, tuple[str, ...], int], ...]:
+        if self._frozen_manifest is not None:
+            return self._frozen_manifest
+        return self._current_cache_records()
+
+    def _current_cache_records(self) -> tuple[tuple[str, tuple[str, ...], int], ...]:
+        grouped: dict[int, tuple[SourceParser, set[str]]] = {}
+        for language, parser in self._parsers.items():
+            key = id(parser)
+            if key not in grouped:
+                grouped[key] = (parser, set())
+            grouped[key][1].add(language)
+        records = [
+            (
+                parser.cache_key,
+                tuple(sorted(languages)),
+                getattr(parser, "priority", 0),
+            )
+            for parser, languages in grouped.values()
+        ]
+        return tuple(
+            sorted(
+                records,
+                key=lambda item: (
+                    item[1],
+                    item[2],
+                    item[0],
+                ),
+            )
+        )
+
+    def require_stable(self) -> None:
+        """Fail closed if a frozen plugin changes its declared cache identity."""
+
+        if self._frozen_manifest is None:
+            return
+        try:
+            current = self._current_cache_records()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError("a frozen parser changed its cache identity") from exc
+        if current != self._frozen_manifest:
+            raise RuntimeError("a frozen parser changed its cache identity")
 
     def parse(
         self,

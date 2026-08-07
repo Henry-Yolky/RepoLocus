@@ -26,7 +26,9 @@ from repolocus.models import (
 )
 from repolocus.providers import (
     ProviderRequestPlan,
+    ProviderTransport,
     build_provider_request_plan,
+    build_provider_transport,
     create_provider,
     provider_family,
 )
@@ -44,7 +46,7 @@ from repolocus.security.evidence_validation import validate_model_text
 
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _SCAN_ATTEMPTS = 3
-RefreshMode = Literal["auto", "always", "never"]
+RefreshMode = Literal["auto", "always", "never", "rebuild"]
 
 
 class PrivacyRequiredError(RuntimeError):
@@ -65,11 +67,13 @@ class ScanOperation:
     index_path: Path
 
     def to_dict(self) -> dict[str, object]:
+        update = asdict(self.update)
+        update["generation"] = self.update.content_generation
         return {
             "root": str(self.result.root),
             "index_path": str(self.index_path),
             "scan": asdict(self.result.stats),
-            "update": asdict(self.update),
+            "update": update,
             "warnings": list(self.result.warnings),
         }
 
@@ -88,6 +92,7 @@ class PreparedAsk:
     system_prompt: str
     user_prompt: str
     request_plan: ProviderRequestPlan | None
+    transport: ProviderTransport | None
     settings: Settings
 
 
@@ -109,6 +114,10 @@ class RepoLocusService:
             max_directory_depth=self.settings.max_directory_depth,
             max_repository_chunks=self.settings.max_repository_chunks,
             max_repository_symbols=self.settings.max_repository_symbols,
+            max_repository_dependencies=self.settings.max_repository_dependencies,
+            max_dependencies_per_file=self.settings.max_dependencies_per_file,
+            max_symbols_per_file=self.settings.max_symbols_per_file,
+            max_chunks_per_file=self.settings.max_chunks_per_file,
             max_scan_seconds=self.settings.max_scan_seconds,
         )
         self.privacy = privacy or PrivacyStore()
@@ -119,6 +128,7 @@ class RepoLocusService:
         *,
         expected_generation: int | None = None,
         _materialize_files: bool = False,
+        refresh: RefreshMode = "auto",
     ) -> ScanOperation:
         """Refresh the index, retrying only scans not pinned to a generation.
 
@@ -128,18 +138,29 @@ class RepoLocusService:
         """
 
         repo = self._repository(root)
+        mode = self._refresh_mode(refresh)
+        if mode == "never":
+            raise ValueError("scan refresh mode cannot be never")
         with RepositoryIndex.open(repo) as index:
             for attempt in range(_SCAN_ATTEMPTS):
                 snapshot = (
                     index.snapshot()
-                    if _materialize_files
-                    else index.manifest_snapshot(
-                        max_files=self.scanner.max_repository_files,
-                    )
+                    if (_materialize_files or mode != "auto")
+                    else (index.manifest_snapshot(max_files=self.scanner.max_repository_files))
                 )
+                if snapshot.fingerprints != self.scanner.fingerprints and not _materialize_files:
+                    snapshot = index.snapshot()
                 self._require_generation(snapshot.generation, expected_generation)
                 cached_files: dict[str, ScannedFile] = {}
-                if snapshot.analysis_version == self.scanner.analysis_version:
+                fingerprints = snapshot.fingerprints
+                parser_compatible = (
+                    fingerprints is not None
+                    and fingerprints.parser == self.scanner.fingerprints.parser
+                )
+                scan_compatible = (
+                    fingerprints is not None and fingerprints.scan == self.scanner.fingerprints.scan
+                )
+                if parser_compatible:
                     cached_files = {
                         file.path: file
                         for file in snapshot.files
@@ -148,14 +169,20 @@ class RepoLocusService:
                 result = self.scanner.scan(
                     repo,
                     cached_files=cached_files,
-                    trusted_cache=True,
+                    trusted_cache=mode == "auto" and scan_compatible,
                     base_generation=snapshot.generation,
+                    base_scan_revision=snapshot.scan_revision,
+                    refresh_mode=mode,
                 )
                 try:
-                    update = index.update(result)
+                    update = index.auto_cache_hit(result) if mode == "auto" else None
+                    if update is None:
+                        update = index.update(result)
                 except StaleScanError:
-                    if expected_generation is not None or attempt + 1 == _SCAN_ATTEMPTS:
+                    if attempt + 1 == _SCAN_ATTEMPTS:
                         raise
+                    if expected_generation is not None:
+                        self._require_generation(index.content_generation(), expected_generation)
                     continue
                 return ScanOperation(result, update, index.db_path)
         raise RuntimeError("scan retry loop ended unexpectedly")  # pragma: no cover
@@ -170,11 +197,12 @@ class RepoLocusService:
     ) -> ScanOperation:
         mode = self._refresh_mode(refresh)
         repo = self._repository(root)
-        if mode in {"auto", "always"}:
+        if mode in {"auto", "always", "rebuild"}:
             return self.scan(
                 repo,
                 expected_generation=expected_generation,
                 _materialize_files=materialize_files,
+                refresh=mode,
             )
 
         with RepositoryIndex.open(repo) as index:
@@ -191,12 +219,16 @@ class RepoLocusService:
         )
 
     def _compatible_snapshot(self, snapshot: IndexSnapshot) -> bool:
-        return snapshot.analysis_version == self.scanner.analysis_version and (
-            snapshot.generation > 0 or bool(snapshot.files)
+        fingerprints = snapshot.fingerprints
+        return (
+            fingerprints is not None
+            and fingerprints.scan == self.scanner.fingerprints.scan
+            and fingerprints.parser == self.scanner.fingerprints.parser
+            and fingerprints.term_index == self.scanner.fingerprints.term_index
         )
 
-    @staticmethod
     def _snapshot_operation(
+        self,
         root: Path,
         index_path: Path,
         snapshot: IndexSnapshot,
@@ -226,6 +258,9 @@ class RepoLocusService:
             analysis_version=snapshot.analysis_version,
             temporarily_unreadable=snapshot.temporarily_unreadable,
             base_generation=snapshot.generation,
+            base_scan_revision=snapshot.scan_revision,
+            fingerprints=snapshot.fingerprints or self.scanner.fingerprints,
+            refresh_mode="never",
         )
         update = IndexUpdate(
             added=0,
@@ -234,14 +269,15 @@ class RepoLocusService:
             removed=0,
             chunks=0,
             stale=stale_count,
-            generation=snapshot.generation,
+            content_generation=snapshot.generation,
+            scan_revision=snapshot.scan_revision,
         )
         return ScanOperation(result, update, index_path)
 
     @staticmethod
     def _refresh_mode(refresh: RefreshMode) -> RefreshMode:
-        if refresh not in {"auto", "always", "never"}:
-            raise ValueError("refresh must be one of: auto, always, never")
+        if refresh not in {"auto", "always", "never", "rebuild"}:
+            raise ValueError("refresh must be one of: auto, always, never, rebuild")
         return refresh
 
     @staticmethod
@@ -374,6 +410,11 @@ class RepoLocusService:
         scope = self.consent_scope(chosen_model)
         request_plan = self._request_plan(chosen_model, system_prompt, user_prompt)
         endpoint = canonical_endpoint(request_plan.endpoint) if request_plan is not None else None
+        transport = (
+            build_provider_transport(self.settings, request_plan.endpoint)
+            if request_plan is not None
+            else None
+        )
         preview = CloudSendPreview(
             provider=scope,
             paths=tuple(dict.fromkeys(item.path for item in bounded)),
@@ -385,6 +426,9 @@ class RepoLocusService:
             model=chosen_model,
             endpoint=endpoint,
             payload_bytes=len(request_plan.body) if request_plan is not None else 0,
+            transport=transport.preview()
+            if transport is not None
+            else {"mode": "direct", "policy": "disabled"},
         )
         prepared = PreparedAsk(
             root=operation.result.root,
@@ -397,6 +441,7 @@ class RepoLocusService:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             request_plan=request_plan,
+            transport=transport,
             settings=self.settings,
         )
         return prepared, operation
@@ -461,6 +506,9 @@ class RepoLocusService:
                 prepared.root,
                 prepared.consent_scope,
                 prepared.endpoint,
+                transport_identity=(
+                    prepared.transport.identity if prepared.transport is not None else None
+                ),
             )
             if not (allow_cloud or remembered):
                 raise PrivacyRequiredError(prepared.preview, evidence)
@@ -471,9 +519,19 @@ class RepoLocusService:
                     prepared.root,
                     prepared.consent_scope,
                     prepared.endpoint,
+                    transport_identity=(
+                        prepared.transport.identity if prepared.transport is not None else None
+                    ),
+                    transport=(
+                        prepared.transport.preview() if prepared.transport is not None else None
+                    ),
                 )
 
-        provider = create_provider(prepared.model, prepared.settings)
+        provider = create_provider(
+            prepared.model,
+            prepared.settings,
+            transport_route=prepared.transport,
+        )
         generate_prepared = getattr(provider, "generate_prepared", None)
         if prepared.request_plan is not None and callable(generate_prepared):
             model_text = generate_prepared(prepared.request_plan)
@@ -594,6 +652,7 @@ class RepoLocusService:
                 score=item.score,
                 symbol=item.symbol,
                 reason=item.reason,
+                generation=item.generation,
             )
             separator = 1 if selected else 0
             remaining = budget - used - separator
@@ -609,6 +668,7 @@ class RepoLocusService:
                 score=item.score,
                 symbol=item.symbol,
                 reason=item.reason,
+                generation=item.generation,
             )
             if len(self._source_record(candidate)) > remaining:
                 low = 0
@@ -623,6 +683,7 @@ class RepoLocusService:
                         score=item.score,
                         symbol=item.symbol,
                         reason=item.reason,
+                        generation=item.generation,
                     )
                     if len(self._source_record(candidate)) <= remaining:
                         low = middle
@@ -643,6 +704,7 @@ class RepoLocusService:
                 score=item.score,
                 symbol=item.symbol,
                 reason=item.reason,
+                generation=item.generation,
             )
             selected.append(bounded)
             redactions += count
@@ -694,6 +756,12 @@ class RepoLocusService:
 
         plan = self._request_plan(model, "", "")
         return canonical_endpoint(plan.endpoint) if plan is not None else None
+
+    def consent_transport(self, model: str) -> ProviderTransport | None:
+        """Return the exact route identity bound to remembered consent."""
+
+        plan = self._request_plan(model, "", "")
+        return build_provider_transport(self.settings, plan.endpoint) if plan is not None else None
 
     def _request_plan(
         self,

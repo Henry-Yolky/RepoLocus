@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "description": "Small, independently scanned repositories for the v0.1.5 retrieval gate.",
+  "fixtures": [
+    {
+      "id": "python-small",
+      "path": "repos/python-small",
+      "qrels": "qrels/python-small.jsonl",
+      "revision": "fixture-v1",
+      "source": "RepoLocus-authored synthetic external repository fixture",
+      "license": "Apache-2.0",
+      "tree_sha256": "049cb695325731676b019989185b411080ba26fe28edf27b301afaf7ef243ec8",
+      "qrels_sha256": "89ca9a21565c9b30554733964fce0fce2a9a562133716ac9d922c873353e1020"
+    },
+    {
+      "id": "cpp-cmake",
+      "path": "repos/cpp-cmake",
+      "qrels": "qrels/cpp-cmake.jsonl",
+      "revision": "fixture-v1",
+      "source": "RepoLocus-authored synthetic external repository fixture",
+      "license": "Apache-2.0",
+      "tree_sha256": "d82207a2a88dea935a43b4506ab5bb541144cfb8d7489688251193c98bdb771c",
+      "qrels_sha256": "f1699f81ae17187dc962c544ea6d8c267d548004f9f8c53fd8eb03572320828f"
+    },
+    {
+      "id": "rust-cli",
+      "path": "repos/rust-cli",
+      "qrels": "qrels/rust-cli.jsonl",
+      "revision": "fixture-v1",
+      "source": "RepoLocus-authored synthetic external repository fixture",
+      "license": "Apache-2.0",
+      "tree_sha256": "d104ef1d63c28249fc71dcba10bbfdcda59390c9b547e97cc1d73f6f282a72a9",
+      "qrels_sha256": "46005c3ed7452d4b6b3b76e8ea2470e42dbfc24bec0c3683449a94cbd76d5e64"
+    },
+    {
+      "id": "go-service",
+      "path": "repos/go-service",
+      "qrels": "qrels/go-service.jsonl",
+      "revision": "fixture-v1",
+      "source": "RepoLocus-authored synthetic external repository fixture",
+      "license": "Apache-2.0",
+      "tree_sha256": "39d8db2e1e61e993731e1a3f63db4a793464ae17b78edab0f6842324bc05a03c",
+      "qrels_sha256": "ff58f42bf2fc048151c2e9e9bba9a8304f219211e379446f9404ad72e60acbe3"
+    },
+    {
+      "id": "typescript-web",
+      "path": "repos/typescript-web",
+      "qrels": "qrels/typescript-web.jsonl",
+      "revision": "fixture-v1",
+      "source": "RepoLocus-authored synthetic external repository fixture",
+      "license": "Apache-2.0",
+      "tree_sha256": "d77fce4c9ced82c004579e78e45ba661380eaf4b74d4c53abe223a19a8b776e5",
+      "qrels_sha256": "09fd65f8ba3c4ad23f225b38c43d69a136f9d667ab1d21a828fcc86aa56fc1e3"
+    },
+    {
+      "id": "java-gradle",
+      "path": "repos/java-gradle",
+      "qrels": "qrels/java-gradle.jsonl",
+      "revision": "fixture-v1",
+      "source": "RepoLocus-authored synthetic external repository fixture",
+      "license": "Apache-2.0",
+      "tree_sha256": "cb2f82fe5b48bbacca4c4ededbfdeaf670ce501df4778e34549e9a53e45c5ea6",
+      "qrels_sha256": "8fb9e661f07946e48b6c211893db79fad918d6fb47e97b621ab3c7b8f8d34511"
+    }
+  ]
+}

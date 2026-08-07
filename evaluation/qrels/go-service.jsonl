@@ -1,0 +1,3 @@
+{"question":"Where is ReadyStatus defined?","language":"en","query_type":"definition","answerable":true,"relevant":[{"path":"internal/health/handler.go","start":3,"end":5,"grade":3}],"must_not_return":[]}
+{"question":"Which Go entry point calls health.ReadyStatus?","language":"en","query_type":"direct_dependency","answerable":true,"relevant":[{"path":"cmd/server/main.go","start":8,"end":10,"grade":3}],"must_not_return":[]}
+{"question":"Which function validates JWT bearer signatures?","language":"en","query_type":"hard_negative","answerable":false,"relevant":[],"must_not_return":[]}

@@ -548,8 +548,10 @@ def test_v2_index_migration_invalidates_untrusted_existing_facts(tmp_path: Path)
         assert migrated.search_chunks("VALUE") == []
         assert migrated.generation() == 1
         assert metadata["analysis_version"] == ""
-        assert metadata["schema_version"] == "4"
-        assert metadata["index_format_version"] == "4"
+        assert metadata["schema_version"] == "5"
+        assert metadata["index_format_version"] == "5"
+        assert metadata["content_generation"] == "1"
+        assert metadata["scan_revision"] == "1"
         assert len(metadata["repository_identity"]) == 64
         indexes = {
             str(row[1]) for row in migrated._connection.execute("PRAGMA index_list('chunk_terms')")
@@ -557,6 +559,134 @@ def test_v2_index_migration_invalidates_untrusted_existing_facts(tmp_path: Path)
         assert "chunk_terms_chunk_idx" in indexes
         migrated._migrate_v2_to_v3()  # Models a waiter after another migration.
         assert migrated.get_files() == []
+
+
+def test_legacy_v3_search_layout_migrates_to_v5_without_reusing_facts(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = tmp_path / "cache"
+    source = _file("legacy.py", "LEGACY_FACT = True\n", symbol="legacy_fact")
+
+    with RepositoryIndex.open(repository, cache) as index:
+        database = index.db_path
+        committed = index.update(_scan(repository, source))
+
+    connection = sqlite3.connect(database)
+    for trigger in (
+        "chunks_after_insert",
+        "chunks_after_delete",
+        "chunks_after_update",
+    ):
+        connection.execute(f"DROP TRIGGER {trigger}")  # nosec B608
+    connection.execute("DROP TABLE chunks_fts")
+    connection.execute("DROP TABLE chunk_terms")
+    connection.execute("ALTER TABLE files DROP COLUMN facts_sha256")
+    connection.execute(
+        """
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            path,
+            symbol,
+            content,
+            tokenize = 'unicode61 remove_diacritics 2'
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER chunks_after_insert AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, path, symbol, content)
+            VALUES (new.id, new.file_path, new.symbol, new.content);
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER chunks_after_delete AFTER DELETE ON chunks BEGIN
+            DELETE FROM chunks_fts WHERE rowid = old.id;
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER chunks_after_update AFTER UPDATE ON chunks BEGIN
+            DELETE FROM chunks_fts WHERE rowid = old.id;
+            INSERT INTO chunks_fts(rowid, path, symbol, content)
+            VALUES (new.id, new.file_path, new.symbol, new.content);
+        END
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO chunks_fts(rowid, path, symbol, content)
+        SELECT id, file_path, symbol, content FROM chunks
+        """
+    )
+    connection.execute(
+        "DELETE FROM meta WHERE key IN "
+        "('content_generation', 'scan_revision', 'scan_fingerprint', "
+        "'parser_fingerprint', 'term_index_fingerprint', "
+        "'retrieval_fingerprint', 'repository_identity')"
+    )
+    connection.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
+    connection.execute("UPDATE meta SET value = '3' WHERE key = 'index_format_version'")
+    connection.execute("PRAGMA user_version = 3")
+    connection.commit()
+    assert [row[1] for row in connection.execute("PRAGMA table_info(chunks_fts)")] == [
+        "path",
+        "symbol",
+        "content",
+    ]
+    assert connection.execute("SELECT count(*) FROM chunks_fts").fetchone()[0] == 1
+    connection.close()
+
+    with RepositoryIndex.open(repository, cache) as migrated:
+        metadata = migrated.get_metadata()
+        tables = {
+            str(row[0])
+            for row in migrated._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        file_columns = {
+            str(row[1]) for row in migrated._connection.execute("PRAGMA table_info(files)")
+        }
+        fts_columns = [
+            str(row[1]) for row in migrated._connection.execute("PRAGMA table_info(chunks_fts)")
+        ]
+        chunk_term_indexes = {
+            str(row[1]) for row in migrated._connection.execute("PRAGMA index_list('chunk_terms')")
+        }
+        trigger_sql = {
+            str(row[0]): str(row[1])
+            for row in migrated._connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'chunks'"
+            )
+        }
+
+        assert migrated.get_files() == []
+        assert migrated.get_symbols() == []
+        assert migrated.search_chunks("LEGACY_FACT") == []
+        assert migrated.generation() == committed.generation + 1
+        assert metadata["schema_version"] == "5"
+        assert metadata["index_format_version"] == "5"
+        assert metadata["content_generation"] == str(committed.generation + 1)
+        assert metadata["scan_revision"] == str(committed.generation + 1)
+        assert int(migrated._connection.execute("PRAGMA user_version").fetchone()[0]) == 5
+        assert "chunk_terms" in tables
+        assert "facts_sha256" in file_columns
+        assert fts_columns == ["file_path", "symbol", "content"]
+        assert "chunk_terms_chunk_idx" in chunk_term_indexes
+        assert set(trigger_sql) == {
+            "chunks_after_insert",
+            "chunks_after_delete",
+            "chunks_after_update",
+        }
+        assert all("file_path" in statement for statement in trigger_sql.values())
+        assert migrated._connection.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
+        assert migrated._connection.execute("SELECT count(*) FROM chunk_terms").fetchone()[0] == 0
+        assert migrated._connection.execute("SELECT count(*) FROM chunks_fts").fetchone()[0] == 0
 
 
 def test_same_path_repository_replacement_invalidates_index_identity(tmp_path: Path) -> None:

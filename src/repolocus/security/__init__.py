@@ -1,5 +1,6 @@
 """Security and privacy boundaries used across RepoLocus."""
 
+from .atomic_write import AtomicWriteError, AtomicWriteResult, atomic_write_within_root
 from .display import escape_untrusted_display, has_unsafe_display_controls
 from .network import is_loopback_url
 from .paths import PathSecurityError, ensure_within_root, is_within_root, resolve_within_root
@@ -23,12 +24,15 @@ from .redaction import (
 from .secrets import SecretMatch, contains_high_confidence_secret, find_likely_secrets
 
 __all__ = [
+    "AtomicWriteError",
+    "AtomicWriteResult",
     "CloudSendPreview",
     "ConsentRequiredError",
     "PathSecurityError",
     "PrivacyStore",
     "PrivacyStoreError",
     "SecretMatch",
+    "atomic_write_within_root",
     "build_cloud_send_preview",
     "canonical_endpoint",
     "contains_high_confidence_secret",
