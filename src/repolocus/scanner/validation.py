@@ -6,15 +6,17 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from repolocus.models import Chunk, Dependency, Symbol
-from repolocus.parsers.base import ParseResult
+from repolocus.parsers.base import (
+    DEFAULT_MAX_CHUNKS_PER_FILE,
+    DEFAULT_MAX_DEPENDENCIES_PER_FILE,
+    DEFAULT_MAX_SYMBOLS_PER_FILE,
+    ParseResult,
+)
 from repolocus.parsers.chunking import semantic_chunks
 from repolocus.scanner.budget import FactCounts
 from repolocus.security.display import has_unsafe_display_controls
 
 DEFAULT_MAX_REPOSITORY_DEPENDENCIES = 1_000_000
-DEFAULT_MAX_DEPENDENCIES_PER_FILE = 10_000
-DEFAULT_MAX_SYMBOLS_PER_FILE = 10_000
-DEFAULT_MAX_CHUNKS_PER_FILE = 10_000
 HARD_MAX_REPOSITORY_DEPENDENCIES = 2_000_000
 HARD_MAX_DEPENDENCIES_PER_FILE = 20_000
 HARD_MAX_SYMBOLS_PER_FILE = 20_000
