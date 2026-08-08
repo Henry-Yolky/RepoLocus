@@ -47,9 +47,23 @@ def test_external_evaluation_blocks_packaging() -> None:
     assert "external-evaluation:" in workflow
     assert "scripts/evaluate_external_repositories.py evaluation" in workflow
     assert "--minimum-citation-recall 1.0" in workflow
-    assert "needs: [test, coverage, security, external-evaluation]" in workflow
+    assert "--minimum-qrels 100" in workflow
+    assert "--minimum-answerable-qrels 60" in workflow
+    assert "--minimum-no-answer-qrels 20" in workflow
+    assert "--minimum-citation-qrels 60" in workflow
+    external_job = workflow.split("  external-evaluation:", 1)[1].split(
+        "  performance-benchmark:", 1
+    )[0]
+    assert "timeout-minutes: 20" in external_job
+    assert "performance-benchmark:" in workflow
+    assert "--manifest benchmarks/v0.2-gates.json" in workflow
+    assert "benchmarks/v0.2-scale-gates.json" not in workflow
+    assert (
+        "needs: [test, coverage, security, external-evaluation, performance-benchmark]" in workflow
+    )
     assert "if: ${{ always() }}" in workflow
     assert "EVALUATION_RESULT: ${{ needs.external-evaluation.result }}" in workflow
+    assert "PERFORMANCE_RESULT: ${{ needs.performance-benchmark.result }}" in workflow
     assert 'if [[ "$result" != "success" ]]' in workflow
     assert 'python-version: ["3.10", "3.12", "3.14"]' in workflow
 
@@ -59,6 +73,11 @@ def test_release_attests_and_verifies_every_asset_before_publish() -> None:
 
     assert "scripts/evaluate_external_repositories.py evaluation" in workflow
     assert "--minimum-citation-recall 1.0" in workflow
+    assert "--minimum-qrels 100" in workflow
+    assert "benchmarks/v0.2-scale-gates.json" in workflow
+    assert "repolocus-${PROJECT_VERSION}.scale-benchmark.json" in workflow
+    assert "timeout-minutes: 45" in workflow
+    assert "timeout-minutes: 20" in workflow
     assert "repolocus-${PROJECT_VERSION}.external-evaluation.json" in workflow
     assert "attestations: write" in workflow
     assert "subject-path: release-assets/*" in workflow
@@ -67,6 +86,43 @@ def test_release_attests_and_verifies_every_asset_before_publish() -> None:
     assert 'gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"' in workflow
     assert "needs: [build, verify-provenance]" in workflow
     assert "repolocus doctor --security --json" in workflow
+
+
+def test_core_and_treesitter_wheels_are_smoke_tested_separately() -> None:
+    ci = _workflow("ci.yml")
+    release = _workflow("release.yml")
+
+    assert ci.count("--extra api --extra treesitter") >= 2
+    assert "--extra api --extra treesitter" in release
+    for workflow in (ci, release):
+        core_install = re.search(
+            r'uv pip install --python (\S+/bin/python) "\$\{wheel\}"', workflow
+        )
+        treesitter_install = re.search(
+            r'uv pip install --python (\S+/bin/python) "\$\{wheel\}\[api,treesitter\]"',
+            workflow,
+        )
+        assert core_install is not None
+        assert treesitter_install is not None
+        assert core_install.group(1) != treesitter_install.group(1)
+        assert "assert TreeSitterParser.discover() is None" in workflow
+        assert "result = parse_source(" in workflow
+        assert 'expected_languages = {"c", "cpp", "javascript", "typescript", "rust"}' in workflow
+        assert "assert parser.languages == expected_languages" in workflow
+        assert "parser._parser(language, path=path).parse(source_bytes).root_node" in workflow
+        assert "assert root.has_error is False" in workflow
+        assert "native_symbols = parser._symbols(" in workflow
+        assert "result = parser.parse(" in workflow
+        assert "assert result.chunks" in workflow
+        for fixture in (
+            "fixture.c",
+            "fixture.cpp",
+            "fixture.js",
+            "fixture.ts",
+            "fixture.tsx",
+            "fixture.rs",
+        ):
+            assert fixture in workflow
 
 
 def test_dependabot_updates_github_actions() -> None:

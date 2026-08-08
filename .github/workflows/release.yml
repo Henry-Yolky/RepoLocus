@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       attestations: write
       contents: read
@@ -71,7 +72,19 @@ jobs:
             --minimum-citation-recall 1.0 \
             --minimum-no-answer-f1 0.80 \
             --maximum-must-not-return-rate 0.0 \
+            --minimum-qrels 100 \
+            --minimum-answerable-qrels 60 \
+            --minimum-no-answer-qrels 20 \
+            --minimum-citation-qrels 60 \
             --output "release-assets/repolocus-${PROJECT_VERSION}.external-evaluation.json"
+      - name: Run the versioned 100k-file release performance gate
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          uv run python benchmarks/benchmark_v020.py
+          --manifest benchmarks/v0.2-scale-gates.json
+          --output
+          "release-assets/repolocus-${PROJECT_VERSION}.scale-benchmark.json"
       - name: Build and check Python distributions
         run: |
           mkdir -p release-assets
@@ -89,7 +102,8 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: >-
-          uv export --frozen --no-dev --extra api --preview-features sbom-export
+          uv export --frozen --no-dev --extra api --extra treesitter
+          --preview-features sbom-export
           --format cyclonedx1.5
           --output-file "release-assets/repolocus-${VERSION}.cyclonedx.json"
       - name: Generate SHA-256 checksums
@@ -110,6 +124,7 @@ jobs:
   verify-provenance:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       attestations: read
       contents: read
@@ -132,17 +147,71 @@ jobs:
           for asset in *; do
             gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
           done
-      - name: Install the wheel and run the security doctor in a clean environment
+      - name: Install the core wheel and smoke-test the heuristic fallback
         env:
           PROJECT_VERSION: ${{ needs.build.outputs.version }}
         run: |
-          uv venv --python 3.14 /tmp/repolocus-release-verify
+          uv venv --python 3.14 /tmp/repolocus-release-core
           wheel="$(find release-assets -maxdepth 1 -name 'repolocus-*.whl' -print -quit)"
           test -n "$wheel"
-          uv pip install --python /tmp/repolocus-release-verify/bin/python "${wheel}[api]"
-          runtime_version="$(/tmp/repolocus-release-verify/bin/repolocus --version)"
+          uv pip install --python /tmp/repolocus-release-core/bin/python "${wheel}"
+          runtime_version="$(/tmp/repolocus-release-core/bin/repolocus --version)"
           test "$runtime_version" = "RepoLocus $PROJECT_VERSION"
-          /tmp/repolocus-release-verify/bin/repolocus doctor --security --json
+          /tmp/repolocus-release-core/bin/python - <<'PY'
+          from repolocus.parsers import TreeSitterParser, parse_source
+
+          assert TreeSitterParser.discover() is None
+          result = parse_source(
+              "fixture.c",
+              "int add(int left, int right) { return left + right; }\n",
+              "c",
+          )
+          assert any(symbol.name == "add" for symbol in result.symbols)
+          assert result.chunks
+          PY
+      - name: Install runtime extras and smoke-test every Tree-sitter language
+        run: |
+          uv venv --python 3.14 /tmp/repolocus-release-treesitter
+          wheel="$(find release-assets -maxdepth 1 -name 'repolocus-*.whl' -print -quit)"
+          test -n "$wheel"
+          uv pip install --python /tmp/repolocus-release-treesitter/bin/python "${wheel}[api,treesitter]"
+          /tmp/repolocus-release-treesitter/bin/python - <<'PY'
+          from repolocus.parsers import SourceLayout, TreeSitterParser
+
+          parser = TreeSitterParser.discover()
+          assert parser is not None
+          expected_languages = {"c", "cpp", "javascript", "typescript", "rust"}
+          assert parser.languages == expected_languages
+          fixtures = (
+              ("c", "fixture.c", "int add(int a, int b) { return a + b; }\n", "add"),
+              ("cpp", "fixture.cpp", "int add(int a, int b) { return a + b; }\n", "add"),
+              ("javascript", "fixture.js", "function run() { return 1; }\n", "run"),
+              ("typescript", "fixture.ts", "function run(): number { return 1; }\n", "run"),
+              ("typescript", "fixture.tsx", "const View = () => <main>ok</main>;\n", "View"),
+              ("rust", "fixture.rs", "fn run() -> i32 { 1 }\n", "run"),
+          )
+          for language, path, source, expected_symbol in fixtures:
+              source_bytes = source.encode("utf-8")
+              root = parser._parser(language, path=path).parse(source_bytes).root_node
+              assert root.has_error is False
+              native_symbols = parser._symbols(
+                  path,
+                  source_bytes,
+                  root,
+                  SourceLayout.build(source, language=language),
+              )
+              assert any(symbol.name == expected_symbol for symbol in native_symbols)
+              result = parser.parse(
+                  path,
+                  source,
+                  language,
+                  max_chunk_lines=160,
+                  max_chunk_chars=16_000,
+              )
+              assert any(symbol.name == expected_symbol for symbol in result.symbols)
+              assert result.chunks
+          PY
+          /tmp/repolocus-release-treesitter/bin/repolocus doctor --security --json
 
   publish-pypi:
     needs: [build, verify-provenance]

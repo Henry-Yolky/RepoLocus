@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "description": "Release-scale v0.2 gate: 100,000 files, 500,000 symbols, and a 99,000-edge dependency graph.",
+  "baseline": {
+    "date": "2026-08-08",
+    "benchmark_script_sha256": "50d90690ba71786f6704fff61bfbf59e11af92ae61db3dc2897a3ca4bcec5f85",
+    "implementation_sha256": "a5ac377d93d49201e5c48969397867cc963271968d9fbec1c5900a16f844156f",
+    "repolocus_version": "0.2.0",
+    "python": "3.12.3",
+    "platform": "Linux-6.8.0-137-generic-x86_64-with-glibc2.39",
+    "hardware": {
+      "cpu_visible_to_process": 8,
+      "cpu": "AMD EPYC 7K62 48-Core Processor",
+      "memory_bytes": 16748249088,
+      "storage": "ephemeral container filesystem; not characterized"
+    },
+    "source_bytes": 516120950,
+    "operations": {
+      "scan": {
+        "wall_seconds": 849.521089,
+        "cpu_seconds": 814.628646,
+        "peak_rss_bytes": 2134265856,
+        "sqlite_query_count": 28589019,
+        "database_bytes": 2525388800,
+        "wal_bytes": 2540289032
+      },
+      "map": {
+        "wall_seconds": 10.857519,
+        "cpu_seconds": 8.184953,
+        "peak_rss_bytes": 100159488,
+        "sqlite_query_count": 11,
+        "database_bytes": 2525388800,
+        "wal_bytes": 0
+      },
+      "diagram": {
+        "wall_seconds": 2.345195,
+        "cpu_seconds": 2.344991,
+        "peak_rss_bytes": 72409088,
+        "sqlite_query_count": 7,
+        "database_bytes": 2525388800,
+        "wal_bytes": 0
+      },
+      "symbol_query": {
+        "wall_seconds": 4.584451,
+        "cpu_seconds": 4.45364,
+        "peak_rss_bytes": 50987008,
+        "sqlite_query_count": 1,
+        "database_bytes": 2525388800,
+        "wal_bytes": 0
+      },
+      "dependency_query": {
+        "wall_seconds": 0.000887,
+        "cpu_seconds": 0.00089,
+        "peak_rss_bytes": 50987008,
+        "sqlite_query_count": 2,
+        "database_bytes": 2525388800,
+        "wal_bytes": 0
+      },
+      "retrieval": {
+        "wall_seconds": 18.189425,
+        "cpu_seconds": 17.906007,
+        "peak_rss_bytes": 50987008,
+        "sqlite_query_count": 10,
+        "database_bytes": 2525388800,
+        "wal_bytes": 0
+      }
+    }
+  },
+  "files": 100000,
+  "scan_deadline_seconds": 1200,
+  "minimum_symbols": 500000,
+  "minimum_dependencies": 99000,
+  "minimum_source_bytes": 512000000,
+  "thresholds": {
+    "scan": {
+      "maximum_wall_seconds": 1200,
+      "maximum_cpu_seconds": 1200,
+      "maximum_peak_rss_bytes": 3221225472,
+      "maximum_sqlite_query_count": 35000000,
+      "maximum_database_bytes": 3221225472,
+      "maximum_wal_bytes": 3221225472,
+      "baseline_sqlite_query_count": 28589019,
+      "maximum_query_regression_ratio": 1.1
+    },
+    "map": {
+      "maximum_wall_seconds": 30,
+      "maximum_cpu_seconds": 30,
+      "maximum_peak_rss_bytes": 268435456,
+      "maximum_sqlite_query_count": 15,
+      "maximum_database_bytes": 3221225472,
+      "maximum_wal_bytes": 67108864,
+      "baseline_sqlite_query_count": 11,
+      "maximum_query_regression_ratio": 1.1
+    },
+    "diagram": {
+      "maximum_wall_seconds": 15,
+      "maximum_cpu_seconds": 15,
+      "maximum_peak_rss_bytes": 201326592,
+      "maximum_sqlite_query_count": 10,
+      "maximum_database_bytes": 3221225472,
+      "maximum_wal_bytes": 67108864,
+      "baseline_sqlite_query_count": 7,
+      "maximum_query_regression_ratio": 1.1
+    },
+    "symbol_query": {
+      "maximum_wall_seconds": 15,
+      "maximum_cpu_seconds": 15,
+      "maximum_peak_rss_bytes": 134217728,
+      "maximum_sqlite_query_count": 2,
+      "maximum_database_bytes": 3221225472,
+      "maximum_wal_bytes": 67108864,
+      "baseline_sqlite_query_count": 1,
+      "maximum_query_regression_ratio": 1.1
+    },
+    "dependency_query": {
+      "maximum_wall_seconds": 5,
+      "maximum_cpu_seconds": 5,
+      "maximum_peak_rss_bytes": 134217728,
+      "maximum_sqlite_query_count": 3,
+      "maximum_database_bytes": 3221225472,
+      "maximum_wal_bytes": 67108864,
+      "baseline_sqlite_query_count": 2,
+      "maximum_query_regression_ratio": 1.1
+    },
+    "retrieval": {
+      "maximum_wall_seconds": 45,
+      "maximum_cpu_seconds": 45,
+      "maximum_peak_rss_bytes": 134217728,
+      "maximum_sqlite_query_count": 15,
+      "maximum_database_bytes": 3221225472,
+      "maximum_wal_bytes": 67108864,
+      "baseline_sqlite_query_count": 10,
+      "maximum_query_regression_ratio": 1.1
+    }
+  }
+}
