@@ -1,0 +1,87 @@
+{
+  "version": 2,
+  "review_id": "v0.2.0-qrels-r3",
+  "reviewed_at": "2026-08-08",
+  "reviewed_by": "RepoLocus maintainers",
+  "method": "Manual review of runtime intent, answerability, ambiguous dependency candidates, independent family, source-range, multi-path truth, and decoy paths against each pinned fixture.",
+  "artifacts": [
+    {
+      "fixture": "python-small",
+      "fixture_revision": "fixture-v4",
+      "tree_sha256": "52b4bf4cac3311a5eedd16b6bcc17132b5edbbe8586536ee789e78aa6273e624",
+      "qrels_sha256": "a5daa32634795bc691c16b8fa709ff5604018cd14c3789f901887f82f33128a0",
+      "no_answer_families": {
+        "python-small-hard-negative-013": "lunar-payment-workflow",
+        "python-small-hard-negative-014": "python-ghost-scheduler-identifier",
+        "python-small-hard-negative-015": "python-ghost-adapter-path",
+        "python-small-hard-negative-016": "python-ghost-scheduler-definition",
+        "python-small-ambiguous-dependency-017": "ambiguous-shared-python-import"
+      }
+    },
+    {
+      "fixture": "cpp-cmake",
+      "fixture_revision": "fixture-v4",
+      "tree_sha256": "7185d1283b111d3c69cfed39394a32cdf4badbeb994755bf49a49f4fef2ba7fe",
+      "qrels_sha256": "90e1985e4343c0cad698e6b3664505264afe90f5f00cff7136766f20dc70858e",
+      "no_answer_families": {
+        "cpp-cmake-hard-negative-013": "cpp-ghost-scheduler-identifier",
+        "cpp-cmake-hard-negative-014": "cpp-ghost-adapter-path",
+        "cpp-cmake-hard-negative-015": "cpp-ghost-scheduler-definition",
+        "cpp-cmake-hard-negative-016": "cpp-ghost-scheduler-callers",
+        "cpp-cmake-hard-negative-017": "cpp-ghost-scheduler-dependency"
+      }
+    },
+    {
+      "fixture": "rust-cli",
+      "fixture_revision": "fixture-v4",
+      "tree_sha256": "12ea2330dafc6bf2496e7899f2695fc3d098f330ca98a78d238696025148aa88",
+      "qrels_sha256": "2d48d82dae91b8cc4a2cc076b830c4413ad5e36b89cc8052d02c3df45cb1b714",
+      "no_answer_families": {
+        "rust-cli-hard-negative-013": "rust-ghost-scheduler-callers",
+        "rust-cli-hard-negative-014": "rust-ghost-scheduler-dependency",
+        "rust-cli-hard-negative-015": "rust-ghost-scheduler-configuration",
+        "rust-cli-hard-negative-016": "rust-ghost-scheduler-architecture",
+        "rust-cli-hard-negative-017": "rust-lunar-payment-workflow"
+      }
+    },
+    {
+      "fixture": "go-service",
+      "fixture_revision": "fixture-v4",
+      "tree_sha256": "b0ca058d6e92b28e6012049428829b4377ac54d15e6f752bbf6ade11e4e134a5",
+      "qrels_sha256": "25265969549c69dd8b49f4293572c6d2949b5369dfacf34f23e4dbd2f3a51d0d",
+      "no_answer_families": {
+        "go-service-hard-negative-013": "go-ghost-scheduler-configuration",
+        "go-service-hard-negative-014": "go-ghost-scheduler-architecture",
+        "go-service-hard-negative-015": "go-lunar-payment-workflow",
+        "go-service-hard-negative-016": "go-ghost-scheduler-identifier",
+        "go-service-hard-negative-017": "go-ghost-adapter-path"
+      }
+    },
+    {
+      "fixture": "typescript-web",
+      "fixture_revision": "fixture-v4",
+      "tree_sha256": "f13f5ab375511c565f889465a901c4c86950559789c9c517e1fa27da00648ce4",
+      "qrels_sha256": "518a69fa12f7af51227626e19e8c3a1c9aaaf7393b65a00f066756104dab7bd7",
+      "no_answer_families": {
+        "typescript-web-hard-negative-013": "typescript-ghost-scheduler-identifier",
+        "typescript-web-hard-negative-014": "typescript-ghost-adapter-path",
+        "typescript-web-hard-negative-015": "typescript-ghost-scheduler-definition",
+        "typescript-web-hard-negative-016": "typescript-ghost-scheduler-callers",
+        "typescript-web-ambiguous-dependency-017": "ambiguous-shared-typescript-import"
+      }
+    },
+    {
+      "fixture": "java-gradle",
+      "fixture_revision": "fixture-v4",
+      "tree_sha256": "ce898b7c3a0ad37d72df2ffac903bc52267d16175d770c31d1120a93dfb37a9f",
+      "qrels_sha256": "1270bf60a61f4e36f1610e26a3d1064de50b8ab82c68312b7f7ba053cbd03771",
+      "no_answer_families": {
+        "java-gradle-hard-negative-013": "java-ghost-scheduler-definition",
+        "java-gradle-hard-negative-014": "java-ghost-scheduler-callers",
+        "java-gradle-hard-negative-015": "java-ghost-scheduler-dependency",
+        "java-gradle-hard-negative-016": "java-ghost-scheduler-configuration",
+        "java-gradle-hard-negative-017": "java-ghost-scheduler-architecture"
+      }
+    }
+  ]
+}
