@@ -13,15 +13,22 @@ import os
 import re
 import sqlite3
 import threading
+import unicodedata
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from platformdirs import user_cache_path
 
-from repolocus.analysis import DEFAULT_ANALYSIS_FINGERPRINTS, AnalysisFingerprints
+from repolocus.analysis import (
+    DEFAULT_ANALYSIS_FINGERPRINTS,
+    DEPENDENCY_RESOLVER_FINGERPRINT,
+    AnalysisFingerprints,
+)
+from repolocus.graph import ResolvedDependency
 from repolocus.models import (
     Chunk,
     Dependency,
@@ -33,10 +40,15 @@ from repolocus.models import (
 )
 from repolocus.security.identity import filesystem_identity
 
-SCHEMA_VERSION = 5
-INDEX_FORMAT_VERSION = "5"
+if TYPE_CHECKING:
+    from repolocus.index.view import SQLiteRepositoryView
+
+SCHEMA_VERSION = 6
+INDEX_FORMAT_VERSION = "6"
+MAX_RETRIEVAL_LIMIT = 500
 _PROVENANCE_SCHEMA_VERSION = 3
 _IDENTITY_SCHEMA_VERSION = 4
+_FINGERPRINT_SCHEMA_VERSION = 5
 # The product rename did not change the SQLite schema. Keep the original format
 # magic so existing valid indexes remain recognizable when explicitly opened.
 APPLICATION_ID = 0x4456504C  # "DVPL"
@@ -44,10 +56,83 @@ _SAFE_SLUG = re.compile(r"[^A-Za-z0-9._-]+")
 _V2_REQUIRED_TABLES = frozenset(
     {"meta", "files", "symbols", "dependencies", "chunks", "chunks_fts"}
 )
-_REQUIRED_TABLES = _V2_REQUIRED_TABLES | {"chunk_terms"}
+_V5_REQUIRED_TABLES = _V2_REQUIRED_TABLES | {"chunk_terms"}
+_REQUIRED_TABLES = _V5_REQUIRED_TABLES | {
+    "path_aliases",
+    "resolved_dependencies",
+    "resolved_dependency_candidates",
+    "symbol_terms",
+}
+_EVIDENCE_TABLE_COLUMNS = {
+    "path_aliases": (
+        ("alias", "TEXT", 1, 1),
+        ("path", "TEXT", 1, 2),
+    ),
+    "resolved_dependencies": (
+        ("dependency_id", "INTEGER", 0, 1),
+        ("source_path", "TEXT", 1, 0),
+        ("target_path", "TEXT", 0, 0),
+        ("target_symbol", "TEXT", 0, 0),
+        ("resolution_kind", "TEXT", 1, 0),
+        ("confidence", "REAL", 1, 0),
+        ("witness_line", "INTEGER", 1, 0),
+    ),
+    "resolved_dependency_candidates": (
+        ("dependency_id", "INTEGER", 1, 1),
+        ("path", "TEXT", 1, 2),
+    ),
+    "symbol_terms": (
+        ("term", "TEXT", 1, 1),
+        ("symbol_id", "INTEGER", 1, 2),
+        ("match_kind", "TEXT", 1, 3),
+    ),
+}
+_EVIDENCE_TABLE_FOREIGN_KEYS = {
+    "path_aliases": frozenset({("path", "files", "path", "CASCADE")}),
+    "resolved_dependencies": frozenset(
+        {
+            ("dependency_id", "dependencies", "id", "CASCADE"),
+            ("source_path", "files", "path", "CASCADE"),
+            ("target_path", "files", "path", "CASCADE"),
+        }
+    ),
+    "resolved_dependency_candidates": frozenset(
+        {
+            ("dependency_id", "resolved_dependencies", "dependency_id", "CASCADE"),
+            ("path", "files", "path", "CASCADE"),
+        }
+    ),
+    "symbol_terms": frozenset({("symbol_id", "symbols", "id", "CASCADE")}),
+}
+_EVIDENCE_TABLE_SQL_FRAGMENTS = {
+    "path_aliases": ("withoutrowid",),
+    "resolved_dependencies": (
+        "check(resolution_kindin('exact','probable','ambiguous','unresolved'))",
+        "check(confidence>=0.0andconfidence<=1.0)",
+        "check(witness_line>=1)",
+    ),
+    "resolved_dependency_candidates": ("withoutrowid",),
+    "symbol_terms": (
+        "check(match_kindin('exact','casefold','term'))",
+        "withoutrowid",
+    ),
+}
+_EVIDENCE_INDEX_SPECS = {
+    "path_aliases_path_idx": ("path_aliases", ("path",)),
+    "resolved_dependencies_source_idx": ("resolved_dependencies", ("source_path",)),
+    "resolved_dependencies_target_idx": ("resolved_dependencies", ("target_path",)),
+    "resolved_dependency_candidates_path_idx": (
+        "resolved_dependency_candidates",
+        ("path",),
+    ),
+    "symbol_terms_symbol_idx": ("symbol_terms", ("symbol_id",)),
+}
+_EVIDENCE_SCHEMA_OBJECTS = frozenset({*_EVIDENCE_TABLE_COLUMNS, *_EVIDENCE_INDEX_SPECS})
 _OPEN_LOCKS_GUARD = threading.Lock()
 _OPEN_LOCKS: dict[str, threading.RLock] = {}
 _MAX_SNAPSHOT_WARNINGS = 256
+_SQLITE_IN_BATCH_SIZE = 500
+_SEARCH_RRF_K = 60
 
 
 class IndexFormatError(RuntimeError):
@@ -64,7 +149,7 @@ class StaleScanError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class IndexedChunkHit:
-    """An internal chunk result with its SQLite FTS rank."""
+    """An internal chunk result with its fused lexical rank."""
 
     chunk_id: int
     chunk: Chunk
@@ -89,6 +174,16 @@ class NeighborChunkHit:
     chunk: Chunk
     seed_path: str
     direction: str
+
+
+def _validate_retrieval_limit(limit: object) -> int:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= MAX_RETRIEVAL_LIMIT
+    ):
+        raise ValueError(f"limit must be an integer between 1 and {MAX_RETRIEVAL_LIMIT}")
+    return limit
 
 
 def _canonical_root(root: Path) -> Path:
@@ -177,6 +272,19 @@ def _literal_query_tokens(query: str) -> frozenset[str]:
     from repolocus.retrieval.terms import literal_query_terms
 
     return frozenset(literal_query_terms(query))
+
+
+def _literal_identifier_terms(query: str) -> frozenset[str]:
+    """Return identifiers written as complete lexical units by the user."""
+
+    normalized = unicodedata.normalize("NFKC", query)
+    identifiers: set[str] = set()
+    for match in re.finditer(r"[\w$]+(?:(?:::|\.)[\w$]+)*", normalized):
+        identifier = match.group(0).casefold()
+        identifiers.add(identifier)
+        if "." in identifier or "::" in identifier:
+            identifiers.update(part for part in re.split(r"::|\.", identifier) if part)
+    return frozenset(identifiers)
 
 
 def _literal_query_token_groups(query: str) -> tuple[tuple[str, ...], ...]:
@@ -516,7 +624,7 @@ class RepositoryIndex:
                     version = _PROVENANCE_SCHEMA_VERSION
                     tables.add("chunk_terms")
                 if version == _PROVENANCE_SCHEMA_VERSION:
-                    missing_tables = _REQUIRED_TABLES - tables
+                    missing_tables = _V5_REQUIRED_TABLES - tables
                     if missing_tables and (
                         missing_tables != {"chunk_terms"}
                         or not self._is_recognized_legacy_v3_layout()
@@ -527,11 +635,18 @@ class RepositoryIndex:
                     version = _IDENTITY_SCHEMA_VERSION
                     tables.add("chunk_terms")
                 if version == _IDENTITY_SCHEMA_VERSION:
-                    if not _REQUIRED_TABLES.issubset(tables):
-                        missing = ", ".join(sorted(_REQUIRED_TABLES - tables))
+                    if not _V5_REQUIRED_TABLES.issubset(tables):
+                        missing = ", ".join(sorted(_V5_REQUIRED_TABLES - tables))
                         raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
                     self._migrate_v4_to_v5()
+                    version = _FINGERPRINT_SCHEMA_VERSION
+                if version == _FINGERPRINT_SCHEMA_VERSION:
+                    if not _V5_REQUIRED_TABLES.issubset(tables):
+                        missing = ", ".join(sorted(_V5_REQUIRED_TABLES - tables))
+                        raise IndexFormatError(f"index schema is incomplete; missing: {missing}")
+                    self._migrate_v5_to_v6()
                     version = SCHEMA_VERSION
+                    tables.update(_REQUIRED_TABLES)
                 elif version != SCHEMA_VERSION:
                     raise IndexFormatError(
                         f"unsupported index schema {version}; expected {SCHEMA_VERSION}"
@@ -562,6 +677,7 @@ class RepositoryIndex:
                 if current_version in {
                     _PROVENANCE_SCHEMA_VERSION,
                     _IDENTITY_SCHEMA_VERSION,
+                    _FINGERPRINT_SCHEMA_VERSION,
                     SCHEMA_VERSION,
                 }:
                     return
@@ -736,7 +852,11 @@ class RepositoryIndex:
         try:
             with self._transaction():
                 current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-                if current_version in {_IDENTITY_SCHEMA_VERSION, SCHEMA_VERSION}:
+                if current_version in {
+                    _IDENTITY_SCHEMA_VERSION,
+                    _FINGERPRINT_SCHEMA_VERSION,
+                    SCHEMA_VERSION,
+                }:
                     return
                 if current_version != _PROVENANCE_SCHEMA_VERSION:
                     raise IndexFormatError(
@@ -780,7 +900,7 @@ class RepositoryIndex:
         try:
             with self._transaction():
                 current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-                if current_version == SCHEMA_VERSION:
+                if current_version in {_FINGERPRINT_SCHEMA_VERSION, SCHEMA_VERSION}:
                     return
                 if current_version != _IDENTITY_SCHEMA_VERSION:
                     raise IndexFormatError(
@@ -806,8 +926,8 @@ class RepositoryIndex:
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                     """,
                     (
-                        ("schema_version", str(SCHEMA_VERSION)),
-                        ("index_format_version", INDEX_FORMAT_VERSION),
+                        ("schema_version", str(_FINGERPRINT_SCHEMA_VERSION)),
+                        ("index_format_version", str(_FINGERPRINT_SCHEMA_VERSION)),
                         ("content_generation", str(generation)),
                         ("scan_revision", str(generation)),
                         ("generation", str(generation)),
@@ -817,9 +937,60 @@ class RepositoryIndex:
                         ("retrieval_fingerprint", ""),
                     ),
                 )
-                self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._connection.execute(f"PRAGMA user_version = {_FINGERPRINT_SCHEMA_VERSION}")
         except sqlite3.Error as exc:
             raise IndexFormatError(f"could not migrate v4 index: {exc}") from exc
+
+    def _migrate_v5_to_v6(self) -> None:
+        """Add normalized symbol terms and the persistent resolved graph."""
+
+        try:
+            with self._transaction():
+                current_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+                if current_version == SCHEMA_VERSION:
+                    return
+                if current_version != _FINGERPRINT_SCHEMA_VERSION:
+                    raise IndexFormatError(
+                        f"unsupported index schema {current_version}; "
+                        f"expected {_FINGERPRINT_SCHEMA_VERSION}"
+                    )
+                existing_schema_objects = {
+                    str(row[0])
+                    for row in self._connection.execute(
+                        "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+                    )
+                }
+                unexpected = sorted(_EVIDENCE_SCHEMA_OBJECTS & existing_schema_objects)
+                if unexpected:
+                    self._validate_existing_evidence_schema(existing_schema_objects)
+                generation = self._generation_in_transaction()
+                has_evidence_facts = bool(
+                    self._connection.execute(
+                        "SELECT EXISTS(SELECT 1 FROM symbols LIMIT 1) "
+                        "OR EXISTS(SELECT 1 FROM dependencies LIMIT 1)"
+                    ).fetchone()[0]
+                )
+                migrated_generation = generation + int(has_evidence_facts)
+                for statement in self._evidence_index_schema():
+                    self._connection.execute(statement)
+                self._rebuild_symbol_terms()
+                self._rebuild_resolved_graph()
+                self._connection.executemany(
+                    """
+                    INSERT INTO meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
+                        ("schema_version", str(SCHEMA_VERSION)),
+                        ("index_format_version", INDEX_FORMAT_VERSION),
+                        ("generation", str(migrated_generation)),
+                        ("content_generation", str(migrated_generation)),
+                        ("dependency_resolver_fingerprint", DEPENDENCY_RESOLVER_FINGERPRINT),
+                    ),
+                )
+                self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except sqlite3.Error as exc:
+            raise IndexFormatError(f"could not migrate v5 index: {exc}") from exc
 
     def _generation_in_transaction(self) -> int:
         return self._revision_in_transaction("content_generation", fallback="generation")
@@ -905,6 +1076,138 @@ class RepositoryIndex:
             """,
         ):
             self._connection.execute(statement)
+
+    def _validate_existing_evidence_schema(self, existing_objects: set[str]) -> None:
+        """Fail closed if a v5 cache contains a partial or malformed v6 schema."""
+
+        missing = sorted(_EVIDENCE_SCHEMA_OBJECTS - existing_objects)
+        if missing:
+            raise IndexFormatError(
+                "v5 index contains an incomplete v6 evidence schema; missing: " + ", ".join(missing)
+            )
+
+        for table, expected_columns in _EVIDENCE_TABLE_COLUMNS.items():
+            columns = tuple(
+                (
+                    str(row["name"]),
+                    str(row["type"]).upper(),
+                    int(row["notnull"]),
+                    int(row["pk"]),
+                )
+                for row in self._connection.execute(f"PRAGMA table_info({table})")  # nosec B608
+            )
+            if columns != expected_columns:
+                raise IndexFormatError(
+                    f"v5 index contains an incompatible v6 evidence table: {table}"
+                )
+
+            foreign_keys = frozenset(
+                (
+                    str(row["from"]),
+                    str(row["table"]),
+                    str(row["to"]),
+                    str(row["on_delete"]).upper(),
+                )
+                for row in self._connection.execute(  # nosec B608
+                    f"PRAGMA foreign_key_list({table})"
+                )
+            )
+            if foreign_keys != _EVIDENCE_TABLE_FOREIGN_KEYS[table]:
+                raise IndexFormatError(
+                    f"v5 index contains incompatible v6 evidence foreign keys: {table}"
+                )
+
+            row = self._connection.execute(
+                "SELECT type, sql FROM sqlite_master WHERE name = ?",
+                (table,),
+            ).fetchone()
+            if row is None or str(row["type"]) != "table" or row["sql"] is None:
+                raise IndexFormatError(
+                    f"v5 index contains an incompatible v6 evidence object: {table}"
+                )
+            normalized_sql = re.sub(r"\s+", "", str(row["sql"]).casefold())
+            if any(
+                fragment not in normalized_sql for fragment in _EVIDENCE_TABLE_SQL_FRAGMENTS[table]
+            ):
+                raise IndexFormatError(
+                    f"v5 index contains incompatible v6 evidence constraints: {table}"
+                )
+
+        for index_name, (table, expected_columns) in _EVIDENCE_INDEX_SPECS.items():
+            indexes = {
+                str(row["name"]): row
+                for row in self._connection.execute(f"PRAGMA index_list({table})")  # nosec B608
+            }
+            index = indexes.get(index_name)
+            if (
+                index is None
+                or int(index["unique"]) != 0
+                or str(index["origin"]) != "c"
+                or int(index["partial"]) != 0
+            ):
+                raise IndexFormatError(
+                    f"v5 index contains an incompatible v6 evidence index: {index_name}"
+                )
+            columns = tuple(
+                str(row["name"])
+                for row in self._connection.execute(  # nosec B608
+                    f"PRAGMA index_info({index_name})"
+                )
+            )
+            if columns != expected_columns:
+                raise IndexFormatError(
+                    f"v5 index contains an incompatible v6 evidence index: {index_name}"
+                )
+
+    @staticmethod
+    def _evidence_index_schema() -> tuple[str, ...]:
+        return (
+            """
+            CREATE TABLE IF NOT EXISTS path_aliases (
+                alias TEXT NOT NULL,
+                path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+                PRIMARY KEY (alias, path)
+            ) WITHOUT ROWID
+            """,
+            "CREATE INDEX IF NOT EXISTS path_aliases_path_idx ON path_aliases(path)",
+            """
+            CREATE TABLE IF NOT EXISTS resolved_dependencies (
+                dependency_id INTEGER PRIMARY KEY
+                    REFERENCES dependencies(id) ON DELETE CASCADE,
+                source_path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+                target_path TEXT REFERENCES files(path) ON DELETE CASCADE,
+                target_symbol TEXT,
+                resolution_kind TEXT NOT NULL CHECK (
+                    resolution_kind IN ('exact', 'probable', 'ambiguous', 'unresolved')
+                ),
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                witness_line INTEGER NOT NULL CHECK (witness_line >= 1)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS resolved_dependencies_source_idx "
+            "ON resolved_dependencies(source_path)",
+            "CREATE INDEX IF NOT EXISTS resolved_dependencies_target_idx "
+            "ON resolved_dependencies(target_path)",
+            """
+            CREATE TABLE IF NOT EXISTS resolved_dependency_candidates (
+                dependency_id INTEGER NOT NULL
+                    REFERENCES resolved_dependencies(dependency_id) ON DELETE CASCADE,
+                path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+                PRIMARY KEY (dependency_id, path)
+            ) WITHOUT ROWID
+            """,
+            "CREATE INDEX IF NOT EXISTS resolved_dependency_candidates_path_idx "
+            "ON resolved_dependency_candidates(path)",
+            """
+            CREATE TABLE IF NOT EXISTS symbol_terms (
+                term TEXT NOT NULL,
+                symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                match_kind TEXT NOT NULL CHECK (match_kind IN ('exact', 'casefold', 'term')),
+                PRIMARY KEY (term, symbol_id, match_kind)
+            ) WITHOUT ROWID
+            """,
+            "CREATE INDEX IF NOT EXISTS symbol_terms_symbol_idx ON symbol_terms(symbol_id)",
+        )
 
     def _create_schema(self) -> None:
         statements = (
@@ -1008,6 +1311,7 @@ class RepositoryIndex:
                 VALUES (new.id, new.file_path, new.symbol, new.content);
             END
             """,
+            *self._evidence_index_schema(),
         )
         try:
             with self._transaction():
@@ -1028,6 +1332,7 @@ class RepositoryIndex:
                         ("parser_fingerprint", ""),
                         ("term_index_fingerprint", ""),
                         ("retrieval_fingerprint", ""),
+                        ("dependency_resolver_fingerprint", DEPENDENCY_RESOLVER_FINGERPRINT),
                         ("repository_identity", self._repository_identity),
                     ),
                 )
@@ -1058,6 +1363,8 @@ class RepositoryIndex:
         incomplete_paths = tuple(sorted(set(scan.temporarily_unreadable)))
         with self._lock, self._read_transaction():
             metadata = self.get_metadata()
+            if metadata.get("dependency_resolver_fingerprint") != DEPENDENCY_RESOLVER_FINGERPRINT:
+                return None
             current_generation = self._read_revision(metadata, "content_generation", "generation")
             scan_revision = self._read_revision(metadata, "scan_revision")
             if (
@@ -1182,6 +1489,10 @@ class RepositoryIndex:
                 for row in self._connection.execute("SELECT key, value FROM meta")
             }
             prior_fingerprints = _metadata_fingerprints(metadata_before)
+            resolver_changed = (
+                metadata_before.get("dependency_resolver_fingerprint")
+                != DEPENDENCY_RESOLVER_FINGERPRINT
+            )
             committed_fingerprints = (
                 scan.fingerprints or prior_fingerprints or DEFAULT_ANALYSIS_FINGERPRINTS
             )
@@ -1198,6 +1509,17 @@ class RepositoryIndex:
             }
             incoming_paths = set(incoming)
             current_paths = set(current)
+            current_resolver_paths = {
+                path
+                for path, row in current.items()
+                if row["provenance"] == "source" and not row["stale"]
+            }
+            incoming_resolver_paths = {
+                path
+                for path, file in incoming.items()
+                if file.provenance == "source" and not file.stale
+            }
+            resolver_paths_changed = current_resolver_paths != incoming_resolver_paths
             added = sorted(incoming_paths - current_paths)
             if any(not incoming[path].facts_materialized for path in added):
                 raise ValueError("new scanned files must include materialized parser facts")
@@ -1226,6 +1548,10 @@ class RepositoryIndex:
             changed_set = set(changed)
             unchanged_paths = sorted((incoming_paths & current_paths) - changed_set)
             newly_stale = [path for path in retained_stale if not current[path]["stale"]]
+            go_module_aliases_changed = any(
+                PurePosixPath(path).name.casefold() == "go.mod"
+                for path in {*added, *changed_set, *removed, *newly_stale}
+            )
             term_changed = (
                 prior_fingerprints is None
                 or prior_fingerprints.term_index != committed_fingerprints.term_index
@@ -1240,7 +1566,23 @@ class RepositoryIndex:
                 for file in incoming.values()
             )
             term_fact_changed = term_changed and (current_has_chunks or incoming_has_chunks)
-            fact_changed = bool(added or changed or removed or newly_stale or term_fact_changed)
+            current_has_dependencies = (
+                self._connection.execute(
+                    "SELECT 1 FROM dependencies AS d "
+                    "JOIN files AS f ON f.path = d.source_path "
+                    "WHERE f.provenance = 'source' AND f.stale = 0 LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+            resolver_fact_changed = resolver_changed and current_has_dependencies
+            fact_changed = bool(
+                added
+                or changed
+                or removed
+                or newly_stale
+                or term_fact_changed
+                or resolver_fact_changed
+            )
             physical_replacements = sorted(
                 set(added)
                 | changed_set
@@ -1248,11 +1590,48 @@ class RepositoryIndex:
             )
             if any(not incoming[path].facts_materialized for path in physical_replacements):
                 raise ValueError("rebuild scans must include materialized parser facts")
+            existing_replacements = [
+                path for path in physical_replacements if path in current_paths
+            ]
+            stored_dependency_facts: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+            for offset in range(0, len(existing_replacements), _SQLITE_IN_BATCH_SIZE):
+                batch = existing_replacements[offset : offset + _SQLITE_IN_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = self._connection.execute(
+                    f"""
+                    SELECT source_path, target, kind, line
+                    FROM dependencies
+                    WHERE source_path IN ({placeholders})
+                    ORDER BY source_path, target, kind, line, id
+                    """,  # nosec B608 -- only generated placeholders are interpolated
+                    tuple(batch),
+                ).fetchall()
+                for row in rows:
+                    stored_dependency_facts[str(row["source_path"])].append(
+                        (str(row["target"]), str(row["kind"]), int(row["line"]))
+                    )
+            dependency_replacements = {
+                path
+                for path in existing_replacements
+                if tuple(stored_dependency_facts[path])
+                != tuple(
+                    sorted(
+                        (dependency.target, dependency.kind, dependency.line)
+                        for dependency in incoming[path].dependencies
+                    )
+                )
+            }
             inserted_chunks = 0
-            for path in removed + [path for path in physical_replacements if path in current_paths]:
+            for path in removed:
                 self._connection.execute("DELETE FROM files WHERE path = ?", (path,))
             for path in physical_replacements:
-                inserted_chunks += self._insert_file(incoming[path])
+                if path in current_paths:
+                    inserted_chunks += self._replace_file(
+                        incoming[path],
+                        replace_dependencies=path in dependency_replacements,
+                    )
+                else:
+                    inserted_chunks += self._insert_file(incoming[path])
             for path in unchanged_paths:
                 if path in physical_replacements:
                     continue
@@ -1265,6 +1644,20 @@ class RepositoryIndex:
                 self._connection.execute("UPDATE files SET stale = 1 WHERE path = ?", (path,))
             if term_changed:
                 self._rebuild_chunk_terms()
+                self._rebuild_symbol_terms()
+            if resolver_paths_changed or resolver_changed or go_module_aliases_changed:
+                self._rebuild_resolved_graph()
+            else:
+                replaced_dependency_sources = [
+                    path
+                    for path in dependency_replacements
+                    if incoming[path].provenance == "source" and incoming[path].dependencies
+                ]
+                if replaced_dependency_sources:
+                    self._resolve_replaced_dependencies(
+                        sorted(replaced_dependency_sources),
+                        incoming_resolver_paths,
+                    )
 
             scan_digest = hashlib.sha256()
             for path in sorted(incoming):
@@ -1292,6 +1685,7 @@ class RepositoryIndex:
                 "generation": str(committed_generation),
                 "content_generation": str(committed_generation),
                 "scan_revision": str(committed_scan_revision),
+                "dependency_resolver_fingerprint": DEPENDENCY_RESOLVER_FINGERPRINT,
                 **committed_fingerprints.metadata(),
             }
             self._connection.executemany(
@@ -1338,6 +1732,41 @@ class RepositoryIndex:
                 _file_fact_digest(file),
             ),
         )
+        return self._insert_file_facts(file, insert_dependencies=True)
+
+    def _replace_file(self, file: ScannedFile, *, replace_dependencies: bool) -> int:
+        """Replace facts in place so graph edges targeting the stable path survive."""
+
+        self._connection.execute(
+            """
+            UPDATE files
+            SET language = ?, size_bytes = ?, sha256 = ?, line_count = ?, text = ?,
+                is_entry_point = ?, mtime_ns = ?, ctime_ns = ?, provenance = ?,
+                stale = ?, facts_sha256 = ?
+            WHERE path = ?
+            """,
+            (
+                file.language,
+                file.size_bytes,
+                file.sha256.casefold(),
+                file.line_count,
+                file.text,
+                int(file.is_entry_point),
+                file.mtime_ns,
+                file.ctime_ns,
+                file.provenance,
+                int(file.stale),
+                _file_fact_digest(file),
+                file.path,
+            ),
+        )
+        self._connection.execute("DELETE FROM symbols WHERE file_path = ?", (file.path,))
+        if replace_dependencies:
+            self._connection.execute("DELETE FROM dependencies WHERE source_path = ?", (file.path,))
+        self._connection.execute("DELETE FROM chunks WHERE file_path = ?", (file.path,))
+        return self._insert_file_facts(file, insert_dependencies=replace_dependencies)
+
+    def _insert_file_facts(self, file: ScannedFile, *, insert_dependencies: bool) -> int:
         self._connection.executemany(
             """
             INSERT INTO symbols(file_path, name, kind, start_line, end_line, signature)
@@ -1355,16 +1784,18 @@ class RepositoryIndex:
                 for symbol in file.symbols
             ),
         )
-        self._connection.executemany(
-            """
-            INSERT INTO dependencies(source_path, target, kind, line)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                (file.path, dependency.target, dependency.kind, dependency.line)
-                for dependency in file.dependencies
-            ),
-        )
+        self._insert_symbol_terms_for_path(file.path)
+        if insert_dependencies:
+            self._connection.executemany(
+                """
+                INSERT INTO dependencies(source_path, target, kind, line)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (file.path, dependency.target, dependency.kind, dependency.line)
+                    for dependency in file.dependencies
+                ),
+            )
         chunks = _effective_chunks(file)
         self._connection.executemany(
             """
@@ -1418,6 +1849,147 @@ class RepositoryIndex:
         ).fetchall()
         self._insert_chunk_terms(rows)
 
+    def _insert_symbol_terms_for_path(self, path: str) -> None:
+        rows = self._connection.execute(
+            "SELECT id, name FROM symbols WHERE file_path = ? ORDER BY id", (path,)
+        ).fetchall()
+        self._insert_symbol_terms(rows)
+
+    def _insert_symbol_terms(self, rows: Sequence[sqlite3.Row]) -> None:
+        from repolocus.retrieval.terms import document_terms
+
+        for row in rows:
+            name = str(row["name"])
+            symbol_id = int(row["id"])
+            normalized = name.casefold()
+            values = {(name, "exact"), (normalized, "casefold")}
+            values.update((term, "term") for term in document_terms(name, maximum=128))
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO symbol_terms(term, symbol_id, match_kind) VALUES (?, ?, ?)",
+                ((term, symbol_id, kind) for term, kind in sorted(values)),
+            )
+
+    def _rebuild_symbol_terms(self) -> None:
+        self._connection.execute("DELETE FROM symbol_terms")
+        rows = self._connection.execute("SELECT id, name FROM symbols ORDER BY id").fetchall()
+        self._insert_symbol_terms(rows)
+
+    def _rebuild_resolved_graph(self) -> None:
+        from repolocus.graph import build_alias_index
+
+        self._connection.execute("DELETE FROM resolved_dependency_candidates")
+        self._connection.execute("DELETE FROM resolved_dependencies")
+        self._connection.execute("DELETE FROM path_aliases")
+        paths = [
+            str(row["path"])
+            for row in self._connection.execute(
+                "SELECT path FROM files WHERE provenance = 'source' AND stale = 0 ORDER BY path"
+            )
+        ]
+        aliases = build_alias_index(paths, go_modules=self._go_module_roots())
+        self._connection.executemany(
+            "INSERT INTO path_aliases(alias, path) VALUES (?, ?)",
+            ((alias, path) for alias, candidates in aliases.items() for path in candidates),
+        )
+        dependency_rows = self._connection.execute(
+            """
+            SELECT d.id, d.source_path, d.target, d.kind, d.line
+            FROM dependencies AS d
+            JOIN files AS f ON f.path = d.source_path
+            WHERE f.provenance = 'source' AND f.stale = 0
+            ORDER BY d.source_path, d.line, d.target, d.kind, d.id
+            """
+        ).fetchall()
+        self._insert_resolved_dependencies(dependency_rows, aliases)
+
+    def _resolve_replaced_dependencies(
+        self,
+        source_paths: Sequence[str],
+        resolver_paths: Sequence[str] | set[str],
+    ) -> None:
+        """Resolve newly inserted dependency rows without rewriting the complete graph."""
+
+        if not source_paths:
+            return
+        from repolocus.graph import build_alias_index
+
+        aliases = build_alias_index(resolver_paths, go_modules=self._go_module_roots())
+        for offset in range(0, len(source_paths), _SQLITE_IN_BATCH_SIZE):
+            batch = source_paths[offset : offset + _SQLITE_IN_BATCH_SIZE]
+            placeholders = ", ".join("?" for _ in batch)
+            dependency_rows = self._connection.execute(
+                f"""
+                SELECT d.id, d.source_path, d.target, d.kind, d.line
+                FROM dependencies AS d
+                JOIN files AS f ON f.path = d.source_path
+                WHERE f.provenance = 'source' AND f.stale = 0
+                  AND d.source_path IN ({placeholders})
+                ORDER BY d.source_path, d.line, d.target, d.kind, d.id
+                """,  # nosec B608 -- only generated placeholders are interpolated
+                tuple(batch),
+            ).fetchall()
+            self._insert_resolved_dependencies(dependency_rows, aliases)
+
+    def _go_module_roots(self) -> dict[str, str]:
+        from repolocus.graph import go_module_roots
+
+        rows = self._connection.execute(
+            """
+            SELECT path, text
+            FROM files
+            WHERE provenance = 'source' AND stale = 0
+              AND (path = 'go.mod' OR path LIKE '%/go.mod')
+            ORDER BY path
+            """
+        ).fetchall()
+        return go_module_roots((str(row["path"]), str(row["text"])) for row in rows)
+
+    def _insert_resolved_dependencies(
+        self,
+        dependency_rows: Sequence[sqlite3.Row],
+        aliases: Mapping[str, tuple[str, ...]],
+    ) -> None:
+        from repolocus.graph import resolve_dependency
+
+        confidence_scores = {
+            "exact": 1.0,
+            "probable": 0.7,
+            "ambiguous": 0.25,
+            "unresolved": 0.0,
+        }
+        for row in dependency_rows:
+            dependency_id = int(row["id"])
+            resolved = resolve_dependency(
+                Dependency(
+                    source_path=str(row["source_path"]),
+                    target=str(row["target"]),
+                    kind=str(row["kind"]),
+                    line=int(row["line"]),
+                ),
+                aliases,
+            )
+            self._connection.execute(
+                """
+                INSERT INTO resolved_dependencies(
+                    dependency_id, source_path, target_path, target_symbol,
+                    resolution_kind, confidence, witness_line
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dependency_id,
+                    resolved.source_path,
+                    resolved.target_path,
+                    resolved.target_symbol,
+                    resolved.confidence,
+                    confidence_scores[resolved.confidence],
+                    resolved.line,
+                ),
+            )
+            self._connection.executemany(
+                "INSERT INTO resolved_dependency_candidates(dependency_id, path) VALUES (?, ?)",
+                ((dependency_id, path) for path in resolved.candidates),
+            )
+
     def get_metadata(self) -> dict[str, str]:
         self._ensure_open()
         with self._lock:
@@ -1465,6 +2037,13 @@ class RepositoryIndex:
             else:
                 self._connection.commit()
 
+    def repository_view(self, *, expected_generation: int | None = None) -> SQLiteRepositoryView:
+        """Return a projection-only view that must be used as a context manager."""
+
+        from repolocus.index.view import SQLiteRepositoryView
+
+        return SQLiteRepositoryView(self, expected_generation)
+
     def snapshot(self) -> IndexSnapshot:
         """Read full cache facts and their CAS generation from one SQLite snapshot."""
 
@@ -1511,13 +2090,14 @@ class RepositoryIndex:
             else:
                 self._connection.commit()
         return IndexSnapshot(
-            generation,
-            scan_revision,
-            fingerprints,
-            files,
-            skipped,
-            warnings,
-            incomplete,
+            content_generation=generation,
+            scan_revision=scan_revision,
+            fingerprints=fingerprints,
+            files=files,
+            skipped=skipped,
+            warnings=warnings,
+            temporarily_unreadable=incomplete,
+            dependency_resolver_fingerprint=metadata.get("dependency_resolver_fingerprint"),
         )
 
     def stats(self) -> dict[str, int]:
@@ -1625,15 +2205,25 @@ class RepositoryIndex:
         ):
             raise ValueError("max_files must be a positive integer or None")
         query = """
+            WITH chunk_counts AS (
+                SELECT file_path, count(*) AS count FROM chunks GROUP BY file_path
+            ),
+            symbol_counts AS (
+                SELECT file_path, count(*) AS count FROM symbols GROUP BY file_path
+            ),
+            dependency_counts AS (
+                SELECT source_path, count(*) AS count
+                FROM dependencies GROUP BY source_path
+            )
             SELECT f.path, f.language, f.size_bytes, f.sha256, f.line_count,
                    f.is_entry_point, f.mtime_ns, f.ctime_ns, f.provenance, f.stale,
-                   (SELECT count(*) FROM chunks AS c WHERE c.file_path = f.path)
-                       AS cached_chunk_count,
-                   (SELECT count(*) FROM symbols AS s WHERE s.file_path = f.path)
-                       AS cached_symbol_count,
-                   (SELECT count(*) FROM dependencies AS d WHERE d.source_path = f.path)
-                       AS cached_dependency_count
+                   coalesce(c.count, 0) AS cached_chunk_count,
+                   coalesce(s.count, 0) AS cached_symbol_count,
+                   coalesce(d.count, 0) AS cached_dependency_count
             FROM files AS f
+            LEFT JOIN chunk_counts AS c ON c.file_path = f.path
+            LEFT JOIN symbol_counts AS s ON s.file_path = f.path
+            LEFT JOIN dependency_counts AS d ON d.source_path = f.path
             ORDER BY f.path
         """
         parameters: tuple[int, ...] = ()
@@ -1713,11 +2303,10 @@ class RepositoryIndex:
         *,
         synonyms: Mapping[str, Sequence[str]] | None = None,
     ) -> list[IndexedChunkHit]:
-        """Search FTS5 plus normalized CJK and source-identifier terms."""
+        """Search FTS5 and normalized terms with a limit from 1 through 500."""
 
         self._ensure_open()
-        if limit <= 0:
-            return []
+        limit = _validate_retrieval_limit(limit)
         tokens = _query_tokens(query, synonyms)
         if not tokens:
             return []
@@ -1777,7 +2366,7 @@ class RepositoryIndex:
             fts_query = fts_query_template % literal_coverage  # nosec B608
             fts_rows = self._connection.execute(
                 fts_query,
-                (expression, *coverage_parameters, min(int(limit), 500)),
+                (expression, *coverage_parameters, limit),
             ).fetchall()
             placeholders = ", ".join("?" for _ in tokens)
             # Only generated SQLite parameter markers are interpolated; every value stays bound.
@@ -1797,36 +2386,50 @@ class RepositoryIndex:
             term_query = term_query_template % (placeholders, literal_coverage)  # nosec B608
             term_rows = self._connection.execute(
                 term_query,
-                (*tokens, *coverage_parameters, min(int(limit), 500)),
+                (*tokens, *coverage_parameters, limit),
             ).fetchall()
-        hits: dict[int, IndexedChunkHit] = {}
-        for row in fts_rows:
-            hit = IndexedChunkHit(
-                chunk_id=int(row["id"]),
-                chunk=self._row_to_chunk(row),
-                rank=float(row["fts_rank"]),
-            )
-            hits[hit.chunk_id] = hit
-        for row in term_rows:
+        chunks: dict[int, Chunk] = {}
+        fused_scores: defaultdict[int, float] = defaultdict(float)
+        previous_fts_rank: float | None = None
+        dense_rank = 0
+        for position, row in enumerate(fts_rows, 1):
+            fts_rank = float(row["fts_rank"])
+            if previous_fts_rank is None or fts_rank != previous_fts_rank:
+                dense_rank = position
+                previous_fts_rank = fts_rank
             chunk_id = int(row["id"])
-            term_rank = -float(row["term_matches"])
-            current = hits.get(chunk_id)
-            if current is None:
-                hits[chunk_id] = IndexedChunkHit(
-                    chunk_id=chunk_id,
-                    chunk=self._row_to_chunk(row),
-                    rank=term_rank,
-                )
-            else:
-                hits[chunk_id] = IndexedChunkHit(
-                    chunk_id=chunk_id,
-                    chunk=current.chunk,
-                    rank=min(current.rank, term_rank),
-                )
-        return sorted(
-            hits.values(),
-            key=lambda hit: (hit.rank, hit.chunk.path, hit.chunk.start_line, hit.chunk_id),
-        )[: min(int(limit), 500)]
+            chunks[chunk_id] = self._row_to_chunk(row)
+            fused_scores[chunk_id] += 1.0 / (_SEARCH_RRF_K + dense_rank)
+
+        previous_term_matches: int | None = None
+        dense_rank = 0
+        for position, row in enumerate(term_rows, 1):
+            term_matches = int(row["term_matches"])
+            if previous_term_matches is None or term_matches != previous_term_matches:
+                dense_rank = position
+                previous_term_matches = term_matches
+            chunk_id = int(row["id"])
+            if chunk_id not in chunks:
+                chunks[chunk_id] = self._row_to_chunk(row)
+            fused_scores[chunk_id] += 1.0 / (_SEARCH_RRF_K + dense_rank)
+
+        ordered_ids = sorted(
+            fused_scores,
+            key=lambda chunk_id: (
+                -fused_scores[chunk_id],
+                chunks[chunk_id].path,
+                chunks[chunk_id].start_line,
+                chunk_id,
+            ),
+        )
+        return [
+            IndexedChunkHit(
+                chunk_id=chunk_id,
+                chunk=chunks[chunk_id],
+                rank=-fused_scores[chunk_id],
+            )
+            for chunk_id in ordered_ids[:limit]
+        ]
 
     def find_symbol_chunks(
         self,
@@ -1835,247 +2438,358 @@ class RepositoryIndex:
         *,
         synonyms: Mapping[str, Sequence[str]] | None = None,
     ) -> list[SymbolChunkHit]:
-        """Find chunks for exact or partial symbol-name matches."""
+        """Find symbol chunks with one query and a limit from 1 through 500."""
 
         self._ensure_open()
-        if limit <= 0:
-            return []
+        limit = _validate_retrieval_limit(limit)
         tokens = _query_tokens(query, synonyms)
         if not tokens:
             return []
-        full = query.strip().casefold()
+        full = unicodedata.normalize("NFKC", query.strip()).casefold()
         token_set = {token.casefold() for token in tokens}
         literal_tokens = _literal_query_tokens(query)
         expanded_tokens = token_set - literal_tokens
-        partial_tokens = {token for token in token_set if len(token) >= 4}
-        expanded_partial_tokens = {token for token in expanded_tokens if len(token) >= 4}
-        with self._lock:
-            symbol_rows = self._connection.execute(
-                """
-                SELECT s.* FROM symbols AS s
-                JOIN files AS f ON f.path = s.file_path
-                WHERE f.provenance = 'source' AND f.stale = 0
-                ORDER BY s.file_path, s.start_line, s.name, s.id
-                """
-            ).fetchall()
-            matches: list[tuple[int, str, sqlite3.Row]] = []
-            for row in symbol_rows:
-                name = str(row["name"])
-                folded = name.casefold()
-                if folded == full or folded in literal_tokens:
-                    matches.append((0, "exact", row))
-                elif folded in expanded_tokens:
-                    matches.append((1, "expanded", row))
-                elif any(token in folded for token in expanded_partial_tokens):
-                    matches.append((2, "expanded", row))
-                elif (full and full in folded) or any(token in folded for token in partial_tokens):
-                    matches.append((3, "partial", row))
-            matches.sort(
-                key=lambda item: (
-                    item[0],
-                    str(item[2]["name"]).casefold(),
-                    str(item[2]["file_path"]),
-                    int(item[2]["start_line"]),
+        exact_terms = _literal_identifier_terms(query)
+        requested: dict[str, tuple[str, bool]] = {}
+        if full:
+            requested[full] = ("literal", full in exact_terms)
+        for token in sorted(token_set):
+            category = "expanded" if token in expanded_tokens else "literal"
+            current = requested.get(token)
+            if current is None or current[0] != "literal":
+                requested[token] = (category, category == "literal" and token in exact_terms)
+        request_rows = {
+            (term, category, term if allow_exact else "")
+            for term, (category, allow_exact) in requested.items()
+        }
+        alias_count = 0
+        for exact_term in sorted(exact_terms):
+            normalized_terms = _query_tokens(exact_term, maximum=1)
+            if normalized_terms and normalized_terms[0] in token_set:
+                request_rows.add((normalized_terms[0], "literal", exact_term))
+                alias_count += 1
+                if alias_count >= len(token_set):
+                    break
+        values = ", ".join("(?, ?, ?, ?, ?, ?)" for _ in request_rows)
+        parameters: list[str | int] = []
+        for term, category, exact_form in sorted(request_rows):
+            parameters.extend(
+                (
+                    term,
+                    category,
+                    term + "\U0010ffff",
+                    int(len(term) >= 4),
+                    int(bool(exact_form)),
+                    exact_form,
                 )
             )
-            results: list[SymbolChunkHit] = []
-            seen: set[int] = set()
-            for _, match_type, symbol_row in matches:
-                chunk_row = self._connection.execute(
-                    """
-                    SELECT * FROM chunks
-                    WHERE file_path = ?
-                      AND (symbol = ? OR (start_line <= ? AND end_line >= ?))
-                    ORDER BY CASE WHEN symbol = ? THEN 0 ELSE 1 END,
-                             start_line, ordinal, id
-                    LIMIT 1
-                    """,
+        sql = f"""
+            WITH requested(
+                term, category, upper_bound, allow_prefix, allow_exact, exact_form
+            ) AS (
+                VALUES {values}
+            ),
+            term_matches AS (
+                SELECT s.id AS symbol_id, s.file_path, s.name, s.start_line,
+                       CASE
+                           WHEN r.category = 'literal' AND r.allow_exact = 1
+                                AND (
+                                    s.name = r.exact_form COLLATE NOCASE
+                                    OR (
+                                        substr(s.name, -length(r.exact_form))
+                                            = r.exact_form COLLATE NOCASE
+                                        AND (
+                                            substr(
+                                                s.name, -(length(r.exact_form) + 1), 1
+                                            ) = '.'
+                                            OR substr(
+                                                s.name, -(length(r.exact_form) + 2), 2
+                                            ) = '::'
+                                        )
+                                    )
+                                ) THEN 0
+                           WHEN r.category = 'expanded' THEN 1
+                           ELSE 3
+                       END AS priority
+                FROM requested AS r
+                JOIN symbol_terms AS st ON st.term = r.term
+                JOIN symbols AS s ON s.id = st.symbol_id
+                UNION ALL
+                SELECT s.id AS symbol_id, s.file_path, s.name, s.start_line,
+                       CASE WHEN r.category = 'expanded' THEN 2 ELSE 3 END AS priority
+                FROM requested AS r
+                JOIN symbol_terms AS st
+                  ON st.match_kind = 'term'
+                 AND st.term >= r.term
+                 AND st.term < r.upper_bound
+                 AND st.term != r.term
+                JOIN symbols AS s ON s.id = st.symbol_id
+                WHERE r.allow_prefix = 1
+            ),
+            matched_symbols AS (
+                SELECT m.symbol_id, m.file_path, m.name, m.start_line,
+                       min(m.priority) AS priority
+                FROM term_matches AS m
+                JOIN files AS f ON f.path = m.file_path
+                WHERE f.provenance = 'source' AND f.stale = 0
+                GROUP BY m.symbol_id
+            ),
+            symbol_chunks AS (
+                SELECT c.*, m.name AS symbol_name, m.priority,
+                       m.symbol_id
+                FROM matched_symbols AS m
+                JOIN chunks AS c ON c.id = coalesce(
                     (
-                        symbol_row["file_path"],
-                        symbol_row["name"],
-                        symbol_row["start_line"],
-                        symbol_row["start_line"],
-                        symbol_row["name"],
+                        SELECT exact.id
+                        FROM chunks AS exact
+                        WHERE exact.file_path = m.file_path
+                          AND exact.symbol = m.name
+                          AND exact.start_line = m.start_line
+                        ORDER BY exact.ordinal, exact.id
+                        LIMIT 1
                     ),
-                ).fetchone()
-                if chunk_row is None:
-                    chunk_row = self._connection.execute(
-                        """
-                        SELECT * FROM chunks WHERE file_path = ?
-                        ORDER BY start_line, ordinal, id LIMIT 1
-                        """,
-                        (symbol_row["file_path"],),
-                    ).fetchone()
-                if chunk_row is None or int(chunk_row["id"]) in seen:
-                    continue
-                chunk_id = int(chunk_row["id"])
-                seen.add(chunk_id)
-                results.append(
-                    SymbolChunkHit(
-                        chunk_id=chunk_id,
-                        chunk=self._row_to_chunk(chunk_row),
-                        symbol_name=str(symbol_row["name"]),
-                        match=match_type,
+                    (
+                        SELECT exact.id
+                        FROM chunks AS exact
+                        WHERE exact.file_path = m.file_path
+                          AND exact.symbol = m.name
+                          AND exact.start_line <= m.start_line
+                          AND exact.end_line >= m.start_line
+                        ORDER BY exact.start_line DESC, exact.ordinal, exact.id
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT exact.id
+                        FROM chunks AS exact
+                        WHERE exact.file_path = m.file_path
+                          AND exact.symbol = m.name
+                        ORDER BY exact.start_line, exact.ordinal, exact.id
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT containing.id
+                        FROM chunks AS containing
+                        WHERE containing.file_path = m.file_path
+                          AND containing.start_line <= m.start_line
+                          AND containing.end_line >= m.start_line
+                        ORDER BY containing.start_line, containing.ordinal, containing.id
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT first.id
+                        FROM chunks AS first
+                        WHERE first.file_path = m.file_path
+                        ORDER BY first.start_line, first.ordinal, first.id
+                        LIMIT 1
                     )
                 )
-                if len(results) >= min(int(limit), 500):
-                    break
-        return results
+            ),
+            distinct_chunks AS (
+                SELECT sc.*,
+                       row_number() OVER (
+                           PARTITION BY sc.id
+                           ORDER BY sc.priority, sc.symbol_name COLLATE NOCASE,
+                                    sc.file_path, sc.start_line
+                       ) AS chunk_rank
+                FROM symbol_chunks AS sc
+            )
+            SELECT * FROM distinct_chunks
+            WHERE chunk_rank = 1
+            ORDER BY priority, symbol_name COLLATE NOCASE, file_path, start_line, id
+            LIMIT ?
+        """  # nosec B608 -- only generated VALUES placeholders are interpolated
+        parameters.append(limit)
+        with self._lock:
+            rows = self._connection.execute(sql, tuple(parameters)).fetchall()
+        return [
+            SymbolChunkHit(
+                chunk_id=int(row["id"]),
+                chunk=self._row_to_chunk(row),
+                symbol_name=str(row["symbol_name"]),
+                match=(
+                    "exact"
+                    if int(row["priority"]) == 0
+                    else "expanded"
+                    if int(row["priority"]) in {1, 2}
+                    else "partial"
+                ),
+            )
+            for row in rows
+        ]
 
-    @staticmethod
-    def _path_aliases(path: str) -> set[str]:
-        lowered = path.casefold()
-        aliases = {lowered, PurePosixPath(lowered).name}
-        suffix = PurePosixPath(lowered).suffix
-        without_suffix = lowered[: -len(suffix)] if suffix else lowered
-        aliases.add(without_suffix)
-        aliases.add(PurePosixPath(without_suffix).name)
-        dotted = without_suffix.replace("/", ".")
-        parts = dotted.split(".")
-        aliases.update(".".join(parts[offset:]) for offset in range(len(parts)))
-        if parts and parts[-1] == "__init__":
-            package_parts = parts[:-1]
-            aliases.update(".".join(package_parts[offset:]) for offset in range(len(package_parts)))
-        return {alias for alias in aliases if alias}
-
-    @classmethod
-    def _resolve_dependency_target(
-        cls,
-        source_path: str,
-        target: str,
-        aliases: dict[str, set[str]],
-        known_paths: dict[str, str],
-    ) -> set[str]:
-        cleaned = target.strip().strip("'\"").casefold().replace("\\", "/")
-        if not cleaned:
-            return set()
-        candidates = {cleaned, cleaned.replace("/", ".")}
-        if cleaned.startswith("./") or cleaned.startswith("../"):
-            joined = PurePosixPath(source_path).parent.joinpath(cleaned)
-            normalized_parts: list[str] = []
-            for part in joined.parts:
-                if part == ".":
-                    continue
-                if part == "..":
-                    if normalized_parts:
-                        normalized_parts.pop()
-                    continue
-                normalized_parts.append(part)
-            relative = "/".join(normalized_parts)
-            candidates.update({relative, relative.replace("/", ".")})
-        elif cleaned.startswith("."):
-            # Python relative imports use leading dots rather than ../.  One
-            # dot means the source package, two dots mean its parent, etc.
-            level = len(cleaned) - len(cleaned.lstrip("."))
-            module = cleaned[level:].replace(".", "/")
-            base_parts = list(PurePosixPath(source_path).parent.parts)
-            if level > 1:
-                base_parts = base_parts[: max(0, len(base_parts) - level + 1)]
-            relative = "/".join([*base_parts, *([module] if module else [])])
-            candidates.update({relative, relative.replace("/", ".")})
-        resolved: set[str] = set()
-        extensions = (
-            "",
-            ".py",
-            ".pyi",
-            ".ts",
-            ".tsx",
-            ".js",
-            ".jsx",
-            ".go",
-            ".rs",
-            ".java",
-            ".c",
-            ".cc",
-            ".cpp",
-            ".h",
-            ".hpp",
-        )
-        for candidate in tuple(candidates):
-            direct_path = known_paths.get(candidate)
-            if direct_path is not None:
-                resolved.add(direct_path)
-            slash_candidate = candidate if "/" in candidate else candidate.replace(".", "/")
-            candidates.add(slash_candidate)
-            for extension in extensions:
-                direct = f"{slash_candidate}{extension}"
-                direct_path = known_paths.get(direct)
-                if direct_path is not None:
-                    resolved.add(direct_path)
-        for candidate in candidates:
-            resolved.update(aliases.get(candidate, ()))
-            resolved.update(aliases.get(candidate.removesuffix(".py"), ()))
-        return resolved
-
-    def dependency_neighbors(
-        self, seed_paths: Sequence[str], limit: int = 32
-    ) -> list[NeighborChunkHit]:
-        """Return one source-addressable chunk for each direct dependency neighbor."""
+    def get_resolved_dependencies(self, source_path: str | None = None) -> list[ResolvedDependency]:
+        """Return the persisted dependency projection without resolving at query time."""
 
         self._ensure_open()
-        if limit <= 0 or not seed_paths:
-            return []
-        seeds = set(seed_paths)
+        where = ""
+        parameters: tuple[str, ...] = ()
+        if source_path is not None:
+            where = "WHERE rd.source_path = ?"
+            parameters = (source_path,)
         with self._lock:
-            path_rows = self._connection.execute(
-                """
-                SELECT path FROM files
-                WHERE provenance = 'source' AND stale = 0
-                ORDER BY path
-                """
+            self._ensure_resolved_graph_current()
+            rows = self._connection.execute(
+                f"""
+                SELECT rd.dependency_id, rd.source_path, d.target, rd.target_path,
+                       rd.target_symbol, d.kind, rd.witness_line, rd.resolution_kind,
+                       candidate.path AS candidate_path
+                FROM resolved_dependencies AS rd
+                JOIN dependencies AS d ON d.id = rd.dependency_id
+                LEFT JOIN resolved_dependency_candidates AS candidate
+                  ON candidate.dependency_id = rd.dependency_id
+                {where}
+                ORDER BY rd.source_path, rd.witness_line, d.target, d.kind,
+                         rd.dependency_id, candidate.path
+                """,  # nosec B608 -- the only optional fragment is a constant predicate
+                parameters,
             ).fetchall()
-            known_paths = {str(row["path"]).casefold(): str(row["path"]) for row in path_rows}
-            alias_map: dict[str, set[str]] = defaultdict(set)
-            for folded_path, canonical in known_paths.items():
-                for alias in self._path_aliases(folded_path):
-                    alias_map[alias].add(canonical)
-            dependency_rows = self._connection.execute(
-                """
-                SELECT d.* FROM dependencies AS d
-                JOIN files AS f ON f.path = d.source_path
+        dependencies: dict[int, tuple[sqlite3.Row, list[str]]] = {}
+        for row in rows:
+            dependency_id = int(row["dependency_id"])
+            stored = dependencies.setdefault(dependency_id, (row, []))
+            if row["candidate_path"] is not None:
+                stored[1].append(str(row["candidate_path"]))
+        return [
+            ResolvedDependency(
+                source_path=str(row["source_path"]),
+                raw_target=str(row["target"]),
+                target_path=str(row["target_path"]) if row["target_path"] is not None else None,
+                target_symbol=(
+                    str(row["target_symbol"]) if row["target_symbol"] is not None else None
+                ),
+                kind=str(row["kind"]),
+                line=int(row["witness_line"]),
+                confidence=str(row["resolution_kind"]),  # type: ignore[arg-type]
+                candidates=tuple(candidates),
+            )
+            for row, candidates in dependencies.values()
+        ]
+
+    def dependency_neighbors(
+        self,
+        seed_paths: Sequence[str],
+        limit: int = 32,
+        *,
+        direction: str | None = None,
+    ) -> list[NeighborChunkHit]:
+        """Query direct resolved neighbors through indexed SQLite projections.
+
+        Filtering by *direction* happens before the shared result ``limit`` is
+        applied, so one direction cannot crowd out an explicitly requested one.
+        Both the result limit and the number of seed entries are bounded at 500.
+        """
+
+        self._ensure_open()
+        limit = _validate_retrieval_limit(limit)
+        if direction not in {None, "dependency of", "dependent of"}:
+            raise ValueError("dependency direction is invalid")
+        if len(seed_paths) > _SQLITE_IN_BATCH_SIZE:
+            raise ValueError(f"seed_paths must contain at most {_SQLITE_IN_BATCH_SIZE} entries")
+        seeds = tuple(sorted(set(seed_paths)))
+        if not seeds:
+            return []
+        values = ", ".join("(?)" for _ in seeds)
+        sql = f"""
+            WITH seeds(path) AS (VALUES {values}),
+            neighbors(path, seed_path, direction, target_symbol, witness_line) AS (
+                SELECT rd.target_path, rd.source_path, 'dependency of',
+                       rd.target_symbol, NULL
+                FROM resolved_dependencies AS rd
+                JOIN seeds AS s ON s.path = rd.source_path
+                WHERE rd.target_path IS NOT NULL
+                  AND rd.target_path != rd.source_path
+                  AND (? IS NULL OR ? = 'dependency of')
+                UNION ALL
+                SELECT rd.source_path, rd.target_path, 'dependent of',
+                       NULL, rd.witness_line
+                FROM resolved_dependencies AS rd
+                JOIN seeds AS s ON s.path = rd.target_path
+                WHERE rd.target_path IS NOT NULL
+                  AND rd.source_path != rd.target_path
+                  AND (? IS NULL OR ? = 'dependent of')
+            ),
+            selected_neighbors AS (
+                SELECT path, seed_path, direction,
+                       min(target_symbol) AS target_symbol,
+                       min(witness_line) AS witness_line
+                FROM neighbors
+                GROUP BY path, seed_path, direction
+            ),
+            ranked_chunks AS (
+                SELECT c.*, n.seed_path, n.direction,
+                       row_number() OVER (
+                           PARTITION BY n.path, n.seed_path, n.direction
+                           ORDER BY
+                               CASE
+                                   WHEN n.direction = 'dependency of'
+                                        AND n.target_symbol IS NOT NULL
+                                        AND c.symbol = n.target_symbol THEN 0
+                                   WHEN n.direction = 'dependent of'
+                                        AND n.witness_line BETWEEN c.start_line AND c.end_line
+                                       THEN 0
+                                   ELSE 1
+                               END,
+                               CASE
+                                   WHEN n.direction = 'dependent of'
+                                        AND n.witness_line < c.start_line
+                                       THEN c.start_line - n.witness_line
+                                   WHEN n.direction = 'dependent of'
+                                        AND n.witness_line > c.end_line
+                                       THEN n.witness_line - c.end_line
+                                   ELSE 0
+                               END,
+                               c.start_line, c.ordinal, c.id
+                       ) AS chunk_rank
+                FROM selected_neighbors AS n
+                JOIN chunks AS c ON c.file_path = n.path
+                JOIN files AS f ON f.path = c.file_path
                 WHERE f.provenance = 'source' AND f.stale = 0
-                ORDER BY d.source_path, d.line, d.target, d.id
-                """
+            ),
+            limited_neighbors AS (
+                SELECT rc.*,
+                       row_number() OVER (
+                           ORDER BY rc.direction, rc.file_path, rc.seed_path, rc.start_line,
+                                    rc.ordinal, rc.id
+                       ) AS direction_rank
+                FROM ranked_chunks AS rc
+                WHERE rc.chunk_rank = 1
+            )
+            SELECT * FROM limited_neighbors
+            WHERE direction_rank <= ?
+            ORDER BY direction, file_path, seed_path, start_line, id
+        """  # nosec B608 -- only generated VALUES placeholders are interpolated
+        with self._lock:
+            self._ensure_resolved_graph_current()
+            rows = self._connection.execute(
+                sql,
+                (
+                    *seeds,
+                    direction,
+                    direction,
+                    direction,
+                    direction,
+                    limit,
+                ),
             ).fetchall()
-            neighbor_info: dict[str, tuple[str, str]] = {}
-            for row in dependency_rows:
-                source = str(row["source_path"])
-                targets = self._resolve_dependency_target(
-                    source,
-                    str(row["target"]),
-                    alias_map,
-                    known_paths,
-                )
-                if source in seeds:
-                    for target_path in sorted(targets):
-                        if target_path not in seeds:
-                            neighbor_info.setdefault(target_path, (source, "dependency of"))
-                if targets & seeds and source not in seeds:
-                    seed = sorted(targets & seeds)[0]
-                    neighbor_info.setdefault(source, (seed, "dependent of"))
-            results: list[NeighborChunkHit] = []
-            for path in sorted(neighbor_info):
-                row = self._connection.execute(
-                    """
-                    SELECT * FROM chunks WHERE file_path = ?
-                    ORDER BY start_line, ordinal, id LIMIT 1
-                    """,
-                    (path,),
-                ).fetchone()
-                if row is None:
-                    continue
-                seed, direction = neighbor_info[path]
-                results.append(
-                    NeighborChunkHit(
-                        chunk_id=int(row["id"]),
-                        chunk=self._row_to_chunk(row),
-                        seed_path=seed,
-                        direction=direction,
-                    )
-                )
-                if len(results) >= min(int(limit), 500):
-                    break
-        return results
+        return [
+            NeighborChunkHit(
+                chunk_id=int(row["id"]),
+                chunk=self._row_to_chunk(row),
+                seed_path=str(row["seed_path"]),
+                direction=str(row["direction"]),
+            )
+            for row in rows
+        ]
+
+    def _ensure_resolved_graph_current(self) -> None:
+        row = self._connection.execute(
+            "SELECT value FROM meta WHERE key = 'dependency_resolver_fingerprint'"
+        ).fetchone()
+        fingerprint = str(row["value"]) if row is not None else None
+        if fingerprint != DEPENDENCY_RESOLVER_FINGERPRINT:
+            raise IndexFormatError(
+                "resolved dependency graph is stale; refresh the repository index"
+            )
 
     def close(self) -> None:
         with self._lock:

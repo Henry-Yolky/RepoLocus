@@ -13,6 +13,10 @@ from typing import Protocol
 
 from repolocus.models import Chunk, Dependency, Symbol
 
+DEFAULT_MAX_DEPENDENCIES_PER_FILE = 10_000
+DEFAULT_MAX_SYMBOLS_PER_FILE = 10_000
+DEFAULT_MAX_CHUNKS_PER_FILE = 10_000
+
 
 @dataclass(frozen=True, slots=True)
 class ParseResult:
@@ -39,6 +43,9 @@ class SourceParser(Protocol):
         *,
         max_chunk_lines: int,
         max_chunk_chars: int,
+        max_dependencies_per_file: int = DEFAULT_MAX_DEPENDENCIES_PER_FILE,
+        max_symbols_per_file: int = DEFAULT_MAX_SYMBOLS_PER_FILE,
+        max_chunks_per_file: int = DEFAULT_MAX_CHUNKS_PER_FILE,
     ) -> ParseResult:
         """Extract source facts from *text*."""
 
@@ -177,15 +184,26 @@ class ParserRegistry:
         *,
         max_chunk_lines: int = 160,
         max_chunk_chars: int = 16_000,
+        max_dependencies_per_file: int = DEFAULT_MAX_DEPENDENCIES_PER_FILE,
+        max_symbols_per_file: int = DEFAULT_MAX_SYMBOLS_PER_FILE,
+        max_chunks_per_file: int = DEFAULT_MAX_CHUNKS_PER_FILE,
     ) -> ParseResult:
-        if max_chunk_lines <= 0:
-            raise ValueError("max_chunk_lines must be positive")
-        if max_chunk_chars <= 0:
-            raise ValueError("max_chunk_chars must be positive")
+        for name, value in (
+            ("max_chunk_lines", max_chunk_lines),
+            ("max_chunk_chars", max_chunk_chars),
+            ("max_dependencies_per_file", max_dependencies_per_file),
+            ("max_symbols_per_file", max_symbols_per_file),
+            ("max_chunks_per_file", max_chunks_per_file),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         return self.parser_for(language).parse(
             path,
             text,
             language,
             max_chunk_lines=max_chunk_lines,
             max_chunk_chars=max_chunk_chars,
+            max_dependencies_per_file=max_dependencies_per_file,
+            max_symbols_per_file=max_symbols_per_file,
+            max_chunks_per_file=max_chunks_per_file,
         )

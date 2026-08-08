@@ -978,6 +978,9 @@ class RepositoryScanner:
                     language,
                     max_chunk_lines=self.max_chunk_lines,
                     max_chunk_chars=self.max_chunk_chars,
+                    max_dependencies_per_file=self.parse_limits.max_dependencies_per_file,
+                    max_symbols_per_file=self.parse_limits.max_symbols_per_file,
+                    max_chunks_per_file=self.parse_limits.max_chunks_per_file,
                 )
                 stats.parsed_files += 1
                 parsed, parsed_counts = finalize_parse_result(

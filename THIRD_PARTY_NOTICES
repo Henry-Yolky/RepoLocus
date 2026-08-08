@@ -9,11 +9,13 @@ RepoLocus's direct runtime dependencies retain their own copyright and license n
 | HTTPX | BSD-3-Clause |
 | PathSpec | MPL-2.0 |
 | Platformdirs | MIT |
+| Tomli (Python 3.10 only) | MIT |
 | FastAPI (optional API extra) | MIT |
 | Uvicorn (optional API extra) | BSD-3-Clause |
+| Tree-sitter and bundled language wheels (optional treesitter extra) | MIT |
 
 The authoritative versions and transitive dependency graph are recorded in `uv.lock`. CI emits
-a CycloneDX SBOM for core plus API runtime dependencies, creates a full installed-package
-license report, blocks licenses requiring explicit review, and audits published dependencies
-for known vulnerabilities. Each dependency's own distribution remains the authoritative source
-for its copyright and complete license text.
+a CycloneDX SBOM for core plus API and Tree-sitter runtime dependencies, creates a full
+installed-package license report, blocks licenses requiring explicit review, and audits published
+dependencies for known vulnerabilities. Each dependency's own distribution remains the
+authoritative source for its copyright and complete license text.

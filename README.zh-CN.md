@@ -6,7 +6,7 @@ RepoLocus 是一个只读、本地优先的代码库理解工具。它不会执�
 安全扫描源码、建立 SQLite/FTS 索引、生成结构稳定的 `PROJECT_MAP.md`、输出经过校验的
 Mermaid 图，并为代码问题检索可核验的源码证据。
 
-当前仓库实现的是 CLI 优先的 v0.1 基线。静态依赖与调用关系是近似结果；路线图中的
+当前仓库实现的是 CLI 优先的 v0.2 开发基线。静态依赖与调用关系是近似结果；路线图中的
 公共仓库 Web Demo 尚未包含在本版本中。
 
 ## 快速开始
@@ -79,9 +79,16 @@ scan revision 不会让证据 snapshot 失效。输入空行即结束，问答�
 
 - 安全扫描：遵循 `.gitignore`，排除二进制、大文件、密钥文件、构建产物和符号链接；
 - 增量索引：仓库外 SQLite/FTS5 缓存，按文件哈希更新；
+- Evidence Index：用 SQLite 索引符号词项和持久化 resolved dependency graph；歧义依赖保留
+  全部候选，不静默猜测目标；
+- 投影读取：`map` 和 `diagram` 固定一个 content generation，只读取所需元数据、resolved
+  edges 和有界 README 前缀，不物化完整仓库正文与 chunks；
+- 可选 Tree-sitter：安装 `treesitter` extra 后为 C/C++、JavaScript/TypeScript 和 Rust 提供
+  原生语法范围，失败时确定性回退到启发式 parser；
 - 配置安全：用户、仓库与环境设置合并后执行类型和边界校验，仓库配置只能收紧资源限制；
 - 项目地图：固定章节、源码链接和 `Confirmed` / `Inferred` / `Needs review` 标签；
-- 证据问答：符号、FTS5/BM25、term 索引与依赖邻居混合检索；term 索引拆分
+- 证据问答：按 query intent 融合符号、FTS5/BM25、term 索引与 resolved dependency 邻居，
+  使用 RRF、内容/行区间去重、路径多样性和显式 no-answer reason；term 索引拆分
   camelCase、snake_case 和路径，并为连续 CJK 文本建立 bigram/trigram；用户可通过
   `REPOLOCUS_QUERY_SYNONYMS` 的 JSON 显式增加同义词，仓库配置无权设置；
 - 模型校验：每个实质 claim 后必须紧跟相同 citation 和源码原文子串的 `Evidence quote`；
@@ -90,9 +97,10 @@ scan revision 不会让证据 snapshot 失效。输入空行即结束，问答�
 - 模型适配：无模型提取式回答、Ollama、OpenAI-compatible、Anthropic；
 - 隐私控制：默认关闭遥测，云端逐次授权或按仓库和端点记忆授权，可预览与撤回；
 - 自托管 API：安装 `api` 可选依赖后运行 `repolocus serve`。
-- 评测：自仓库 smoke set 之外，固定六个独立合成仓库和 18 条 qrels 作为 CI gate；报告
-  recall@k、MRR、nDCG@k、citation、no-answer、`must_not_return` 及按仓库等维度的汇总；
-  release gate 要求 citation recall 达到 1.0。
+- 评测：自仓库 smoke set 之外，固定六个独立合成仓库和 102 条逐项复核 qrels 作为
+  CI/release gate；覆盖定义、exact/expanded/partial symbol、入口点、正反依赖、配置和
+  hard-negative，报告 recall@k、MRR、nDCG@k、citation、no-answer、`must_not_return`
+  及按仓库等维度的汇总；release gate 要求 citation recall 达到 1.0。
 
 ## Agent Skill
 
@@ -125,7 +133,7 @@ Copy-Item -Recurse -Force "skills/repolocus-analyze-repo" (Join-Path $env:CODEX_
 复制后请重启 Codex；如果宿主提供 Skill 注册表重载操作，也可以执行重载。之后以
 `$repolocus-analyze-repo` 调用。该 Skill 不暴露云端授权参数，Agent 不能通过这条路径
 静默把仓库内容发送给远程模型。Skill 压缩包只包含 adapter，不内置 RepoLocus runtime；
-必须预先提供 `>=0.1.5,<0.2.0` 的已安装 runtime 或已同步的可信源码环境，adapter 全程 offline/no-sync，
+必须预先提供 `>=0.2.0,<0.3.0` 的已安装 runtime 或已同步的可信源码环境，adapter 全程 offline/no-sync，
 缺失或版本不兼容时直接 fail closed，不会自行下载依赖。
 
 ## 自托管 API
@@ -154,9 +162,10 @@ API 默认只监听回环地址、只允许访问 `--root` 指定目录之下的
 ## 明确边界
 
 RepoLocus 不修改业务代码、不执行测试或构建脚本、不提交 Git、不自动创建 PR。仓库内的
-README、注释和测试数据都按不可信输入处理。当前 Python 使用标准 AST，TypeScript、
-JavaScript、Go、Rust、Java、C/C++ 使用保守的启发式解析器；动态调用、反射、依赖注入
-和生成代码可能无法被静态分析还原。
+README、注释和测试数据都按不可信输入处理。Python 使用标准 AST；安装可选 `treesitter`
+extra 后，C/C++、TypeScript、JavaScript 和 Rust 使用带启发式回退的 Tree-sitter symbol
+范围，Go、Java、文档和配置仍使用保守的启发式解析器。动态调用、反射、依赖注入和生成
+代码可能无法被静态分析还原。
 
 索引和授权记录均保存在仓库之外。POSIX 平台会收紧文件权限；Windows 上尚未实现原生
 ACL 检查，因此 `doctor --security` 会明确将 ACL 状态报告为“未验证”，不会声称检查成功。
@@ -167,8 +176,8 @@ ACL 检查，因此 `doctor --security` 会明确将 ACL 状态报告为“未�
 拒绝旧扫描覆盖新结果；follow-up 只绑定前者。
 `ask` 的兼容分析版本刷新使用 metadata-only manifest，跳过未变化文件的正文和 parser facts；
 Python API 的 `RepoLocusService.scan()` 对未变化文件同样只返回 metadata 和已缓存的 fact
-计数。需要物化 facts 时应调用 `map()`、`diagram()` 或 `evidence()`。变化文件会安全读取、
-哈希并重新解析。
+计数。`map()`、`diagram()` 和 `evidence()` 同样使用有界索引投影；调用方确实需要已存储
+facts 时应使用 `RepositoryIndex` 查询接口。变化文件会安全读取、哈希并重新解析。
 扫描同时限制文件/entry 数、总字节、目录深度、chunks、symbols，并在有界操作前后检查总耗时；
 阻塞的文件系统调用或第三方 parser 可能在下一次检查前超时。检测到预算耗尽时，未完成范围会
 标为 `stale`，而不是确认删除旧 facts。

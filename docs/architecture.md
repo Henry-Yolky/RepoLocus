@@ -21,12 +21,20 @@ flowchart LR
 
 - `scanner/` owns bounded discovery, ignore policy, binary and sensitive-file exclusion.
 - `parsers/` turns accepted text into symbols, dependencies, entry-point flags, and semantic
-  chunks. Parser output is always a static approximation.
+  chunks. A shared one-pass `SourceLayout` bounds fallback parsing work; optional Tree-sitter
+  wheels provide native syntax ranges for C, C++, JavaScript, TypeScript, and Rust. Parser output
+  is always a static approximation.
 - `index/` stores repository facts in a schema-versioned SQLite database outside the repository.
   Updates compare content hashes, track source/generated provenance and stale state, and commit
-  against separate content-generation and scan-revision compare-and-swap values.
-- `retrieval/` combines symbol matches, FTS5/BM25 results, deterministic lexical terms, and static
-  dependency neighbors. Terms split camelCase, snake_case, and paths and include CJK bigrams and
+  against separate content-generation and scan-revision compare-and-swap values. Schema v6 also
+  stores normalized symbol terms, path aliases, resolved dependency edges, and ambiguous
+  candidates. `RepositoryView` pins one generation while exposing only bounded projections.
+- `graph/` owns the language-neutral dependency resolver used by index commits, retrieval, maps,
+  and diagrams. Ambiguous aliases retain every candidate and never become a guessed edge.
+- `retrieval/` combines indexed symbol matches, FTS5/BM25 ranks, deterministic lexical terms, and
+  resolved dependency neighbors with reciprocal-rank fusion. Query intent selects reverse graph
+  retrieval for callers/references; content hashes, line-range overlap, and path diversity suppress
+  redundant evidence. Terms split camelCase, snake_case, and paths and include CJK bigrams and
   trigrams. Bounded user synonyms can come from `REPOLOCUS_QUERY_SYNONYMS`; target-repository
   configuration cannot choose them.
 - `generators/` creates `PROJECT_MAP.md` and a restricted Mermaid subset without model output.
@@ -73,6 +81,11 @@ rows. If a scan is incomplete or a path is temporarily unreadable, prior facts f
 retained as `stale`; a confirmed deletion removes them. Query snapshots and retrieval SQL admit
 only non-stale `source` facts, preventing generated output or uncertain old content from becoming
 evidence.
+
+Map and diagram generation open one `RepositoryView` read transaction. They consume file counts,
+entry points, area summaries, resolved edges, and bounded README prefixes; they do not materialize
+all source bodies, chunks, or symbols. Retrieval uses the same generation-pinned database snapshot,
+and every returned evidence item records that content generation.
 
 Each scan starts from one transactionally consistent SQLite snapshot and commits with both content
 generation and scan revision compare-and-swap values. An old scan cannot overwrite a newer commit.
