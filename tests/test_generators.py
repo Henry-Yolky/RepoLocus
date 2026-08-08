@@ -3,7 +3,74 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from repolocus.generators import MermaidGenerator, ProjectMapGenerator, validate_mermaid
+from repolocus.graph import ResolvedDependency
+from repolocus.index.view import AreaSummary, DiagramFile, EntryPoint, FileSummary
 from repolocus.models import Chunk, Dependency, ScannedFile, ScanResult, ScanStats, Symbol
+
+
+class _OneShotDependencies:
+    def __init__(self) -> None:
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        if self.iterations > 1:
+            raise AssertionError("dependency projection was consumed more than once")
+        yield ResolvedDependency(
+            source_path="src/app/main.py",
+            raw_target="worker.jobs",
+            target_path="src/worker/jobs.py",
+            target_symbol=None,
+            kind="import",
+            line=8,
+            confidence="exact",
+            candidates=(),
+        )
+
+
+class _ProjectionView:
+    generation = 7
+    root = Path("/tmp/projection")
+
+    def __init__(self) -> None:
+        self.dependency_values = _OneShotDependencies()
+        self.diagram_file_reads = 0
+        self.file_summary_reads = 0
+
+    def file_summaries(self):
+        self.file_summary_reads += 1
+        return (
+            FileSummary("src/app/main.py", "Python", 20, 9, True, 1, 7),
+            FileSummary("src/worker/jobs.py", "Python", 20, 12, False, 0, 11),
+        )
+
+    def diagram_files(self):
+        self.diagram_file_reads += 1
+        return (
+            DiagramFile("src/app/main.py", 7),
+            DiagramFile("src/worker/jobs.py", 11),
+        )
+
+    def entry_points(self):
+        return (EntryPoint("src/app/main.py", 7),)
+
+    def symbols_by_area(self):
+        return (AreaSummary("src", 2, 1, (("Python", 2),), "src/app/main.py", 7),)
+
+    def dependencies(self):
+        return self.dependency_values
+
+    def read_text_prefix(self, path: str, max_chars: int) -> str:
+        raise AssertionError(f"unexpected text read for {path} ({max_chars})")
+
+    def stats(self):
+        return {
+            "files": 2,
+            "indexed_bytes": 40,
+            "languages": {"Python": 2},
+            "skipped": {},
+            "warnings": [],
+        }
 
 
 def _result() -> ScanResult:
@@ -100,6 +167,27 @@ def test_mermaid_document_keeps_source_evidence() -> None:
     assert "[src/app/main.py:1](src/app/main.py#L1)" in document
 
 
+def test_projection_generators_preserve_lines_counts_and_single_pass_dependencies() -> None:
+    map_view = _ProjectionView()
+    project_map = ProjectMapGenerator().generate_view(map_view)
+
+    assert "[src/app/main.py:7](src/app/main.py#L7)" in project_map
+    assert "and 1 extracted symbols" in project_map
+    assert map_view.dependency_values.iterations == 1
+    assert map_view.file_summary_reads == 1
+    assert map_view.diagram_file_reads == 0
+
+    diagram_view = _ProjectionView()
+    diagram = MermaidGenerator().generate_view(diagram_view)
+
+    assert "[src/app/main.py:7](src/app/main.py#L7)" in diagram
+    assert "[src/worker/jobs.py:11](src/worker/jobs.py#L11)" in diagram
+    assert "[src/app/main.py:8](src/app/main.py#L8)" in diagram
+    assert diagram_view.dependency_values.iterations == 1
+    assert diagram_view.file_summary_reads == 0
+    assert diagram_view.diagram_file_reads == 1
+
+
 def test_nested_generated_documents_use_destination_relative_source_links(tmp_path: Path) -> None:
     result = _result()
     result.root = tmp_path
@@ -151,6 +239,49 @@ def test_every_mermaid_edge_has_import_evidence() -> None:
     assert "`api -&gt; worker`" in document
     assert "`worker.jobs`" in document
     assert "[src/api/routes.py:1](src/api/routes.py#L1)" in document
+
+
+def test_mermaid_document_and_source_share_go_module_resolution() -> None:
+    module = ScannedFile(
+        path="go.mod",
+        language="config",
+        size_bytes=29,
+        sha256="3" * 64,
+        line_count=1,
+        text="module fixture.local/service\n",
+    )
+    caller = ScannedFile(
+        path="cmd/server/main.go",
+        language="go",
+        size_bytes=64,
+        sha256="4" * 64,
+        line_count=2,
+        text='package main\nimport "fixture.local/service/internal/health"\n',
+        dependencies=(
+            Dependency(
+                "cmd/server/main.go",
+                "fixture.local/service/internal/health",
+                "import",
+                2,
+            ),
+        ),
+    )
+    target = ScannedFile(
+        path="internal/health/handler.go",
+        language="go",
+        size_bytes=15,
+        sha256="5" * 64,
+        line_count=1,
+        text="package health\n",
+    )
+    result = ScanResult(Path("/tmp/go-module"), [module, caller, target], ScanStats())
+
+    document = MermaidGenerator().generate(result)
+    source = MermaidGenerator().generate_source(result)
+
+    assert " --> " in source
+    assert "`cmd -&gt; internal`" in document
+    assert "`fixture.local/service/internal/health`" in document
 
 
 def test_mermaid_validator_rejects_model_like_free_text() -> None:

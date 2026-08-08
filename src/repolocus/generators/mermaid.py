@@ -6,11 +6,14 @@ import hashlib
 import html
 import os
 import re
-from collections import Counter, defaultdict
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from repolocus.models import Dependency, ScannedFile, ScanResult
+from repolocus.graph import ResolvedDependency, go_module_roots, resolve_dependencies
+from repolocus.index.view import DiagramFile, RepositoryView
+from repolocus.models import ScannedFile, ScanResult
 from repolocus.security.display import escape_untrusted_display
 
 _NODE_RE = re.compile(r'^\s{4}(n_[a-f0-9]{10})\["([^"\\]|\\.)*"\]$')
@@ -107,15 +110,52 @@ class MermaidGenerator:
     ) -> str:
         """Render a graph with repository-root-relative links by default."""
 
-        link_prefix = self._link_prefix(result.root, destination)
-        source = self.generate_source(result)
+        dependencies = resolve_dependencies(
+            (file.path for file in result.files),
+            (dependency for file in result.files for dependency in file.dependencies),
+            go_modules=go_module_roots((file.path, file.text) for file in result.files),
+        )
+        return self._generate(
+            result.root,
+            (_diagram_file(file) for file in result.files),
+            dependencies,
+            destination=destination,
+        )
+
+    def generate_view(
+        self,
+        view: RepositoryView,
+        *,
+        destination: Path | str | None = None,
+    ) -> str:
+        """Render directly from the persisted resolved dependency projection."""
+
+        return self._generate(
+            view.root,
+            view.diagram_files(),
+            view.dependencies(),
+            destination=destination,
+        )
+
+    def _generate(
+        self,
+        root: Path,
+        summaries: Iterable[DiagramFile],
+        dependencies: Iterable[ResolvedDependency],
+        *,
+        destination: Path | str | None,
+    ) -> str:
+        files = sorted(summaries, key=lambda item: item.path)
+        selected, ranked_edges = self._graph_facts(files, dependencies)
+        link_prefix = self._link_prefix(root, destination)
+        source = self._render_source(selected, ranked_edges)
         valid, reason = validate_mermaid(source)
         if not valid:
-            source = self._fallback_source(result)
+            source = self._fallback_source(files)
             valid, fallback_reason = validate_mermaid(source)
             if not valid:  # pragma: no cover - defensive invariant
                 raise ValueError(f"could not produce valid Mermaid: {reason}; {fallback_reason}")
-        evidence = self._evidence_table(result, link_prefix)
+        evidence = self._evidence_table(files, ranked_edges, link_prefix)
         link_contract = (
             "Source links are relative to this generated document."
             if destination is not None
@@ -154,7 +194,20 @@ class MermaidGenerator:
         return "" if relative_root == "." else relative_root
 
     def generate_source(self, result: ScanResult) -> str:
-        selected, ranked_edges = self._graph_facts(result)
+        dependencies = resolve_dependencies(
+            (file.path for file in result.files),
+            (dependency for file in result.files for dependency in file.dependencies),
+            go_modules=go_module_roots((file.path, file.text) for file in result.files),
+        )
+        summaries = [_diagram_file(file) for file in result.files]
+        selected, ranked_edges = self._graph_facts(summaries, dependencies)
+        return self._render_source(selected, ranked_edges)
+
+    @staticmethod
+    def _render_source(
+        selected: set[str],
+        ranked_edges: Sequence[tuple[str, str, int, ResolvedDependency]],
+    ) -> str:
         lines = ["flowchart LR"]
         for group in sorted(selected):
             lines.append(f'    {_node_id(group)}["{_escape_label(group)}"]')
@@ -163,34 +216,34 @@ class MermaidGenerator:
         return "\n".join(lines) + "\n"
 
     def _graph_facts(
-        self, result: ScanResult
-    ) -> tuple[set[str], list[tuple[str, str, int, Dependency]]]:
+        self,
+        summaries: Sequence[DiagramFile],
+        dependencies: Iterable[ResolvedDependency],
+    ) -> tuple[set[str], list[tuple[str, str, int, ResolvedDependency]]]:
         """Return the selected nodes and an import witness for every emitted edge."""
 
-        groups: dict[str, list[ScannedFile]] = defaultdict(list)
-        for file in result.files:
-            groups[_group(file.path)].append(file)
-        ranked_groups = sorted(groups, key=lambda key: (-len(groups[key]), key))[: self.max_nodes]
+        groups = Counter(_group(item.path) for item in summaries)
+        ranked_groups = sorted(groups, key=lambda key: (-groups[key], key))[: self.max_nodes]
         selected = set(ranked_groups)
-        aliases = self._aliases(groups)
         edges: Counter[tuple[str, str]] = Counter()
-        witnesses: dict[tuple[str, str], Dependency] = {}
-        for file in result.files:
-            source_group = _group(file.path)
+        witnesses: dict[tuple[str, str], ResolvedDependency] = {}
+        for dependency in dependencies:
+            source_group = _group(dependency.source_path)
             if source_group not in selected:
                 continue
-            for dep in file.dependencies:
-                target_group = self._resolve_target(dep.target, aliases)
-                if target_group and target_group in selected and target_group != source_group:
-                    edge = (source_group, target_group)
-                    edges[edge] += 1
-                    witness = witnesses.get(edge)
-                    if witness is None or (dep.source_path, dep.line, dep.target) < (
-                        witness.source_path,
-                        witness.line,
-                        witness.target,
-                    ):
-                        witnesses[edge] = dep
+            if dependency.target_path is None:
+                continue
+            target_group = _group(dependency.target_path)
+            if target_group in selected and target_group != source_group:
+                edge = (source_group, target_group)
+                edges[edge] += 1
+                witness = witnesses.get(edge)
+                if witness is None or (
+                    dependency.source_path,
+                    dependency.line,
+                    dependency.raw_target,
+                ) < (witness.source_path, witness.line, witness.raw_target):
+                    witnesses[edge] = dependency
         ranked_edges = [
             (source_group, target_group, count, witnesses[(source_group, target_group)])
             for (source_group, target_group), count in sorted(
@@ -199,46 +252,8 @@ class MermaidGenerator:
         ]
         return selected, ranked_edges
 
-    def _aliases(self, groups: dict[str, list[ScannedFile]]) -> dict[str, str]:
-        aliases: dict[str, str] = {}
-        for group, files in groups.items():
-            for file in files:
-                path = PurePosixPath(file.path)
-                parts = list(path.with_suffix("").parts)
-                if parts and parts[0] in {"src", "lib"}:
-                    parts = parts[1:]
-                if parts and parts[-1] == "__init__":
-                    parts = parts[:-1]
-                if not parts or path.suffix.lower() not in {
-                    ".py",
-                    ".pyi",
-                    ".js",
-                    ".jsx",
-                    ".ts",
-                    ".tsx",
-                    ".go",
-                    ".rs",
-                    ".java",
-                    ".c",
-                    ".cc",
-                    ".cpp",
-                    ".h",
-                    ".hpp",
-                }:
-                    continue
-                module = ".".join(part.lower().replace("-", "_") for part in parts)
-                aliases.setdefault(module, group)
-        return aliases
-
-    def _resolve_target(self, target: str, aliases: dict[str, str]) -> str | None:
-        normalized = target.strip().lstrip(".").replace("/", ".").replace("-", "_").lower()
-        for candidate in sorted(aliases, key=len, reverse=True):
-            if normalized == candidate or normalized.startswith(candidate + "."):
-                return aliases[candidate]
-        return None
-
-    def _fallback_source(self, result: ScanResult) -> str:
-        groups = Counter(_group(file.path) for file in result.files)
+    def _fallback_source(self, summaries: Sequence[DiagramFile]) -> str:
+        groups = Counter(_group(item.path) for item in summaries)
         if not groups:
             return 'flowchart LR\n    n_0000000000["empty repository"]\n'
         selected = [group for group, _ in groups.most_common(min(8, self.max_nodes))]
@@ -247,20 +262,21 @@ class MermaidGenerator:
             lines.append(f'    {_node_id(group)}["{_escape_label(group)}"]')
         return "\n".join(lines) + "\n"
 
-    def _evidence_table(self, result: ScanResult, link_prefix: str = "") -> str:
+    def _evidence_table(
+        self,
+        summaries: Sequence[DiagramFile],
+        ranked_edges: Sequence[tuple[str, str, int, ResolvedDependency]],
+        link_prefix: str = "",
+    ) -> str:
         witnesses: dict[str, tuple[str, int]] = {}
-        for file in sorted(result.files, key=lambda item: item.path):
-            group = _group(file.path)
-            line = next(
-                (i for i, value in enumerate(file.text.splitlines(), 1) if value.strip()), 1
-            )
-            witnesses.setdefault(group, (file.path, line))
+        for summary in summaries:
+            group = _group(summary.path)
+            witnesses.setdefault(group, (summary.path, summary.first_line))
         if not witnesses:
             return "No source files were indexed."
         lines = ["### Node evidence", "", "| Node | Representative source |", "|---|---|"]
         for group, (path, line) in sorted(witnesses.items()):
             lines.append(f"| `{_markdown_cell(group)}` | {_source_link(path, line, link_prefix)} |")
-        _selected, ranked_edges = self._graph_facts(result)
         lines.extend(
             [
                 "",
@@ -275,8 +291,17 @@ class MermaidGenerator:
         for source_group, target_group, count, dependency in ranked_edges:
             edge = f"{source_group} -> {target_group}"
             lines.append(
-                f"| `{_markdown_cell(edge)}` | `{_markdown_cell(dependency.target)}` | "
+                f"| `{_markdown_cell(edge)}` | "
+                f"`{_markdown_cell(dependency.raw_target)}` | "
                 f"{_source_link(dependency.source_path, dependency.line, link_prefix)} | "
                 f"{count} |"
             )
         return "\n".join(lines)
+
+
+def _diagram_file(file: ScannedFile) -> DiagramFile:
+    first_line = next((i for i, value in enumerate(file.text.splitlines(), 1) if value.strip()), 1)
+    return DiagramFile(
+        path=file.path,
+        first_line=first_line,
+    )

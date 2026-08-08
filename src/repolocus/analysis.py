@@ -17,9 +17,9 @@ SECRET_DETECTOR_VERSION = 4
 GENERATED_DETECTOR_VERSION = 3
 CHUNKER_VERSION = 4
 PARSER_FINALIZER_VERSION = 3
-TERM_INDEX_VERSION = 5
-RETRIEVAL_VERSION = 4
-DEPENDENCY_RESOLVER_VERSION = 1
+TERM_INDEX_VERSION = 6
+RETRIEVAL_VERSION = 6
+DEPENDENCY_RESOLVER_VERSION = 5
 
 
 def stable_fingerprint(component: str, manifest: Any) -> str:
@@ -35,6 +35,11 @@ def stable_fingerprint(component: str, manifest: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+DEPENDENCY_RESOLVER_FINGERPRINT = stable_fingerprint(
+    "dependency-resolver", {"version": DEPENDENCY_RESOLVER_VERSION}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,10 +121,7 @@ def build_analysis_fingerprints(
     term_index = stable_fingerprint("term-index", {"version": TERM_INDEX_VERSION})
     retrieval = stable_fingerprint(
         "retrieval",
-        {
-            "dependency_resolver": DEPENDENCY_RESOLVER_VERSION,
-            "version": RETRIEVAL_VERSION,
-        },
+        {"version": RETRIEVAL_VERSION},
     )
     return AnalysisFingerprints(scan, parser, term_index, retrieval)
 

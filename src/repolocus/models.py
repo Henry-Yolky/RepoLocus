@@ -168,6 +168,7 @@ class IndexSnapshot:
     skipped: tuple[tuple[str, int], ...] = ()
     warnings: tuple[str, ...] = ()
     temporarily_unreadable: tuple[str, ...] = ()
+    dependency_resolver_fingerprint: str | None = None
 
     @property
     def generation(self) -> int:
