@@ -9,7 +9,7 @@ executing repository commands, builds a local SQLite/FTS index, writes a stable
 It works without an LLM; Ollama and explicitly approved cloud providers can add a narrative
 answer on top of the same evidence.
 
-> **Alpha:** this repository implements the CLI-first v0.1 baseline. Static dependency and
+> **Alpha:** this repository implements the CLI-first v0.2 baseline. Static dependency and
 > call relationships are approximations, and the hosted public-repository Web Demo described
 > in the roadmap is not part of this release.
 
@@ -129,7 +129,11 @@ facts; `--refresh rebuild` reparses every source file. Use `--refresh never` onl
 pinning the last compatible committed snapshot. `repolocus status` reports the retrieval-visible
 content generation separately from the diagnostic scan revision.
 The Python `RepoLocusService.scan()` result keeps unchanged files metadata-only (including cached
-fact counts); use `map()`, `diagram()`, or `evidence()` when materialized facts are required.
+fact counts). `map()`, `diagram()`, and `evidence()` also consume bounded index projections; use
+the `RepositoryIndex` query methods when a caller explicitly needs stored facts. The
+`RepoLocusService.evidence()` compatibility API returns an evidence list, while
+`evidence_result()` returns the structured intent, confidence, rejection reason, fusion hits, and
+suppression diagnostics alongside the same evidence.
 
 Add `--follow-up` to `ask` for a non-persistent in-memory question session; entering a blank line
 ends it. The first answer pins the content generation, and every follow-up uses that exact
@@ -169,7 +173,7 @@ Restart Codex after copying the directory, or reload its Skill registry when the
 that action. Then invoke the Skill as `$repolocus-analyze-repo`. It intentionally exposes no
 cloud-consent flags; an agent cannot silently send repository content to a remote provider
 through this path. The Skill archive contains the adapter, not a RepoLocus runtime. A compatible
-`>=0.1.5,<0.2.0` installed runtime or pre-synchronized trusted source checkout must already exist; adapter
+`>=0.2.0,<0.3.0` installed runtime or pre-synchronized trusted source checkout must already exist; adapter
 operations stay offline and fail closed instead of downloading or synchronizing dependencies.
 
 ## Self-hosted API
@@ -244,18 +248,20 @@ for the detailed model.
 
 ## Supported languages
 
-The scanner identifies many common text formats. v0.1 extracts the strongest symbols and
-imports for Python, JavaScript/TypeScript, Go, Rust, Java, and C/C++. Python uses the standard
-AST; other languages currently use conservative parser plugins and are explicitly static
-approximations. Tree-sitter adapters and language-specific semantic resolution remain on the
-roadmap.
+The scanner identifies many common text formats. Python uses the standard AST. Installing the
+`treesitter` extra adds native syntax ranges for C, C++, JavaScript, TypeScript, and Rust while
+retaining deterministic heuristic fallback; Go, Java, documentation, and configuration parsing
+remain conservative static approximations. Dependency extraction stays lexical and never executes
+project code or build metadata.
 
 | Capability | Python | JS/TS | Go | Rust | Java | C/C++ | Docs/config |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Safe indexing | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Symbols/imports | AST | Heuristic | Heuristic | Heuristic | Heuristic | Heuristic | No |
+| Symbols/imports | AST | Tree-sitter*/heuristic | Heuristic | Tree-sitter*/heuristic | Heuristic | Tree-sitter*/heuristic | Heuristic |
 | Source citations | Yes | Yes | Yes | Yes | Yes | Yes | File chunks |
 | Full call graph | No | No | No | No | No | No | No |
+
+\* Tree-sitter is enabled only when the optional `treesitter` extra is installed.
 
 ## Model support
 
@@ -287,8 +293,8 @@ and citation recall, plus aggregate macro recall, MRR, mean nDCG, any/all-path r
 no-answer precision/recall/F1/accuracy, `must_not_return` violations, and per-language,
 per-repository, and per-query-type breakdowns. Answerable retrieval and no-answer classification
 are aggregated separately. The self dataset remains a smoke test; the fixed six-repository,
-18-qrel fixture set is the v0.1.5 CI gate, including citation recall >= 1.0. It is still smaller
-than the planned 100+ reviewed qrels.
+102-qrel reviewed fixture set is the v0.2 CI/release gate, including citation recall >= 1.0 and
+explicit minimum answerable, no-answer, citation, and query-type coverage.
 
 Architecture decisions live in
 [`docs/adr/`](https://github.com/Henry-Yolky/RepoLocus/tree/main/docs/adr). Contributions are
@@ -299,11 +305,12 @@ welcome; start with
 
 ## Roadmap and limits
 
-The repository includes a reproducible synthetic scan harness under `benchmarks/`, a self-
-retrieval smoke set, and a fixed multi-repository release gate under `evaluation/`. Fixture source,
-revision, license, tree digest, and qrel digest are recorded, but the initial 18 qrels do not
-substitute for the planned 100+ reviewed set. The next milestones are Tree-sitter adapters,
-stronger graph resolution, a public-repository-only Web Demo, and an opt-in GitHub Action. The
+The repository includes reproducible synthetic scan and indexed-workflow gates under
+`benchmarks/`, a self-retrieval smoke set, and a fixed multi-repository release gate under
+`evaluation/`. Fixture source, revision, license, tree digest, qrel digest, and review status are
+recorded for all 102 qrels. v0.2 adds optional Tree-sitter adapters, an indexed
+resolved dependency graph, projection-only map/diagram reads, and structured RRF retrieval. The
+next milestones include a public-repository-only Web Demo and an opt-in GitHub Action. The
 project will not claim a complete dynamic call graph from static source. See
 [ROADMAP.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/ROADMAP.md) for scope.
 

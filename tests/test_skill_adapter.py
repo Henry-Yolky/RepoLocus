@@ -312,7 +312,7 @@ def test_runtime_probe_validates_module_origin_and_compatible_version(
         "run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=0,
-            stdout=json.dumps({"origin": str(origin), "version": "0.1.5"}),
+            stdout=json.dumps({"origin": str(origin), "version": "0.2.0"}),
             stderr="",
         ),
     )
@@ -327,11 +327,14 @@ def test_runtime_probe_validates_module_origin_and_compatible_version(
     )
 
     assert runtime.origin == origin.resolve()
-    assert runtime.version == "0.1.5"
+    assert runtime.version == "0.2.0"
     assert runtime.prefix[-2:] == ("-m", "repolocus")
 
 
-@pytest.mark.parametrize("version", ["0.1.1", "0.1.2", "0.1.3", "0.1.4", "0.2.0", "not-a-version"])
+@pytest.mark.parametrize(
+    "version",
+    ["0.1.1", "0.1.4", "0.1.5", "0.3.0", "1.0.0", "not-a-version"],
+)
 def test_runtime_probe_rejects_incompatible_versions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
@@ -350,7 +353,7 @@ def test_runtime_probe_rejects_incompatible_versions(
         ),
     )
 
-    with pytest.raises(adapter.AdapterError, match=r"requires >=0\.1\.5,<0\.2\.0"):
+    with pytest.raises(adapter.AdapterError, match=r"requires >=0\.2\.0,<0\.3\.0"):
         adapter._probe_runtime(
             [str(tmp_path / "python"), "-I"],
             environment={},

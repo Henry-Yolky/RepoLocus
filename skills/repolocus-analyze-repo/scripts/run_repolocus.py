@@ -69,9 +69,9 @@ _PATH_ENVIRONMENT = frozenset(
         "XDG_STATE_HOME",
     }
 )
-_MINIMUM_RUNTIME_VERSION = (0, 1, 5)
-_MAXIMUM_RUNTIME_VERSION = (0, 2, 0)
-_RUNTIME_REQUIREMENT = ">=0.1.5,<0.2.0"
+_MINIMUM_RUNTIME_VERSION = (0, 2, 0)
+_MAXIMUM_RUNTIME_VERSION = (0, 3, 0)
+_RUNTIME_REQUIREMENT = ">=0.2.0,<0.3.0"
 _VERSION = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 _RUNTIME_PROBE = (
     "import importlib.metadata as metadata, importlib.util as util, json; "

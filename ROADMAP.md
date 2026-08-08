@@ -12,11 +12,18 @@
 
 ## v0.2: better daily use
 
-- Tree-sitter adapters and language-specific import resolution
-- Git-aware cache invalidation without collecting author identity by default
-- Benchmarks across 1k, 10k, and 100k-file fixtures
+- Optional Tree-sitter adapters with deterministic heuristic fallback
+- Persistent, ambiguity-preserving dependency resolution shared by all consumers
+- Indexed SQLite symbol and dependency-neighbor queries
+- Projection-only, generation-pinned map and diagram generation
+- Structured query intent, RRF, deduplication, diversity, and explicit no-answer results
+- 102 reviewed external qrels and versioned scan/map/diagram/query/RSS release gates
+
+## v0.2.x: maintainer workflows
+
+- Repository/snapshot architecture diff
 - Opt-in GitHub Action that proposes project-map diffs
-- PR context summaries and improved golden evaluations
+- PR context summaries and reproducible public benchmarks
 
 ## v0.3: reusable understanding layer
 
