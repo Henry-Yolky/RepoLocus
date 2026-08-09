@@ -162,7 +162,7 @@ class Settings:
         if not isinstance(self.telemetry, bool):
             raise ConfigError("telemetry must be true or false")
         if self.telemetry:
-            raise ConfigError("telemetry is not implemented in v0.1 and must remain false")
+            raise ConfigError("telemetry is not implemented and must remain false")
         for field_name in ("ollama_base_url", "openai_base_url", "anthropic_base_url"):
             _validate_base_url(field_name, getattr(self, field_name))
         if (

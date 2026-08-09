@@ -40,6 +40,8 @@ class IndexRevisionStateMachine(RuleBasedStateMachine):
         )
         self.disk: dict[str, tuple[str, bytes]] = {}
         self.committed: dict[str, tuple[str, bytes]] = {}
+        self.disk_metadata: dict[str, tuple[int, int, int]] = {}
+        self.committed_metadata: dict[str, tuple[int, int, int]] = {}
         self.content_generation = 0
         self.scan_revision = 0
         self.has_scanned = False
@@ -55,23 +57,34 @@ class IndexRevisionStateMachine(RuleBasedStateMachine):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         self.disk[path] = (content, target.read_bytes())
+        metadata = target.stat()
+        self.disk_metadata[path] = (
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
 
     @rule(path=sampled_from(("a.py", "b.py", "nested/c.py")))
     def delete_file(self, path: str) -> None:
         assume(path in self.disk)
         (self.root / path).unlink()
         self.disk.pop(path)
+        self.disk_metadata.pop(path)
 
     @rule(mode=sampled_from(("auto", "always", "rebuild")))
     def refresh(self, mode: str) -> None:
-        dirty = self.disk != self.committed
-        exact_auto_hit = mode == "auto" and self.has_scanned and not dirty
+        content_dirty = self.disk != self.committed
+        metadata_dirty = self.disk_metadata != self.committed_metadata
+        exact_auto_hit = (
+            mode == "auto" and self.has_scanned and not content_dirty and not metadata_dirty
+        )
         operation = self.service.scan(self.root, refresh=mode)  # type: ignore[arg-type]
         if not exact_auto_hit:
             self.scan_revision += 1
-        if dirty:
+        if content_dirty:
             self.content_generation += 1
         self.committed = dict(self.disk)
+        self.committed_metadata = dict(self.disk_metadata)
         self.has_scanned = True
         assert operation.update.content_generation == self.content_generation
         assert operation.update.scan_revision == self.scan_revision
@@ -88,7 +101,13 @@ class IndexRevisionStateMachine(RuleBasedStateMachine):
             file.path: file.text for file in before.files
         }
 
-    @precondition(lambda self: self.has_scanned and self.disk == self.committed)
+    @precondition(
+        lambda self: (
+            self.has_scanned
+            and self.disk == self.committed
+            and self.disk_metadata == self.committed_metadata
+        )
+    )
     @rule()
     def retrieval_fingerprint_change_has_minimal_scope(self) -> None:
         self.fingerprint_revision += 1
@@ -124,6 +143,7 @@ class IndexRevisionStateMachine(RuleBasedStateMachine):
         if dirty:
             self.content_generation += 1
         self.committed = dict(self.disk)
+        self.committed_metadata = dict(self.disk_metadata)
         with RepositoryIndex.open(self.root) as index:
             try:
                 index.update(stale)

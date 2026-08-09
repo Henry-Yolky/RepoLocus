@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
+from bisect import bisect_right
 from pathlib import PurePosixPath
 
 from repolocus.models import Dependency, Symbol
-from repolocus.parsers.base import ParseResult
+from repolocus.parsers.base import (
+    DEFAULT_MAX_CHUNKS_PER_FILE,
+    DEFAULT_MAX_DEPENDENCIES_PER_FILE,
+    DEFAULT_MAX_SYMBOLS_PER_FILE,
+    ParseResult,
+)
 from repolocus.parsers.chunking import Region, semantic_chunks
 
 _FALLBACK_SYMBOL_RE = re.compile(
@@ -50,19 +58,39 @@ def _class_signature(node: ast.ClassDef) -> str:
 
 
 class _PythonVisitor(ast.NodeVisitor):
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, max_symbols: int, max_dependencies: int) -> None:
         self.path = path
         self.symbols: list[Symbol] = []
         self.dependencies: list[Dependency] = []
+        self._seen_symbols: set[Symbol] = set()
+        self._seen_dependencies: set[Dependency] = set()
+        self._max_symbols = max_symbols
+        self._max_dependencies = max_dependencies
         self._scope: list[tuple[str, str]] = []
         self.has_main_guard = False
+
+    def _add_symbol(self, symbol: Symbol) -> None:
+        if symbol in self._seen_symbols:
+            return
+        if len(self._seen_symbols) >= self._max_symbols:
+            raise ValueError("parser exceeded the configured symbol limit")
+        self._seen_symbols.add(symbol)
+        self.symbols.append(symbol)
+
+    def _add_dependency(self, dependency: Dependency) -> None:
+        if dependency in self._seen_dependencies:
+            return
+        if len(self._seen_dependencies) >= self._max_dependencies:
+            raise ValueError("parser exceeded the configured dependency limit")
+        self._seen_dependencies.add(dependency)
+        self.dependencies.append(dependency)
 
     def _qualified(self, name: str) -> str:
         return ".".join([*(scope[0] for scope in self._scope), name])
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         name = self._qualified(node.name)
-        self.symbols.append(
+        self._add_symbol(
             Symbol(
                 name=name,
                 kind="class",
@@ -80,7 +108,7 @@ class _PythonVisitor(ast.NodeVisitor):
         name = self._qualified(node.name)
         in_class = any(scope_kind == "class" for _, scope_kind in self._scope)
         kind = "method" if in_class else "function"
-        self.symbols.append(
+        self._add_symbol(
             Symbol(
                 name=name,
                 kind=kind,
@@ -102,7 +130,7 @@ class _PythonVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            self.dependencies.append(Dependency(self.path, alias.name, "import", node.lineno))
+            self._add_dependency(Dependency(self.path, alias.name, "import", node.lineno))
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         prefix = "." * node.level
@@ -111,7 +139,7 @@ class _PythonVisitor(ast.NodeVisitor):
         else:
             targets = [f"{prefix}{alias.name}" for alias in node.names]
         for target in targets:
-            self.dependencies.append(Dependency(self.path, target, "import", node.lineno))
+            self._add_dependency(Dependency(self.path, target, "import", node.lineno))
 
     def visit_If(self, node: ast.If) -> None:
         if _is_main_guard(node.test):
@@ -135,32 +163,113 @@ def _is_main_guard(test: ast.AST) -> bool:
     )
 
 
-def _fallback(path: str, text: str) -> tuple[list[Symbol], list[Dependency], bool]:
+def _token_offset(line_starts: list[int], text_length: int, position: tuple[int, int]) -> int:
+    row, column = position
+    if row <= 0:
+        return 0
+    if row > len(line_starts):
+        return text_length
+    return min(line_starts[row - 1] + column, text_length)
+
+
+def _is_main_literal(value: str) -> bool:
+    if "__main__" not in value or len(value) > 64:
+        return False
+    try:
+        return ast.literal_eval(value) == "__main__"
+    except (SyntaxError, ValueError):
+        return False
+
+
+def _masked_fallback_source(text: str) -> tuple[str, list[int]]:
+    """Mask Python strings/comments while retaining token and line positions."""
+
+    line_starts = [0]
+    line_starts.extend(index + 1 for index, character in enumerate(text) if character == "\n")
+    masked = list(text)
+
+    def mask_range(start: int, end: int) -> None:
+        for index in range(start, end):
+            if masked[index] not in "\r\n":
+                masked[index] = " "
+
+    tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+    try:
+        for token in tokens:
+            if token.type not in {tokenize.STRING, tokenize.COMMENT}:
+                continue
+            if token.type == tokenize.STRING and _is_main_literal(token.string):
+                continue
+            start = _token_offset(line_starts, len(text), token.start)
+            end = _token_offset(line_starts, len(text), token.end)
+            mask_range(start, end)
+    except tokenize.TokenError as exc:
+        message = str(exc.args[0]) if exc.args else ""
+        location = exc.args[1] if len(exc.args) > 1 else None
+        if (
+            isinstance(location, tuple)
+            and len(location) == 2
+            and ("multi-line string" in message or "triple-quoted string" in message)
+        ):
+            row, column = location
+            start = _token_offset(
+                line_starts,
+                len(text),
+                (int(row), max(0, int(column) - 1)),
+            )
+            mask_range(start, len(text))
+    except (IndentationError, SyntaxError):
+        # Syntax-error fallback intentionally uses every safe token produced
+        # before tokenization reached the malformed region.
+        pass
+    return "".join(masked), line_starts
+
+
+def _fallback(
+    path: str,
+    text: str,
+    *,
+    max_symbols: int,
+    max_dependencies: int,
+) -> tuple[list[Symbol], list[Dependency], bool]:
+    masked, line_starts = _masked_fallback_source(text)
+
+    def line_at(offset: int) -> int:
+        return bisect_right(line_starts, min(max(offset, 0), len(text)))
+
     symbols: list[Symbol] = []
-    for match in _FALLBACK_SYMBOL_RE.finditer(text):
-        line = text.count("\n", 0, match.start()) + 1
+    seen_symbols: set[Symbol] = set()
+    for match in _FALLBACK_SYMBOL_RE.finditer(masked):
+        line = line_at(match.start())
         kind = "class" if match.group("kind") == "class" else "function"
         async_prefix = "async " if match.group("async") else ""
-        symbols.append(
-            Symbol(
-                name=match.group("name"),
-                kind=kind,
-                path=path,
-                start_line=line,
-                end_line=line,
-                signature=f"{async_prefix}{match.group('kind')} {match.group('name')}"
-                f"{match.group('tail').rstrip(':').strip()}",
-            )
+        symbol = Symbol(
+            name=match.group("name"),
+            kind=kind,
+            path=path,
+            start_line=line,
+            end_line=line,
+            signature=f"{async_prefix}{match.group('kind')} {match.group('name')}"
+            f"{match.group('tail').rstrip(':').strip()}",
         )
+        if symbol not in seen_symbols:
+            if len(symbols) >= max_symbols:
+                raise ValueError("parser exceeded the configured symbol limit")
+            seen_symbols.add(symbol)
+            symbols.append(symbol)
     dependencies: list[Dependency] = []
-    for match in _FALLBACK_IMPORT_RE.finditer(text):
+    seen_dependencies: set[Dependency] = set()
+    for match in _FALLBACK_IMPORT_RE.finditer(masked):
         target = match.group("from") or match.group("import")
-        dependencies.append(
-            Dependency(path, target, "import", text.count("\n", 0, match.start()) + 1)
-        )
+        dependency = Dependency(path, target, "import", line_at(match.start()))
+        if dependency not in seen_dependencies:
+            if len(dependencies) >= max_dependencies:
+                raise ValueError("parser exceeded the configured dependency limit")
+            seen_dependencies.add(dependency)
+            dependencies.append(dependency)
     has_main_guard = bool(
-        re.search(r"\b__name__\s*==\s*['\"]__main__['\"]", text)
-        or re.search(r"['\"]__main__['\"]\s*==\s*\b__name__", text)
+        re.search(r"\b__name__\s*==\s*['\"]__main__['\"]", masked)
+        or re.search(r"['\"]__main__['\"]\s*==\s*\b__name__", masked)
     )
     return symbols, dependencies, has_main_guard
 
@@ -168,7 +277,7 @@ def _fallback(path: str, text: str) -> tuple[list[Symbol], list[Dependency], boo
 class PythonParser:
     """Extract Python symbols and imports without executing the source."""
 
-    cache_key = "python-ast:v2"
+    cache_key = "python-ast:v3"
     priority = 100
     languages = frozenset({"python"})
 
@@ -180,13 +289,25 @@ class PythonParser:
         *,
         max_chunk_lines: int,
         max_chunk_chars: int,
+        max_dependencies_per_file: int = DEFAULT_MAX_DEPENDENCIES_PER_FILE,
+        max_symbols_per_file: int = DEFAULT_MAX_SYMBOLS_PER_FILE,
+        max_chunks_per_file: int = DEFAULT_MAX_CHUNKS_PER_FILE,
     ) -> ParseResult:
         try:
             tree = ast.parse(text, filename=path, type_comments=True)
         except (SyntaxError, ValueError, TypeError):
-            symbols, dependencies, has_main_guard = _fallback(path, text)
+            symbols, dependencies, has_main_guard = _fallback(
+                path,
+                text,
+                max_symbols=max_symbols_per_file,
+                max_dependencies=max_dependencies_per_file,
+            )
         else:
-            visitor = _PythonVisitor(path)
+            visitor = _PythonVisitor(
+                path,
+                max_symbols=max_symbols_per_file,
+                max_dependencies=max_dependencies_per_file,
+            )
             visitor.visit(tree)
             symbols = visitor.symbols
             dependencies = visitor.dependencies
@@ -204,6 +325,7 @@ class PythonParser:
             regions=regions,
             max_lines=max_chunk_lines,
             max_chars=max_chunk_chars,
+            max_chunks=max_chunks_per_file,
         )
         basename = PurePosixPath(path).name.casefold()
         conventional_entry = basename in {

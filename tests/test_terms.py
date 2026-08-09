@@ -44,6 +44,16 @@ def test_query_synonyms_are_explicit_and_do_not_change_literal_terms() -> None:
     assert expanded[-2:] == ("config", "settings")
 
 
+def test_literal_query_terms_ignore_search_instructions_and_linking_words() -> None:
+    assert literal_query_terms("Locate the configuration that declares config_cli.") == (
+        "configuration",
+        "declares",
+        "config_cli",
+        "config",
+        "cli",
+    )
+
+
 def test_query_terms_add_only_generic_suffix_variants() -> None:
     assert query_terms("symlinks validated") == (
         "symlinks",

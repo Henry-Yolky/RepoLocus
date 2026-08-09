@@ -4,7 +4,7 @@
     "language": "en",
     "query_type": "identifier",
     "expected_paths": ["src/repolocus/config.py"],
-    "expected_citations": ["src/repolocus/config.py:128"]
+    "expected_citations": ["src/repolocus/config.py:186-203"]
   },
   {
     "question": "PrivacyStore is_allowed grant transport_identity consent",

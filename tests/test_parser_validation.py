@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from repolocus.models import Chunk, Dependency, Symbol
-from repolocus.parsers import ParseResult, ParserRegistry
+from repolocus.parsers import ParseResult, ParserRegistry, PythonParser
 from repolocus.scanner import RepositoryScanner
 from repolocus.scanner.validation import ParseLimits, finalize_parse_result
 
@@ -225,6 +225,7 @@ def test_validation_failure_does_not_consume_repository_fact_budget(tmp_path: Pa
             *,
             max_chunk_lines: int,
             max_chunk_chars: int,
+            **_limits: int,
         ) -> ParseResult:
             del text, language, max_chunk_lines, max_chunk_chars
             start_line = 0 if path == "a.py" else 1
@@ -261,6 +262,7 @@ def test_repository_dependency_budget_is_enforced(tmp_path: Path) -> None:
             *,
             max_chunk_lines: int,
             max_chunk_chars: int,
+            **_limits: int,
         ) -> ParseResult:
             del text, language, max_chunk_lines, max_chunk_chars
             return ParseResult(
@@ -280,3 +282,59 @@ def test_repository_dependency_budget_is_enforced(tmp_path: Path) -> None:
     assert [file.path for file in result.files] == ["a.py"]
     assert result.stats.skipped["repository_budget"] == 1
     assert any("dependency count" in warning for warning in result.warnings)
+
+
+def test_scanner_pushes_per_file_fact_limits_into_parser(tmp_path: Path) -> None:
+    class RecordingParser:
+        languages = frozenset({"python"})
+        cache_key = "test-limit-forwarding:v1"
+        priority = 0
+
+        def __init__(self) -> None:
+            self.received: tuple[int, int, int] | None = None
+
+        def parse(
+            self,
+            path: str,
+            text: str,
+            language: str,
+            *,
+            max_chunk_lines: int,
+            max_chunk_chars: int,
+            max_dependencies_per_file: int,
+            max_symbols_per_file: int,
+            max_chunks_per_file: int,
+        ) -> ParseResult:
+            del path, text, language, max_chunk_lines, max_chunk_chars
+            self.received = (
+                max_dependencies_per_file,
+                max_symbols_per_file,
+                max_chunks_per_file,
+            )
+            return ParseResult()
+
+    parser = RecordingParser()
+    registry = ParserRegistry()
+    registry.register(parser)
+    (tmp_path / "value.py").write_text("value = 1\n", encoding="utf-8")
+
+    RepositoryScanner(
+        parser_registry=registry,
+        max_dependencies_per_file=2,
+        max_symbols_per_file=3,
+        max_chunks_per_file=4,
+    ).scan(tmp_path)
+
+    assert parser.received == (2, 3, 4)
+
+
+def test_python_parser_stops_chunking_at_the_per_file_limit() -> None:
+    with pytest.raises(ValueError, match="configured chunk limit"):
+        PythonParser().parse(
+            "many.py",
+            "def one():\n    pass\ndef two():\n    pass\n",
+            "python",
+            max_chunk_lines=1,
+            max_chunk_chars=16_000,
+            max_chunks_per_file=1,
+        )

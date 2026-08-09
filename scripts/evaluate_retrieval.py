@@ -7,7 +7,7 @@ import argparse
 import json
 import math
 import re
-from collections import defaultdict
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -24,11 +24,32 @@ class EvidenceLike(Protocol):
     path: str
     start_line: int
     end_line: int
+    content: str
     citation: str
 
 
 class RetrievalLike(Protocol):
     def search(self, question: str, limit: int) -> list[EvidenceLike]: ...
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _unit_interval(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite number from 0 to 1") from exc
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be a finite number from 0 to 1")
+    return parsed
 
 
 def _unique_paths(evidence: Iterable[EvidenceLike]) -> list[str]:
@@ -46,7 +67,7 @@ def _ndcg(returned: Sequence[str], expected: set[str] | Mapping[str, int], cutof
         return 1.0 if not returned else 0.0
     dcg = sum(
         (2 ** grades[path] - 1) / math.log2(rank + 2)
-        for rank, path in enumerate(returned)
+        for rank, path in enumerate(returned[:cutoff])
         if path in grades
     )
     ideal = sum(
@@ -54,6 +75,111 @@ def _ndcg(returned: Sequence[str], expected: set[str] | Mapping[str, int], cutof
         for rank, grade in enumerate(sorted(grades.values(), reverse=True)[:cutoff])
     )
     return dcg / ideal if ideal else 0.0
+
+
+def _line_iou(first: EvidenceLike, second: EvidenceLike) -> float:
+    if str(first.path) != str(second.path):
+        return 0.0
+    first_start, first_end = int(first.start_line), int(first.end_line)
+    second_start, second_end = int(second.start_line), int(second.end_line)
+    intersection = max(0, min(first_end, second_end) - max(first_start, second_start) + 1)
+    union = max(first_end, second_end) - min(first_start, second_start) + 1
+    return intersection / union if union else 0.0
+
+
+def _evidence_diagnostics(evidence: Sequence[EvidenceLike]) -> tuple[int, float | None, float]:
+    seen_ranges: set[tuple[str, int, int]] = set()
+    seen_content: set[str] = set()
+    duplicates = 0
+    for item in evidence:
+        identity = (str(item.path), int(item.start_line), int(item.end_line))
+        content = str(getattr(item, "content", ""))
+        if identity in seen_ranges or (bool(content) and content in seen_content):
+            duplicates += 1
+        seen_ranges.add(identity)
+        if content:
+            seen_content.add(content)
+    path_diversity = (
+        len({str(item.path) for item in evidence}) / len(evidence) if evidence else None
+    )
+    maximum_iou = max(
+        (
+            _line_iou(first, second)
+            for index, first in enumerate(evidence)
+            for second in evidence[index + 1 :]
+        ),
+        default=0.0,
+    )
+    return duplicates, path_diversity, maximum_iou
+
+
+def _retrieve(
+    retrieval: RetrievalLike,
+    question: str,
+    *,
+    limit: int,
+) -> tuple[list[EvidenceLike], dict[str, object]]:
+    search_result = getattr(retrieval, "search_result", None)
+    if not callable(search_result):
+        evidence = list(retrieval.search(question, limit=limit))
+        diagnostics: dict[str, object] = {
+            "confidence": None,
+            "rejected_reason": None,
+            "intent": None,
+            "retrieval_hits": [],
+            "suppressed": [],
+        }
+    else:
+        result = search_result(question, limit=limit)
+        raw_evidence = getattr(result, "evidence", None)
+        if not isinstance(raw_evidence, Sequence):
+            raise ValueError("structured retrieval result evidence must be a sequence")
+        evidence = list(raw_evidence)
+        confidence = getattr(result, "confidence", None)
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(float(confidence))
+            or not 0.0 <= float(confidence) <= 1.0
+        ):
+            raise ValueError("structured retrieval confidence must be from 0 to 1")
+        intent = getattr(result, "intent", None)
+        if not isinstance(intent, str) or not intent:
+            raise ValueError("structured retrieval intent must be a non-empty string")
+        rejected_reason = getattr(result, "rejected_reason", None)
+        if evidence and rejected_reason is not None:
+            raise ValueError("structured retrieval cannot reject accepted evidence")
+        if not evidence and (not isinstance(rejected_reason, str) or not rejected_reason):
+            raise ValueError("structured no-answer results require a stable rejected reason")
+        retrieval_hits: list[dict[str, object]] = []
+        for hit in getattr(result, "hits", ()):
+            features = getattr(hit, "features", None)
+            if not isinstance(features, Mapping):
+                raise ValueError("structured retrieval hit features must be a mapping")
+            retrieval_hits.append(
+                {
+                    "chunk_id": int(hit.chunk_id),
+                    "retriever": str(hit.retriever),
+                    "rank": int(hit.rank),
+                    "raw_score": hit.raw_score,
+                    "features": dict(features),
+                }
+            )
+        suppressed: list[dict[str, object]] = []
+        for item in getattr(result, "suppressed", ()):
+            if not isinstance(item, Sequence) or len(item) != 2:
+                raise ValueError("structured retrieval suppression entries must be pairs")
+            suppressed.append({"chunk_id": int(item[0]), "reason": str(item[1])})
+        diagnostics = {
+            "confidence": round(float(confidence), 6),
+            "rejected_reason": rejected_reason,
+            "intent": intent,
+            "retrieval_hits": retrieval_hits,
+            "suppressed": suppressed,
+        }
+    if len(evidence) > limit:
+        raise ValueError("retrieval returned more evidence than the requested limit")
+    return evidence, diagnostics
 
 
 def _citation_range(value: str) -> tuple[str, int, int]:
@@ -97,19 +223,6 @@ def evaluate_cases(
     if limit <= 0:
         raise ValueError("evaluation limit must be positive")
     outcomes: list[dict[str, object]] = []
-    language_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
-    language_case_counts: dict[str, int] = defaultdict(int)
-    repository_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
-    repository_case_counts: dict[str, int] = defaultdict(int)
-    query_type_metrics: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
-    query_type_case_counts: dict[str, int] = defaultdict(int)
-    no_answer_true_positive = 0
-    no_answer_false_positive = 0
-    no_answer_false_negative = 0
-    no_answer_true_negative = 0
-    citation_scores: list[float] = []
-    must_not_return_cases = 0
-    must_not_return_violations = 0
     for case in cases:
         question = str(case["question"])
         relevant = case.get("relevant")
@@ -153,8 +266,9 @@ def evaluate_cases(
             raise ValueError("answerable must be true or false")
         if explicit_answerable != bool(expected):
             raise ValueError("answerable must agree with the presence of relevant paths")
-        evidence = retrieval.search(question, limit=limit)
+        evidence, diagnostics = _retrieve(retrieval, question, limit=limit)
         returned = _unique_paths(evidence)
+        duplicate_count, path_diversity, maximum_line_iou = _evidence_diagnostics(evidence)
         answerable = explicit_answerable
         predicted_no_answer = not returned
         relevant_ranks = [rank for rank, path in enumerate(returned, 1) if path in expected]
@@ -167,40 +281,43 @@ def evaluate_cases(
         if not isinstance(expected_citations, list):
             raise ValueError("expected_citations must be a JSON list")
         citation_recall = _citation_recall(evidence, [str(item) for item in expected_citations])
-        if citation_recall is not None:
-            citation_scores.append(citation_recall)
         raw_must_not_return = case.get("must_not_return", [])
         if not isinstance(raw_must_not_return, list):
             raise ValueError("must_not_return must be a JSON list")
         forbidden = {str(path) for path in raw_must_not_return}
         forbidden_returned = sorted(forbidden.intersection(returned))
-        if forbidden:
-            must_not_return_cases += 1
-            if forbidden_returned:
-                must_not_return_violations += 1
-        if not answerable and predicted_no_answer:
-            no_answer_true_positive += 1
-        elif answerable and predicted_no_answer:
-            no_answer_false_positive += 1
-        elif not answerable:
-            no_answer_false_negative += 1
-        else:
-            no_answer_true_negative += 1
         language = str(case.get("language", "unspecified"))
-        language_case_counts[language] += 1
-        repository = str(case.get("fixture", "unspecified"))
-        repository_case_counts[repository] += 1
         query_type = str(case.get("query_type", "unspecified"))
-        query_type_case_counts[query_type] += 1
-        if answerable:
-            if recall is None or reciprocal_rank is None or ndcg is None:  # pragma: no cover
-                raise RuntimeError("answerable metric invariant violated")
-            language_metrics[language].append((recall, reciprocal_rank, ndcg))
-            repository_metrics[repository].append((recall, reciprocal_rank, ndcg))
-            query_type_metrics[query_type].append((recall, reciprocal_rank, ndcg))
+        expected_intent = case.get("expected_intent")
+        if expected_intent is not None and (
+            not isinstance(expected_intent, str) or not expected_intent
+        ):
+            raise ValueError("expected_intent must be a non-empty string")
+        actual_intent = diagnostics["intent"]
+        if expected_intent is not None and actual_intent is None:
+            raise ValueError("intent qrels require the structured retrieval API")
+        intent_match = actual_intent == expected_intent if expected_intent is not None else None
+        required_graph_retriever = {
+            "direct_dependency": "outbound_dependency",
+            "reverse_dependency": "reverse_dependency",
+        }.get(query_type)
+        graph_grounded: bool | None = None
+        if required_graph_retriever is not None:
+            retriever_present = any(
+                hit["retriever"] == required_graph_retriever
+                for hit in diagnostics["retrieval_hits"]  # type: ignore[union-attr]
+            )
+            graph_reason = "dependency of" if query_type == "direct_dependency" else "dependent of"
+            relevant_graph_evidence = any(
+                str(item.path) in expected and graph_reason in str(getattr(item, "reason", ""))
+                for item in evidence
+            )
+            graph_grounded = retriever_present and relevant_graph_evidence
         outcomes.append(
             {
                 "question": question,
+                "case_id": case.get("case_id"),
+                "case_family": case.get("case_family"),
                 "language": language,
                 "query_type": query_type,
                 "answerable": answerable,
@@ -215,9 +332,35 @@ def evaluate_cases(
                 "citation_recall": (
                     round(citation_recall, 6) if citation_recall is not None else None
                 ),
+                "duplicate_evidence_count": duplicate_count,
+                "duplicate_evidence_rate": round(duplicate_count / len(evidence), 6)
+                if evidence
+                else 0.0,
+                "path_diversity": round(path_diversity, 6) if path_diversity is not None else None,
+                "maximum_line_iou": round(maximum_line_iou, 6),
+                "expected_intent": expected_intent,
+                "intent": actual_intent,
+                "intent_match": intent_match,
+                "graph_grounded": graph_grounded,
+                "confidence": diagnostics["confidence"],
+                "rejected_reason": diagnostics["rejected_reason"],
+                "retrieval_hits": diagnostics["retrieval_hits"],
+                "suppressed": diagnostics["suppressed"],
                 "expected_paths": sorted(expected),
                 "returned_paths": returned,
                 "returned_citations": [str(item.citation) for item in evidence],
+                "returned_evidence": [
+                    {
+                        "path": str(item.path),
+                        "start_line": int(item.start_line),
+                        "end_line": int(item.end_line),
+                        "citation": str(item.citation),
+                        "symbol": str(getattr(item, "symbol", "")),
+                        "generation": int(getattr(item, "generation", 0)),
+                        "reason": str(getattr(item, "reason", "")),
+                    }
+                    for item in evidence
+                ],
                 "must_not_return": sorted(forbidden),
                 "must_not_return_violations": forbidden_returned,
                 "fixture": case.get("fixture"),
@@ -226,103 +369,134 @@ def evaluate_cases(
             }
         )
 
-    answerable = [outcome for outcome in outcomes if outcome["answerable"]]
-    no_answer_cases = len(outcomes) - len(answerable)
-    no_answer_precision_denominator = no_answer_true_positive + no_answer_false_positive
-    no_answer_recall_denominator = no_answer_true_positive + no_answer_false_negative
-    no_answer_precision = (
-        no_answer_true_positive / no_answer_precision_denominator
-        if no_answer_precision_denominator
-        else 0.0
-        if no_answer_cases
-        else None
-    )
-    no_answer_recall = (
-        no_answer_true_positive / no_answer_recall_denominator
-        if no_answer_recall_denominator
-        else None
-    )
-    no_answer_f1 = (
-        2 * no_answer_precision * no_answer_recall / (no_answer_precision + no_answer_recall)
-        if no_answer_precision is not None
-        and no_answer_recall is not None
-        and no_answer_precision + no_answer_recall > 0
-        else 0.0
-        if no_answer_precision is not None and no_answer_recall is not None
-        else None
-    )
+    def average(items: Sequence[Mapping[str, object]], field: str) -> float | None:
+        values = [float(item[field]) for item in items if item.get(field) is not None]
+        return round(sum(values) / len(values), 6) if values else None
 
-    def answerable_average(field: str) -> float | None:
-        if not answerable:
-            return None
-        return round(sum(float(outcome[field]) for outcome in answerable) / len(answerable), 6)
-
-    def bucket_summary(
-        counts: Mapping[str, int],
-        values: Mapping[str, list[tuple[float, float, float]]],
-    ) -> dict[str, dict[str, int | float | None]]:
-        summary: dict[str, dict[str, int | float | None]] = {}
-        for label in sorted(counts):
-            answerable_values = values[label]
-            answerable_count = len(answerable_values)
-            summary[label] = {
-                "cases": counts[label],
-                "answerable_cases": answerable_count,
-                "no_answer_cases": counts[label] - answerable_count,
-                "macro_recall_at_k": (
-                    round(sum(item[0] for item in answerable_values) / answerable_count, 6)
-                    if answerable_values
-                    else None
-                ),
-                "mrr": (
-                    round(sum(item[1] for item in answerable_values) / answerable_count, 6)
-                    if answerable_values
-                    else None
-                ),
-                "mean_ndcg_at_k": (
-                    round(sum(item[2] for item in answerable_values) / answerable_count, 6)
-                    if answerable_values
-                    else None
-                ),
-            }
-        return summary
-
-    metrics: dict[str, object] = {
-        "cases": len(outcomes),
-        "answerable_cases": len(answerable),
-        "no_answer_cases": no_answer_cases,
-        "macro_recall_at_k": answerable_average("recall_at_k"),
-        "mrr": answerable_average("reciprocal_rank"),
-        "mean_ndcg_at_k": answerable_average("ndcg_at_k"),
-        "any_expected_path_rate": answerable_average("any_expected_path"),
-        "all_expected_paths_rate": answerable_average("all_expected_paths"),
-        # Compatibility alias retained for reports produced by v0.1.3.
-        "answerable_all_paths_rate": answerable_average("all_expected_paths"),
-        "citation_recall": round(sum(citation_scores) / len(citation_scores), 6)
-        if citation_scores
-        else None,
-        "citation_cases": len(citation_scores),
-        "must_not_return_cases": must_not_return_cases,
-        "must_not_return_violations": must_not_return_violations,
-        "must_not_return_violation_rate": (
-            round(must_not_return_violations / must_not_return_cases, 6)
-            if must_not_return_cases
+    def summarize(items: Sequence[Mapping[str, object]]) -> dict[str, object]:
+        answerable = [item for item in items if bool(item["answerable"])]
+        no_answer = [item for item in items if not bool(item["answerable"])]
+        true_positive = sum(bool(item["predicted_no_answer"]) for item in no_answer)
+        false_positive = sum(bool(item["predicted_no_answer"]) for item in answerable)
+        true_negative = len(answerable) - false_positive
+        precision_denominator = true_positive + false_positive
+        no_answer_precision = (
+            true_positive / precision_denominator
+            if precision_denominator
             else 0.0
-        ),
-        "no_answer_precision": (
-            round(no_answer_precision, 6) if no_answer_precision is not None else None
-        ),
-        "no_answer_recall": round(no_answer_recall, 6) if no_answer_recall is not None else None,
-        "no_answer_f1": round(no_answer_f1, 6) if no_answer_f1 is not None else None,
-        "no_answer_accuracy": round(
-            (no_answer_true_positive + no_answer_true_negative) / len(outcomes), 6
+            if no_answer
+            else None
         )
-        if outcomes
-        else None,
-        "by_language": bucket_summary(language_case_counts, language_metrics),
-        "by_repository": bucket_summary(repository_case_counts, repository_metrics),
-        "by_query_type": bucket_summary(query_type_case_counts, query_type_metrics),
-    }
+        no_answer_recall = true_positive / len(no_answer) if no_answer else None
+        no_answer_f1 = (
+            2 * no_answer_precision * no_answer_recall / (no_answer_precision + no_answer_recall)
+            if no_answer_precision is not None
+            and no_answer_recall is not None
+            and no_answer_precision + no_answer_recall > 0
+            else 0.0
+            if no_answer_precision is not None and no_answer_recall is not None
+            else None
+        )
+        citations = [
+            float(item["citation_recall"])
+            for item in items
+            if item.get("citation_recall") is not None
+        ]
+        constrained = [item for item in items if item.get("must_not_return")]
+        violations = sum(bool(item["must_not_return_violations"]) for item in constrained)
+        evidence_count = sum(len(item["returned_evidence"]) for item in items)  # type: ignore[arg-type]
+        duplicate_count = sum(int(item["duplicate_evidence_count"]) for item in items)
+        intent_cases = [item for item in items if item.get("intent_match") is not None]
+        graph_cases = [item for item in items if item.get("graph_grounded") is not None]
+        return {
+            "cases": len(items),
+            "answerable_cases": len(answerable),
+            "no_answer_cases": len(no_answer),
+            "macro_recall_at_k": average(answerable, "recall_at_k"),
+            "mrr": average(answerable, "reciprocal_rank"),
+            "mean_ndcg_at_k": average(answerable, "ndcg_at_k"),
+            "any_expected_path_rate": average(answerable, "any_expected_path"),
+            "all_expected_paths_rate": average(answerable, "all_expected_paths"),
+            "citation_recall": round(sum(citations) / len(citations), 6) if citations else None,
+            "citation_cases": len(citations),
+            "must_not_return_cases": len(constrained),
+            "must_not_return_violations": violations,
+            "must_not_return_violation_rate": round(violations / len(constrained), 6)
+            if constrained
+            else 0.0,
+            "no_answer_precision": round(no_answer_precision, 6)
+            if no_answer_precision is not None
+            else None,
+            "no_answer_recall": round(no_answer_recall, 6)
+            if no_answer_recall is not None
+            else None,
+            "no_answer_f1": round(no_answer_f1, 6) if no_answer_f1 is not None else None,
+            "no_answer_accuracy": round((true_positive + true_negative) / len(items), 6)
+            if items
+            else None,
+            "returned_evidence": evidence_count,
+            "duplicate_evidence": duplicate_count,
+            "duplicate_evidence_rate": round(duplicate_count / evidence_count, 6)
+            if evidence_count
+            else 0.0,
+            "mean_path_diversity": average(items, "path_diversity"),
+            "maximum_line_iou": max(
+                (float(item["maximum_line_iou"]) for item in items), default=0.0
+            ),
+            "intent_cases": len(intent_cases),
+            "intent_matches": sum(bool(item["intent_match"]) for item in intent_cases),
+            "intent_accuracy": average(intent_cases, "intent_match"),
+            "graph_cases": len(graph_cases),
+            "graph_grounded": sum(bool(item["graph_grounded"]) for item in graph_cases),
+            "graph_grounded_rate": average(graph_cases, "graph_grounded"),
+        }
+
+    def bucket_summary(field: str) -> dict[str, dict[str, object]]:
+        def label(item: Mapping[str, object]) -> str:
+            value = item.get(field)
+            return str(value) if value is not None else "unspecified"
+
+        labels = sorted({label(item) for item in outcomes})
+        return {
+            bucket: summarize([item for item in outcomes if label(item) == bucket])
+            for bucket in labels
+        }
+
+    metrics = summarize(outcomes)
+    # Compatibility alias retained for reports produced by v0.1.3.
+    metrics["answerable_all_paths_rate"] = metrics["all_expected_paths_rate"]
+    metrics["by_language"] = bucket_summary("language")
+    metrics["by_repository"] = bucket_summary("fixture")
+    metrics["by_query_type"] = bucket_summary("query_type")
+    metrics["by_intent"] = bucket_summary("expected_intent")
+    metrics["intent_counts"] = dict(
+        sorted(Counter(str(item["intent"]) for item in outcomes if item.get("intent")).items())
+    )
+    metrics["rejected_reason_counts"] = dict(
+        sorted(
+            Counter(
+                str(item["rejected_reason"]) for item in outcomes if item.get("rejected_reason")
+            ).items()
+        )
+    )
+    metrics["retriever_hit_counts"] = dict(
+        sorted(
+            Counter(
+                str(hit["retriever"])
+                for item in outcomes
+                for hit in item["retrieval_hits"]  # type: ignore[union-attr]
+            ).items()
+        )
+    )
+    metrics["suppressed_reason_counts"] = dict(
+        sorted(
+            Counter(
+                str(suppressed["reason"])
+                for item in outcomes
+                for suppressed in item["suppressed"]  # type: ignore[union-attr]
+            ).items()
+        )
+    )
     return outcomes, metrics
 
 
@@ -330,12 +504,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("questions", type=Path)
     parser.add_argument("repository", type=Path, nargs="?", default=Path("."))
-    parser.add_argument("--limit", type=int, default=5)
-    parser.add_argument("--minimum-hit-rate", type=float, default=0.9)
-    parser.add_argument("--minimum-macro-recall", type=float, default=0.0)
-    parser.add_argument("--minimum-mrr", type=float, default=0.0)
-    parser.add_argument("--minimum-no-answer-f1", type=float, default=0.0)
-    parser.add_argument("--maximum-must-not-return-rate", type=float, default=0.0)
+    parser.add_argument("--limit", type=_positive_integer, default=5)
+    parser.add_argument("--minimum-hit-rate", type=_unit_interval, default=0.9)
+    parser.add_argument("--minimum-macro-recall", type=_unit_interval, default=0.0)
+    parser.add_argument("--minimum-mrr", type=_unit_interval, default=0.0)
+    parser.add_argument("--minimum-no-answer-f1", type=_unit_interval, default=0.0)
+    parser.add_argument("--maximum-must-not-return-rate", type=_unit_interval, default=0.0)
     arguments = parser.parse_args()
 
     questions = json.loads(arguments.questions.read_text(encoding="utf-8"))

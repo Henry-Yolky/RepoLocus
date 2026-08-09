@@ -85,6 +85,7 @@ _URL_PASSWORD = re.compile(
     re.IGNORECASE,
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+(?P<secret>[A-Za-z0-9._~+/=-]{12,})")
+_PROSE_CONTINUATION = re.compile(r"\s+[A-Za-z]{2,}\b")
 _ASSIGNMENT_NAMES = (
     r"password|passwd|pwd|secret(?:[_-]?key)?|client[_-]?secret|api[_-]?key|"
     r"access[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|"
@@ -139,6 +140,17 @@ def _plausible_assigned_secret(value: str) -> bool:
     return _entropy(stripped) >= 2.5
 
 
+def _bearer_match_is_prose(text: str, match: re.Match[str]) -> bool:
+    """Reject low-entropy words that continue as an ordinary sentence."""
+
+    value = match.group("secret")
+    return (
+        value.isalpha()
+        and _entropy(value) < 3.5
+        and _PROSE_CONTINUATION.match(text, match.end()) is not None
+    )
+
+
 def _match_from_group(
     kind: str,
     match: re.Match[str],
@@ -188,6 +200,8 @@ def find_likely_secrets(text: str) -> tuple[SecretMatch, ...]:
     for kind, pattern in (("url_password", _URL_PASSWORD), ("bearer_token", _BEARER)):
         for match in pattern.finditer(text):
             if match.group("secret") == REDACTION_MARKER:
+                continue
+            if kind == "bearer_token" and _bearer_match_is_prose(text, match):
                 continue
             candidate = _match_from_group(kind, match, "high")
             if candidate is not None:

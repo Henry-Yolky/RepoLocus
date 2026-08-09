@@ -81,6 +81,7 @@ def semantic_chunks(
     max_lines: int = 160,
     max_chars: int = 16_000,
     max_chunks: int | None = None,
+    source_lines: list[str] | None = None,
 ) -> tuple[Chunk, ...]:
     """Build bounded chunks around symbols or document sections.
 
@@ -96,7 +97,7 @@ def semantic_chunks(
         isinstance(max_chunks, bool) or not isinstance(max_chunks, int) or max_chunks <= 0
     ):
         raise ValueError("max_chunks must be a positive integer or None")
-    lines = text.splitlines(keepends=True)
+    lines = source_lines if source_lines is not None else text.splitlines(keepends=True)
     if not lines:
         return ()
 

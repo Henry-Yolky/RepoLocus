@@ -178,6 +178,7 @@ def test_rebuild_reinvokes_parser_even_when_source_hash_is_unchanged(
             *,
             max_chunk_lines: int,
             max_chunk_chars: int,
+            **_limits: int,
         ) -> ParseResult:
             del path, text, language, max_chunk_lines, max_chunk_chars
             self.calls += 1
@@ -301,6 +302,7 @@ class _EmptyParser:
         *,
         max_chunk_lines: int,
         max_chunk_chars: int,
+        **_limits: int,
     ) -> ParseResult:
         del text, language, max_chunk_lines, max_chunk_chars
         if self.calls is not None:
@@ -387,6 +389,7 @@ def test_scanner_freezes_parser_selection_and_cache_identity_at_construction(
             *,
             max_chunk_lines: int,
             max_chunk_chars: int,
+            **_limits: int,
         ) -> ParseResult:
             del text, language, max_chunk_lines, max_chunk_chars
             self.calls += 1

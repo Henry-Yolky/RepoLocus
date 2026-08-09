@@ -1,66 +1,123 @@
 {
-  "version": 1,
-  "description": "Small, independently scanned repositories for the v0.1.5 retrieval gate.",
+  "version": 3,
+  "description": "Pinned synthetic repositories and reviewed qrels for the v0.2.0 retrieval gate.",
+  "minimum_qrels": 100,
+  "minimum_case_families": 80,
+  "minimum_case_families_per_fixture": 12,
+  "minimum_must_not_return_qrels": 30,
+  "minimum_must_not_return_qrels_per_fixture": 5,
+  "minimum_query_type_fixtures": 2,
+  "minimum_distinct_relevant_ranges": 24,
+  "minimum_distinct_relevant_ranges_per_fixture": 4,
+  "minimum_multi_path_families": 6,
+  "minimum_multi_path_families_per_fixture": 1,
+  "minimum_ambiguous_dependency_families": 2,
+  "minimum_runtime_intent_fixtures": 2,
+  "minimum_answerable_intent_families": {
+    "architecture": 2,
+    "configuration": 2,
+    "definition": 2,
+    "dependency": 2,
+    "identifier": 2,
+    "natural_language": 2,
+    "path": 2,
+    "references": 2
+  },
+  "minimum_no_answer_intent_families": {
+    "architecture": 2,
+    "configuration": 2,
+    "definition": 2,
+    "dependency": 2,
+    "identifier": 2,
+    "natural_language": 2,
+    "path": 2,
+    "references": 2
+  },
+  "minimum_query_type_families": {
+    "ambiguous_dependency": 2,
+    "architecture": 2,
+    "configuration": 2,
+    "definition": 2,
+    "direct_dependency": 2,
+    "entry_point": 2,
+    "exact_symbol": 2,
+    "expanded_symbol": 2,
+    "hard_negative": 2,
+    "partial_symbol": 2,
+    "path": 2,
+    "reverse_dependency": 2
+  },
+  "review_provenance": {
+    "review_id": "v0.2.0-qrels-r3",
+    "path": "qrels/review-provenance.json",
+    "sha256": "d65ad108e67f5ad31fb2852bdd0ef433f80dcb5898d1685376f2e5b3d186ca24"
+  },
   "fixtures": [
     {
       "id": "python-small",
       "path": "repos/python-small",
       "qrels": "qrels/python-small.jsonl",
-      "revision": "fixture-v1",
+      "revision": "fixture-v4",
       "source": "RepoLocus-authored synthetic external repository fixture",
       "license": "Apache-2.0",
-      "tree_sha256": "049cb695325731676b019989185b411080ba26fe28edf27b301afaf7ef243ec8",
-      "qrels_sha256": "89ca9a21565c9b30554733964fce0fce2a9a562133716ac9d922c873353e1020"
+      "tree_sha256": "52b4bf4cac3311a5eedd16b6bcc17132b5edbbe8586536ee789e78aa6273e624",
+      "qrels_sha256": "a5daa32634795bc691c16b8fa709ff5604018cd14c3789f901887f82f33128a0",
+      "qrels_count": 17
     },
     {
       "id": "cpp-cmake",
       "path": "repos/cpp-cmake",
       "qrels": "qrels/cpp-cmake.jsonl",
-      "revision": "fixture-v1",
+      "revision": "fixture-v4",
       "source": "RepoLocus-authored synthetic external repository fixture",
       "license": "Apache-2.0",
-      "tree_sha256": "d82207a2a88dea935a43b4506ab5bb541144cfb8d7489688251193c98bdb771c",
-      "qrels_sha256": "f1699f81ae17187dc962c544ea6d8c267d548004f9f8c53fd8eb03572320828f"
+      "tree_sha256": "7185d1283b111d3c69cfed39394a32cdf4badbeb994755bf49a49f4fef2ba7fe",
+      "qrels_sha256": "90e1985e4343c0cad698e6b3664505264afe90f5f00cff7136766f20dc70858e",
+      "qrels_count": 17
     },
     {
       "id": "rust-cli",
       "path": "repos/rust-cli",
       "qrels": "qrels/rust-cli.jsonl",
-      "revision": "fixture-v1",
+      "revision": "fixture-v4",
       "source": "RepoLocus-authored synthetic external repository fixture",
       "license": "Apache-2.0",
-      "tree_sha256": "d104ef1d63c28249fc71dcba10bbfdcda59390c9b547e97cc1d73f6f282a72a9",
-      "qrels_sha256": "46005c3ed7452d4b6b3b76e8ea2470e42dbfc24bec0c3683449a94cbd76d5e64"
+      "tree_sha256": "12ea2330dafc6bf2496e7899f2695fc3d098f330ca98a78d238696025148aa88",
+      "qrels_sha256": "2d48d82dae91b8cc4a2cc076b830c4413ad5e36b89cc8052d02c3df45cb1b714",
+      "qrels_count": 17
     },
     {
       "id": "go-service",
       "path": "repos/go-service",
       "qrels": "qrels/go-service.jsonl",
-      "revision": "fixture-v1",
+      "revision": "fixture-v4",
       "source": "RepoLocus-authored synthetic external repository fixture",
       "license": "Apache-2.0",
-      "tree_sha256": "39d8db2e1e61e993731e1a3f63db4a793464ae17b78edab0f6842324bc05a03c",
-      "qrels_sha256": "ff58f42bf2fc048151c2e9e9bba9a8304f219211e379446f9404ad72e60acbe3"
+      "tree_sha256": "b0ca058d6e92b28e6012049428829b4377ac54d15e6f752bbf6ade11e4e134a5",
+      "qrels_sha256": "25265969549c69dd8b49f4293572c6d2949b5369dfacf34f23e4dbd2f3a51d0d",
+      "qrels_count": 17
     },
     {
       "id": "typescript-web",
       "path": "repos/typescript-web",
       "qrels": "qrels/typescript-web.jsonl",
-      "revision": "fixture-v1",
+      "revision": "fixture-v4",
       "source": "RepoLocus-authored synthetic external repository fixture",
       "license": "Apache-2.0",
-      "tree_sha256": "d77fce4c9ced82c004579e78e45ba661380eaf4b74d4c53abe223a19a8b776e5",
-      "qrels_sha256": "09fd65f8ba3c4ad23f225b38c43d69a136f9d667ab1d21a828fcc86aa56fc1e3"
+      "tree_sha256": "f13f5ab375511c565f889465a901c4c86950559789c9c517e1fa27da00648ce4",
+      "qrels_sha256": "518a69fa12f7af51227626e19e8c3a1c9aaaf7393b65a00f066756104dab7bd7",
+      "qrels_count": 17
     },
     {
       "id": "java-gradle",
       "path": "repos/java-gradle",
       "qrels": "qrels/java-gradle.jsonl",
-      "revision": "fixture-v1",
+      "revision": "fixture-v4",
       "source": "RepoLocus-authored synthetic external repository fixture",
       "license": "Apache-2.0",
-      "tree_sha256": "cb2f82fe5b48bbacca4c4ededbfdeaf670ce501df4778e34549e9a53e45c5ea6",
-      "qrels_sha256": "8fb9e661f07946e48b6c211893db79fad918d6fb47e97b621ab3c7b8f8d34511"
+      "tree_sha256": "ce898b7c3a0ad37d72df2ffac903bc52267d16175d770c31d1120a93dfb37a9f",
+      "qrels_sha256": "1270bf60a61f4e36f1610e26a3d1064de50b8ab82c68312b7f7ba053cbd03771",
+      "qrels_count": 17
     }
   ]
 }

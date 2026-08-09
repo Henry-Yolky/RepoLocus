@@ -95,6 +95,59 @@ def test_evidence_refresh_uses_metadata_manifest_instead_of_full_snapshot(
     assert all(file.text == "" for file in operation.result.files)
 
 
+def test_structured_evidence_result_preserves_diagnostics_and_compatibility(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs)
+
+    result, operation = service.evidence_result(
+        "Where is load_config defined?",
+        sample_repo,
+    )
+    evidence, compatibility_operation = service.evidence(
+        "Where is load_config defined?",
+        sample_repo,
+        refresh="never",
+        expected_generation=operation.update.content_generation,
+    )
+
+    assert result.intent == "definition"
+    assert result.rejected_reason is None
+    assert result.confidence > 0
+    assert result.hits
+    assert tuple(evidence) == result.evidence
+    assert compatibility_operation.update.content_generation == operation.update.content_generation
+
+
+@pytest.mark.parametrize("invalid_limit", [True, 0, 21, 1.5])
+def test_service_evidence_rejects_invalid_limits(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    invalid_limit: object,
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs)
+
+    with pytest.raises(ValueError, match="limit must be an integer between 1 and 20"):
+        service.evidence_result("Where is load_config defined?", sample_repo, limit=invalid_limit)
+
+
+def test_refresh_never_rejects_a_stale_dependency_resolver_snapshot(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+) -> None:
+    service = _service(sample_repo, isolated_user_dirs)
+    service.scan(sample_repo)
+    with RepositoryIndex.open(sample_repo) as index:
+        index._connection.execute(
+            "UPDATE meta SET value = 'stale' WHERE key = 'dependency_resolver_fingerprint'"
+        )
+        index._connection.commit()
+
+    with pytest.raises(RuntimeError, match="no valid index snapshot"):
+        service.evidence_result("Where is load_config defined?", sample_repo, refresh="never")
+
+
 def test_explicit_scan_refresh_uses_metadata_manifest(
     sample_repo: Path,
     isolated_user_dirs: Path,

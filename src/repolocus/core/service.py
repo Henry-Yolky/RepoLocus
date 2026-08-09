@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
+from repolocus.analysis import DEPENDENCY_RESOLVER_FINGERPRINT
 from repolocus.config import Settings
 from repolocus.generators import MermaidGenerator, ProjectMapGenerator
 from repolocus.index import RepositoryIndex, StaleScanError
@@ -32,7 +33,7 @@ from repolocus.providers import (
     create_provider,
     provider_family,
 )
-from repolocus.retrieval import RetrievalEngine
+from repolocus.retrieval import RetrievalEngine, RetrievalResult
 from repolocus.scanner import RepositoryScanner
 from repolocus.security import (
     CloudSendPreview,
@@ -134,7 +135,8 @@ class RepoLocusService:
 
         Unchanged files in the returned operation carry metadata and cached fact
         counts, not materialized source text/chunks/symbols. Consumers that need
-        facts should query the committed index through map, diagram, or evidence.
+        facts should use bounded queries on the committed index; map, diagram,
+        and evidence also consume projection-only index views.
         """
 
         repo = self._repository(root)
@@ -225,6 +227,7 @@ class RepoLocusService:
             and fingerprints.scan == self.scanner.fingerprints.scan
             and fingerprints.parser == self.scanner.fingerprints.parser
             and fingerprints.term_index == self.scanner.fingerprints.term_index
+            and snapshot.dependency_resolver_fingerprint == DEPENDENCY_RESOLVER_FINGERPRINT
         )
 
     def _snapshot_operation(
@@ -305,9 +308,19 @@ class RepoLocusService:
         and stdout consumers; ``ScanOperation.to_dict()`` exposes that root.
         """
 
-        operation = self._operation(root, refresh, expected_generation)
+        operation = self._operation(
+            root,
+            refresh,
+            expected_generation,
+            materialize_files=False,
+        )
         output = self._generation_destination(operation.result.root, destination)
-        return ProjectMapGenerator().generate(operation.result, destination=output), operation
+        with (
+            RepositoryIndex.open(operation.result.root) as index,
+            index.repository_view(expected_generation=operation.update.content_generation) as view,
+        ):
+            document = ProjectMapGenerator().generate_view(view, destination=output)
+        return document, operation
 
     def diagram(
         self,
@@ -319,9 +332,19 @@ class RepoLocusService:
     ) -> tuple[str, ScanOperation]:
         """Generate a diagram using the same source-link contract as :meth:`map`."""
 
-        operation = self._operation(root, refresh, expected_generation)
+        operation = self._operation(
+            root,
+            refresh,
+            expected_generation,
+            materialize_files=False,
+        )
         output = self._generation_destination(operation.result.root, destination)
-        return MermaidGenerator().generate(operation.result, destination=output), operation
+        with (
+            RepositoryIndex.open(operation.result.root) as index,
+            index.repository_view(expected_generation=operation.update.content_generation) as view,
+        ):
+            document = MermaidGenerator().generate_view(view, destination=output)
+        return document, operation
 
     @staticmethod
     def _generation_destination(
@@ -344,6 +367,30 @@ class RepoLocusService:
         refresh: RefreshMode = "auto",
         expected_generation: int | None = None,
     ) -> tuple[list[Evidence], ScanOperation]:
+        """Return the compatibility evidence-list projection."""
+
+        result, operation = self.evidence_result(
+            question,
+            root,
+            limit=limit,
+            refresh=refresh,
+            expected_generation=expected_generation,
+        )
+        return list(result.evidence), operation
+
+    def evidence_result(
+        self,
+        question: str,
+        root: Path | str = ".",
+        *,
+        limit: int = 8,
+        refresh: RefreshMode = "auto",
+        expected_generation: int | None = None,
+    ) -> tuple[RetrievalResult, ScanOperation]:
+        """Return evidence with intent, confidence, fusion, and suppression diagnostics."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+            raise ValueError("limit must be an integer between 1 and 20")
         if not question.strip():
             raise ValueError("question must not be empty")
         if len(question) > 4_000:
@@ -356,12 +403,12 @@ class RepoLocusService:
         )
         with RepositoryIndex.open(operation.result.root) as index:
             self._require_generation(index.generation(), operation.update.generation)
-            evidence = RetrievalEngine(
+            result = RetrievalEngine(
                 index,
                 synonyms=self.settings.query_synonym_map,
-            ).search(question, limit=max(1, min(limit, 20)))
+            ).search_result(question, limit=limit)
             self._require_generation(index.generation(), operation.update.generation)
-        return evidence, operation
+        return result, operation
 
     def preview(
         self,

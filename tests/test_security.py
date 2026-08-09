@@ -212,6 +212,14 @@ def test_overlapping_assignment_and_typed_token_count_as_one_secret() -> None:
     assert repeated_count == 0
 
 
+def test_bearer_authentication_prose_is_not_treated_as_a_secret() -> None:
+    source = 'detail="Bearer authentication is required"'
+
+    assert not scanner_detects_likely_secret(source)
+    assert find_likely_secrets(source) == ()
+    assert redact_secrets(source) == (source, 0)
+
+
 def test_privacy_store_remembers_per_repo_provider_outside_repo(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

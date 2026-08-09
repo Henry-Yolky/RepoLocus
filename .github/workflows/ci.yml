@@ -55,13 +55,14 @@ jobs:
           uvx bandit==1.9.4 -q -ll -r
           src
           skills/repolocus-analyze-repo/scripts
-      - name: Export runtime SBOM, including API dependencies
+      - name: Export runtime SBOM, including optional runtime dependencies
         run: >-
-          uv export --frozen --no-dev --extra api --preview-features sbom-export
+          uv export --frozen --no-dev --extra api --extra treesitter
+          --preview-features sbom-export
           --format cyclonedx1.5 --output-file sbom.json
       - name: Export auditable requirements
         run: >-
-          uv export --frozen --no-dev --extra api --no-hashes
+          uv export --frozen --no-dev --extra api --extra treesitter --no-hashes
           --output-file requirements-audit.txt
       - name: Audit known dependency vulnerabilities
         run: uvx pip-audit==2.10.1 -r requirements-audit.txt
@@ -83,6 +84,7 @@ jobs:
 
   external-evaluation:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
@@ -100,6 +102,10 @@ jobs:
           --minimum-citation-recall 1.0
           --minimum-no-answer-f1 0.80
           --maximum-must-not-return-rate 0.0
+          --minimum-qrels 100
+          --minimum-answerable-qrels 60
+          --minimum-no-answer-qrels 20
+          --minimum-citation-qrels 60
           --output external-evaluation.json
       - name: Upload external evaluation report
         if: always()
@@ -109,8 +115,32 @@ jobs:
           path: external-evaluation.json
           if-no-files-found: error
 
+  performance-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          version: "0.9.18"
+      - run: uv sync --all-extras --locked
+      - name: Run the versioned v0.2 hosted-runner performance gate
+        run: >-
+          uv run python benchmarks/benchmark_v020.py
+          --manifest benchmarks/v0.2-gates.json
+          --output v0.2-benchmark.json
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: v0.2-benchmark
+          path: v0.2-benchmark.json
+          if-no-files-found: error
+
   package:
-    needs: [test, coverage, security, external-evaluation]
+    needs: [test, coverage, security, external-evaluation, performance-benchmark]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -118,10 +148,13 @@ jobs:
         env:
           COVERAGE_RESULT: ${{ needs.coverage.result }}
           EVALUATION_RESULT: ${{ needs.external-evaluation.result }}
+          PERFORMANCE_RESULT: ${{ needs.performance-benchmark.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           TEST_RESULT: ${{ needs.test.result }}
         run: |
-          for result in "$TEST_RESULT" "$COVERAGE_RESULT" "$SECURITY_RESULT" "$EVALUATION_RESULT"; do
+          for result in \
+            "$TEST_RESULT" "$COVERAGE_RESULT" "$SECURITY_RESULT" \
+            "$EVALUATION_RESULT" "$PERFORMANCE_RESULT"; do
             if [[ "$result" != "success" ]]; then
               echo "Required CI gate did not succeed: $result" >&2
               exit 1
@@ -133,12 +166,66 @@ jobs:
           python-version: "3.12"
           version: "0.9.18"
       - run: uv build
-      - name: Install wheel in a clean environment
+      - name: Install core wheel and smoke-test the heuristic fallback
         run: |
-          uv venv /tmp/repolocus-wheel-test
+          uv venv --python 3.12 /tmp/repolocus-wheel-core
           wheel="$(find dist -maxdepth 1 -name 'repolocus-*.whl' -print -quit)"
           test -n "$wheel"
-          uv pip install --python /tmp/repolocus-wheel-test/bin/python "${wheel}[api]"
-          /tmp/repolocus-wheel-test/bin/repolocus --version
+          uv pip install --python /tmp/repolocus-wheel-core/bin/python "${wheel}"
+          /tmp/repolocus-wheel-core/bin/repolocus --version
+          /tmp/repolocus-wheel-core/bin/python - <<'PY'
+          from repolocus.parsers import TreeSitterParser, parse_source
+
+          assert TreeSitterParser.discover() is None
+          result = parse_source(
+              "fixture.c",
+              "int add(int left, int right) { return left + right; }\n",
+              "c",
+          )
+          assert any(symbol.name == "add" for symbol in result.symbols)
+          assert result.chunks
+          PY
+      - name: Install wheel extras and smoke-test every Tree-sitter language
+        run: |
+          uv venv --python 3.12 /tmp/repolocus-wheel-treesitter
+          wheel="$(find dist -maxdepth 1 -name 'repolocus-*.whl' -print -quit)"
+          test -n "$wheel"
+          uv pip install --python /tmp/repolocus-wheel-treesitter/bin/python "${wheel}[api,treesitter]"
+          /tmp/repolocus-wheel-treesitter/bin/python - <<'PY'
+          from repolocus.parsers import SourceLayout, TreeSitterParser
+
+          parser = TreeSitterParser.discover()
+          assert parser is not None
+          expected_languages = {"c", "cpp", "javascript", "typescript", "rust"}
+          assert parser.languages == expected_languages
+          fixtures = (
+              ("c", "fixture.c", "int add(int a, int b) { return a + b; }\n", "add"),
+              ("cpp", "fixture.cpp", "int add(int a, int b) { return a + b; }\n", "add"),
+              ("javascript", "fixture.js", "function run() { return 1; }\n", "run"),
+              ("typescript", "fixture.ts", "function run(): number { return 1; }\n", "run"),
+              ("typescript", "fixture.tsx", "const View = () => <main>ok</main>;\n", "View"),
+              ("rust", "fixture.rs", "fn run() -> i32 { 1 }\n", "run"),
+          )
+          for language, path, source, expected_symbol in fixtures:
+              source_bytes = source.encode("utf-8")
+              root = parser._parser(language, path=path).parse(source_bytes).root_node
+              assert root.has_error is False
+              native_symbols = parser._symbols(
+                  path,
+                  source_bytes,
+                  root,
+                  SourceLayout.build(source, language=language),
+              )
+              assert any(symbol.name == expected_symbol for symbol in native_symbols)
+              result = parser.parse(
+                  path,
+                  source,
+                  language,
+                  max_chunk_lines=160,
+                  max_chunk_chars=16_000,
+              )
+              assert any(symbol.name == expected_symbol for symbol in result.symbols)
+              assert result.chunks
+          PY
       - name: Build container image
         run: docker build --tag repolocus:ci .

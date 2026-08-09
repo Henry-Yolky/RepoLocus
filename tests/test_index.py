@@ -548,8 +548,8 @@ def test_v2_index_migration_invalidates_untrusted_existing_facts(tmp_path: Path)
         assert migrated.search_chunks("VALUE") == []
         assert migrated.generation() == 1
         assert metadata["analysis_version"] == ""
-        assert metadata["schema_version"] == "5"
-        assert metadata["index_format_version"] == "5"
+        assert metadata["schema_version"] == "6"
+        assert metadata["index_format_version"] == "6"
         assert metadata["content_generation"] == "1"
         assert metadata["scan_revision"] == "1"
         assert len(metadata["repository_identity"]) == 64
@@ -561,7 +561,7 @@ def test_v2_index_migration_invalidates_untrusted_existing_facts(tmp_path: Path)
         assert migrated.get_files() == []
 
 
-def test_legacy_v3_search_layout_migrates_to_v5_without_reusing_facts(
+def test_legacy_v3_search_layout_migrates_to_v6_without_reusing_facts(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
@@ -669,11 +669,11 @@ def test_legacy_v3_search_layout_migrates_to_v5_without_reusing_facts(
         assert migrated.get_symbols() == []
         assert migrated.search_chunks("LEGACY_FACT") == []
         assert migrated.generation() == committed.generation + 1
-        assert metadata["schema_version"] == "5"
-        assert metadata["index_format_version"] == "5"
+        assert metadata["schema_version"] == "6"
+        assert metadata["index_format_version"] == "6"
         assert metadata["content_generation"] == str(committed.generation + 1)
         assert metadata["scan_revision"] == str(committed.generation + 1)
-        assert int(migrated._connection.execute("PRAGMA user_version").fetchone()[0]) == 5
+        assert int(migrated._connection.execute("PRAGMA user_version").fetchone()[0]) == 6
         assert "chunk_terms" in tables
         assert "facts_sha256" in file_columns
         assert fts_columns == ["file_path", "symbol", "content"]

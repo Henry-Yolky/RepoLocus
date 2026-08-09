@@ -5,6 +5,28 @@ Semantic Versioning while the project is in alpha.
 
 ## [Unreleased]
 
+### Added
+
+- Added a schema-v6 evidence index with normalized `symbol_terms`, persistent path aliases,
+  resolved dependency edges, and explicit ambiguous candidate rows.
+- Added generation-pinned `RepositoryView` projections so project maps and architecture diagrams
+  avoid loading complete source text, chunks, and symbol facts.
+- Added optional Tree-sitter adapters for C, C++, JavaScript, TypeScript, and Rust with stable
+  cache identities and deterministic heuristic fallback.
+- Added structured query intent, reciprocal-rank fusion diagnostics, content/range deduplication,
+  path diversity, and explicit no-answer reason codes.
+- Expanded the pinned external suite to 102 reviewed qrels with enforced query-type and
+  answerable/no-answer/citation coverage.
+- Added a versioned benchmark gate for scan, map, diagram, symbol/dependency queries, and fused
+  retrieval, recording wall/CPU time, peak RSS, SQLite statements, database size, and WAL bytes.
+
+### Changed
+
+- Symbol and dependency-neighbor queries now use indexed SQLite joins instead of Python full-table
+  scans and per-symbol chunk lookups.
+- Heuristic parsers share a one-pass `SourceLayout` for line offsets and brace pairs, including
+  linear package dependency location.
+
 ## [0.1.5] - 2026-08-07
 
 ### Added
