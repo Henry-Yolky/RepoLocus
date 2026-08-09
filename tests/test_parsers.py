@@ -663,6 +663,7 @@ def test_tree_sitter_discovery_degrades_on_optional_adapter_runtime_failure(
         ("javascript", "src/spaces.js", "import " + " " * 1_600 + "x"),
         ("go", "adversarial.go", "package sample\n" + "import (\n" * 4_000),
     ],
+    ids=("javascript-repeated-import", "javascript-long-space", "go-unclosed-import-block"),
 )
 def test_heuristic_import_scanning_is_bounded_on_unclosed_input(
     language: str,

@@ -110,6 +110,7 @@ def _fixture_entry_limit(files: int) -> int:
 
 def _peak_rss_bytes() -> int:
     if sys.platform == "win32":  # pragma: no cover - exercised by Windows CI
+        from ctypes import wintypes
 
         class ProcessMemoryCounters(ctypes.Structure):
             _fields_ = [
@@ -127,12 +128,22 @@ def _peak_rss_bytes() -> int:
 
         counters = ProcessMemoryCounters()
         counters.cb = ctypes.sizeof(counters)
-        process = ctypes.windll.kernel32.GetCurrentProcess()  # type: ignore[attr-defined]
-        succeeded = ctypes.windll.psapi.GetProcessMemoryInfo(  # type: ignore[attr-defined]
-            process, ctypes.byref(counters), counters.cb
-        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.argtypes = []
+        get_current_process.restype = wintypes.HANDLE
+        get_process_memory_info = psapi.GetProcessMemoryInfo
+        get_process_memory_info.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(ProcessMemoryCounters),
+            wintypes.DWORD,
+        ]
+        get_process_memory_info.restype = wintypes.BOOL
+        process = get_current_process()
+        succeeded = get_process_memory_info(process, ctypes.byref(counters), counters.cb)
         if not succeeded:
-            raise OSError("GetProcessMemoryInfo failed")
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
         return int(counters.PeakWorkingSetSize)
 
     import resource
