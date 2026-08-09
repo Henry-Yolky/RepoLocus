@@ -16,7 +16,11 @@ from repolocus.index.store import (
     _validate_retrieval_limit,
 )
 from repolocus.models import Chunk, Evidence
-from repolocus.retrieval.terms import document_terms, literal_query_terms
+from repolocus.retrieval.terms import (
+    document_terms,
+    is_cjk_term,
+    literal_query_term_groups,
+)
 
 QueryIntent = Literal[
     "identifier",
@@ -266,10 +270,10 @@ def _dependency_direction(query: str, intent: QueryIntent) -> str | None:
 def _is_specific_query(query: str, strongest_chunk: Chunk | None) -> bool:
     """Require strong literal coverage before applying the stronger text rank."""
 
-    terms = set(literal_query_terms(query))
-    has_cjk = re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", query) is not None
-    minimum_terms = 1 if has_cjk else 2
-    if len(terms) < minimum_terms or strongest_chunk is None:
+    groups = literal_query_term_groups(query)
+    has_cjk = any(is_cjk_term(group[0]) for group in groups)
+    minimum_groups = 1 if has_cjk else 2
+    if len(groups) < minimum_groups or strongest_chunk is None:
         return False
     indexed_terms = set(
         document_terms(
@@ -278,7 +282,12 @@ def _is_specific_query(query: str, strongest_chunk: Chunk | None) -> bool:
             strongest_chunk.content,
         )
     )
-    return len(terms & indexed_terms) / len(terms) >= _SPECIFIC_QUERY_MINIMUM_COVERAGE
+    matched_groups = sum(
+        len(indexed_terms.intersection(group))
+        >= (min(2, len(group)) if is_cjk_term(group[0]) else 1)
+        for group in groups
+    )
+    return matched_groups / len(groups) >= _SPECIFIC_QUERY_MINIMUM_COVERAGE
 
 
 def _line_iou(first: Chunk, second: Chunk) -> float:

@@ -235,6 +235,23 @@ def test_cjk_rewrite_uses_one_ngram_group_and_keeps_non_cjk_literal_required(
     assert [hit.chunk.path for hit in mixed] == ["src/primary.py"]
 
 
+def test_cjk_query_with_spread_anchors_meets_relevance_threshold(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = _source(
+        "README.zh-CN.md",
+        "# 安全\n\n配置安全: 用户与仓库设置合并后执行类型和边界校验。\n",
+        "安全",
+    )
+
+    with RepositoryIndex.open(repository, tmp_path / "cache") as index:
+        index.update(ScanResult(repository, [source], ScanStats()))
+        result = RetrievalEngine(index).search_result("配置在哪里校验", limit=1)
+
+    assert [evidence.path for evidence in result.evidence] == [source.path]
+    assert result.rejected_reason is None
+
+
 def test_expanded_terms_cannot_substitute_for_literal_coverage(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
