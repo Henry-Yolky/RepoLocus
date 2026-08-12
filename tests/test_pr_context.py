@@ -64,7 +64,9 @@ def test_context_artifacts_are_deterministic_and_record_revisions(
     base = _snapshot(identity="a" * 64, generation=7, digest="b" * 64)
     head = _snapshot(identity="c" * 64, generation=11, digest="d" * 64)
 
-    snapshots = iter((base, head, base, head))
+    relocated_base = _snapshot(identity="e" * 64, generation=7, digest="b" * 64)
+    relocated_head = _snapshot(identity="f" * 64, generation=11, digest="d" * 64)
+    snapshots = iter((base, head, relocated_base, relocated_head))
     monkeypatch.setattr(module, "_capture_snapshot", lambda _root: next(snapshots))
     arguments = {
         "base_root": base_root,
@@ -82,6 +84,7 @@ def test_context_artifacts_are_deterministic_and_record_revisions(
     assert first_payload["head"]["revision"] == "2" * 40
     assert first_payload["generated_by"] == {"name": "RepoLocus", "version": __version__}
     assert first_payload["base"]["snapshot"]["fingerprints"]["parser"] == "2" * 64
+    assert "repository_identity" not in first_payload["base"]["snapshot"]
     assert first_payload["diff"] == module.diff_to_dict(compare_snapshots(base, head))
     assert "# RepoLocus PR Context" in first_markdown
     assert f"RepoLocus version: `{__version__}`" in first_markdown
