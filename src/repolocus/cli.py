@@ -26,6 +26,15 @@ from rich.text import Text
 from repolocus import __version__
 from repolocus.config import Settings
 from repolocus.core import PrivacyRequiredError, RepoLocusService
+from repolocus.diff import (
+    RepositorySnapshot,
+    compare_snapshots,
+    dumps_diff,
+    load_snapshot,
+    render_diff_markdown,
+    save_snapshot,
+    snapshot_from_index,
+)
 from repolocus.index import RepositoryIndex, cache_root, index_path_for
 from repolocus.models import Evidence
 from repolocus.security import (
@@ -57,6 +66,17 @@ RepoArgument = Annotated[
         help="Repository directory.",
         exists=True,
         file_okay=False,
+        dir_okay=True,
+        resolve_path=False,
+    ),
+]
+
+DiffArgument = Annotated[
+    Path,
+    typer.Argument(
+        help="Repository directory or immutable RepoLocus snapshot JSON.",
+        exists=True,
+        file_okay=True,
         dir_okay=True,
         resolve_path=False,
     ),
@@ -329,6 +349,121 @@ def status(
         str(data["scan_revision_detail"]),
     )
     console.print(table)
+
+
+def _require_refresh_mode(refresh: str, *, allow_never: bool) -> None:
+    modes = (
+        ("auto", "always", "never", "rebuild")
+        if allow_never
+        else (
+            "auto",
+            "always",
+            "rebuild",
+        )
+    )
+    if refresh not in modes:
+        supported = ", ".join(modes)
+        raise ValueError(f"refresh must be one of: {supported}")
+
+
+def _scan_snapshot(path: Path, refresh: str) -> RepositorySnapshot:
+    operation = _service(path).scan(path, refresh=refresh)  # type: ignore[arg-type]
+    with RepositoryIndex.open(path) as index:
+        return snapshot_from_index(
+            index,
+            expected_generation=operation.update.content_generation,
+        )
+
+
+def _existing_index_snapshot(path: Path) -> RepositorySnapshot:
+    database = index_path_for(path)
+    if database.is_symlink() or not database.is_file():
+        raise ValueError("no RepoLocus index exists for this repository")
+    with RepositoryIndex.open(path) as index:
+        return snapshot_from_index(index)
+
+
+@app.command("snapshot")
+def snapshot_command(
+    path: RepoArgument,
+    output: Annotated[
+        Path,
+        typer.Argument(
+            help="Destination for the immutable canonical snapshot JSON.",
+            resolve_path=False,
+        ),
+    ],
+    refresh: Annotated[
+        str,
+        typer.Option(
+            "--refresh",
+            help="Index refresh mode: auto, always, or rebuild.",
+        ),
+    ] = "auto",
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Replace an existing regular snapshot file."),
+    ] = False,
+) -> None:
+    """Capture one generation-pinned architecture snapshot without source text."""
+
+    try:
+        if path.is_symlink():
+            raise ValueError("repository path must not be a symbolic link")
+        root = path.resolve(strict=True)
+        _require_refresh_mode(refresh, allow_never=False)
+        snapshot = _scan_snapshot(root, refresh)
+        destination = save_snapshot(snapshot, output, overwrite=force)
+    except (OSError, ValueError, RuntimeError) as exc:
+        _fail(exc)
+    console.print(
+        f"Saved immutable snapshot to {escape_untrusted_display(str(destination))}.",
+        markup=False,
+        highlight=False,
+    )
+
+
+def _diff_snapshot(path: Path, refresh: str) -> RepositorySnapshot:
+    if path.is_symlink():
+        raise ValueError("diff input must not be a symbolic link")
+    candidate = path.resolve(strict=True)
+    if candidate.is_file():
+        return load_snapshot(candidate)
+    if not candidate.is_dir():
+        raise ValueError(f"diff input is neither a repository directory nor snapshot: {candidate}")
+    if refresh == "never":
+        return _existing_index_snapshot(candidate)
+    return _scan_snapshot(candidate, refresh)
+
+
+@app.command("diff")
+def diff_command(
+    old: DiffArgument,
+    new: DiffArgument,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit canonical machine-readable JSON.")
+    ] = False,
+    refresh: Annotated[
+        str,
+        typer.Option(
+            "--refresh",
+            help="Directory index refresh mode: auto, always, never, or rebuild.",
+        ),
+    ] = "auto",
+) -> None:
+    """Compare two repositories or immutable architecture snapshots without running Git."""
+
+    try:
+        _require_refresh_mode(refresh, allow_never=True)
+        old_snapshot = _diff_snapshot(old, refresh)
+        new_snapshot = _diff_snapshot(new, refresh)
+        difference = compare_snapshots(old_snapshot, new_snapshot)
+    except (OSError, ValueError, RuntimeError) as exc:
+        _fail(exc)
+    if json_output:
+        sys.stdout.write(dumps_diff(difference))
+        return
+    sys.stdout.write(render_diff_markdown(difference, str(old), str(new)))
 
 
 @app.command("map")

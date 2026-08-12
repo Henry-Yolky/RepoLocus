@@ -12,6 +12,7 @@ from repolocus import __version__
 from repolocus.cli import _index_cache_permission_status, app
 from repolocus.config import Settings
 from repolocus.core import RepoLocusService
+from repolocus.index import index_path_for
 from repolocus.security import PrivacyStore
 
 runner = CliRunner()
@@ -46,6 +47,155 @@ def test_cli_scan_map_ask_and_diagram(sample_repo: Path, isolated_user_dirs: Pat
     assert ask_data["evidence"]
     assert diagram_result.exit_code == 0, diagram_result.output
     assert (sample_repo / "ARCHITECTURE.md").is_file()
+
+
+def test_cli_snapshot_is_reproducible_and_diffs_a_directory(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "baseline.json"
+
+    created = runner.invoke(app, ["snapshot", str(sample_repo), str(output)])
+
+    assert created.exit_code == 0, created.output
+    first = output.read_bytes()
+    first_text = first.decode("ascii")
+    first_data = json.loads(first_text)
+    assert first_text == (
+        json.dumps(
+            first_data,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    repeated = runner.invoke(
+        app,
+        ["snapshot", str(sample_repo), str(output), "--force"],
+    )
+    assert repeated.exit_code == 0, repeated.output
+    assert output.read_bytes() == first
+
+    unicode_source = sample_repo / "src" / "demo" / "猫.py"
+    unicode_source.write_text("def meow() -> str:\n    return '喵'\n", encoding="utf-8")
+    difference = runner.invoke(
+        app,
+        [
+            "diff",
+            str(output),
+            str(sample_repo),
+            "--refresh",
+            "always",
+            "--json",
+        ],
+    )
+
+    assert difference.exit_code == 0, difference.output
+    difference.stdout.encode("ascii")
+    diff_data = json.loads(difference.stdout)
+    assert {item["path"] for item in diff_data["added_files"]} == {"src/demo/猫.py"}
+    assert "\\u732b" in difference.stdout
+
+
+def test_cli_diff_refresh_never_fails_closed_and_does_not_scan(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    monkeypatch,
+) -> None:
+    database = index_path_for(sample_repo)
+
+    missing = runner.invoke(
+        app,
+        ["diff", str(sample_repo), str(sample_repo), "--refresh", "never"],
+    )
+
+    assert missing.exit_code == 1
+    assert "no RepoLocus index exists" in missing.output
+    assert not database.exists()
+
+    scanned = runner.invoke(app, ["scan", str(sample_repo), "--json"])
+    assert scanned.exit_code == 0, scanned.output
+
+    def unexpected_scan(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("diff --refresh never must not scan the repository")
+
+    monkeypatch.setattr(RepoLocusService, "scan", unexpected_scan)
+    reused = runner.invoke(
+        app,
+        [
+            "diff",
+            str(sample_repo),
+            str(sample_repo),
+            "--refresh",
+            "never",
+            "--json",
+        ],
+    )
+
+    assert reused.exit_code == 0, reused.output
+    assert json.loads(reused.stdout)["is_empty"] is True
+
+
+def test_cli_snapshot_requires_force_and_rejects_symbolic_links(
+    sample_repo: Path,
+    isolated_user_dirs: Path,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "snapshot.json"
+    created = runner.invoke(app, ["snapshot", str(sample_repo), str(output)])
+    assert created.exit_code == 0, created.output
+    original = output.read_bytes()
+
+    readme = sample_repo / "README.md"
+    readme.write_text(readme.read_text(encoding="utf-8") + "\nChanged.\n", encoding="utf-8")
+    refused = runner.invoke(app, ["snapshot", str(sample_repo), str(output)])
+    assert refused.exit_code == 1
+    assert "snapshot already exists" in refused.output
+    assert output.read_bytes() == original
+
+    replaced = runner.invoke(
+        app,
+        ["snapshot", str(sample_repo), str(output), "--force"],
+    )
+    assert replaced.exit_code == 0, replaced.output
+    assert output.read_bytes() != original
+
+    never_output = tmp_path / "never.json"
+    never = runner.invoke(
+        app,
+        [
+            "snapshot",
+            str(sample_repo),
+            str(never_output),
+            "--refresh",
+            "never",
+        ],
+    )
+    assert never.exit_code == 1
+    assert "refresh must be one of" in never.output
+    assert not never_output.exists()
+
+    if os.name != "nt":
+        output_link = tmp_path / "snapshot-link.json"
+        output_link.symlink_to(output)
+        linked_output = runner.invoke(
+            app,
+            ["snapshot", str(sample_repo), str(output_link), "--force"],
+        )
+        assert linked_output.exit_code == 1
+        assert "non-symlink regular file" in linked_output.output
+
+        repository_link = tmp_path / "repository-link"
+        repository_link.symlink_to(sample_repo, target_is_directory=True)
+        linked_repository = runner.invoke(
+            app,
+            ["snapshot", str(repository_link), str(tmp_path / "linked-repo.json")],
+        )
+        assert linked_repository.exit_code == 1
+        assert "repository path must not be a symbolic link" in linked_repository.output
 
 
 def test_cli_cloud_without_consent_prints_preview(

@@ -17,6 +17,9 @@ _METRICS = (
     "database_bytes",
     "wal_bytes",
 )
+_V020_BASELINE_IMPLEMENTATION_SHA256 = (
+    "c383815bf7f4b510d5d1fd29dd0c82303f44f180ef23c77488dbe6c1acb39f38"
+)
 
 
 def _benchmark_module() -> ModuleType:
@@ -79,7 +82,10 @@ def test_v020_versioned_manifests_fix_scale_and_baseline_provenance() -> None:
         assert manifest["minimum_source_bytes"] == source_bytes
         baseline = manifest["baseline"]
         assert baseline["benchmark_script_sha256"] == script_sha256
-        assert baseline["implementation_sha256"] == benchmark._implementation_sha256()
+        # The manifest is an immutable v0.2.0 reference measurement. Current
+        # runs record their own implementation digest in the benchmark report
+        # and are compared with, rather than relabeled as, this baseline.
+        assert baseline["implementation_sha256"] == _V020_BASELINE_IMPLEMENTATION_SHA256
         assert baseline["date"]
         assert baseline["python"]
         assert baseline["platform"]
@@ -316,6 +322,9 @@ def test_v020_benchmark_covers_every_versioned_operation(tmp_path: Path) -> None
     assert report["files"] == 60
     assert report["symbols"] == 300
     assert report["dependencies"] >= 59
+    assert report["implementation_sha256"] == benchmark._implementation_sha256()
+    assert report["benchmark_script_sha256"] == benchmark._script_sha256()
+    assert report["repolocus_version"] == benchmark.__version__
     assert report["gate"] == {"passed": True, "violations": []}
     assert set(report["operations"]) == set(benchmark._OPERATIONS)
     worker_pids = {measurement["worker_pid"] for measurement in report["operations"].values()}
