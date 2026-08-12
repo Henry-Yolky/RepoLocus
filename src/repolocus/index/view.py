@@ -12,8 +12,9 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Protocol
 
-from repolocus.analysis import DEPENDENCY_RESOLVER_FINGERPRINT
+from repolocus.analysis import DEPENDENCY_RESOLVER_FINGERPRINT, AnalysisFingerprints
 from repolocus.graph import ResolvedDependency
+from repolocus.models import ScannedFile, Symbol
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,14 @@ class RepositoryView(Protocol):
 
     generation: int
     root: Path
+    schema_version: int
+    repository_identity: str
+    fingerprints: AnalysisFingerprints | None
+    dependency_resolver_fingerprint: str | None
+
+    def file_manifest(self) -> Iterable[ScannedFile]: ...
+
+    def symbols(self) -> Iterable[Symbol]: ...
 
     def diagram_files(self) -> Iterable[DiagramFile]: ...
 
@@ -96,6 +105,10 @@ class SQLiteRepositoryView:
         self._file_summary_cache: tuple[FileSummary, ...] | None = None
         self.generation = 0
         self.root = Path(index.root)
+        self.schema_version = 0
+        self.repository_identity = ""
+        self.fingerprints: AnalysisFingerprints | None = None
+        self.dependency_resolver_fingerprint: str | None = None
 
     def __enter__(self) -> SQLiteRepositoryView:
         if self._active:
@@ -109,11 +122,23 @@ class SQLiteRepositoryView:
             self.generation = self._index._revision_in_transaction(
                 "content_generation", fallback="generation"
             )
-            resolver_row = self._index._connection.execute(
-                "SELECT value FROM meta WHERE key = 'dependency_resolver_fingerprint'"
-            ).fetchone()
-            resolver_fingerprint = str(resolver_row["value"]) if resolver_row is not None else None
-            if resolver_fingerprint != DEPENDENCY_RESOLVER_FINGERPRINT:
+            metadata = {
+                str(row["key"]): str(row["value"])
+                for row in self._index._connection.execute(
+                    "SELECT key, value FROM meta "
+                    "WHERE key IN ("
+                    "'schema_version', 'repository_identity', "
+                    "'scan_fingerprint', 'parser_fingerprint', "
+                    "'term_index_fingerprint', 'retrieval_fingerprint', "
+                    "'dependency_resolver_fingerprint'"
+                    ")"
+                )
+            }
+            self.schema_version = int(metadata.get("schema_version", "0"))
+            self.repository_identity = metadata.get("repository_identity", "")
+            self.fingerprints = AnalysisFingerprints.from_metadata(metadata)
+            self.dependency_resolver_fingerprint = metadata.get("dependency_resolver_fingerprint")
+            if self.dependency_resolver_fingerprint != DEPENDENCY_RESOLVER_FINGERPRINT:
                 from repolocus.index.store import StaleScanError
 
                 raise StaleScanError(
@@ -179,6 +204,62 @@ class SQLiteRepositoryView:
         ).fetchall()
         return tuple(
             DiagramFile(path=str(row["path"]), first_line=int(row["first_line"])) for row in rows
+        )
+
+    def file_manifest(self) -> tuple[ScannedFile, ...]:
+        """Return metadata-only files from this view's read transaction."""
+
+        self._ensure_active()
+        rows = self._index._connection.execute(
+            """
+            SELECT path, language, size_bytes, sha256, line_count, is_entry_point,
+                   mtime_ns, ctime_ns, provenance, stale
+            FROM files
+            WHERE provenance = 'source' AND stale = 0
+            ORDER BY path
+            """
+        ).fetchall()
+        return tuple(
+            ScannedFile(
+                path=str(row["path"]),
+                language=str(row["language"]),
+                size_bytes=int(row["size_bytes"]),
+                sha256=str(row["sha256"]),
+                line_count=int(row["line_count"]),
+                text="",
+                is_entry_point=bool(row["is_entry_point"]),
+                mtime_ns=int(row["mtime_ns"]),
+                ctime_ns=int(row["ctime_ns"]),
+                provenance="source",
+                stale=False,
+                facts_materialized=False,
+            )
+            for row in rows
+        )
+
+    def symbols(self) -> tuple[Symbol, ...]:
+        """Return source symbol locations without reading files or chunks."""
+
+        self._ensure_active()
+        rows = self._index._connection.execute(
+            """
+            SELECT s.name, s.kind, s.file_path, s.start_line, s.end_line, s.signature
+            FROM symbols AS s
+            JOIN files AS f ON f.path = s.file_path
+            WHERE f.provenance = 'source' AND f.stale = 0
+            ORDER BY s.file_path, s.start_line, s.end_line, s.name, s.kind, s.id
+            """
+        ).fetchall()
+        return tuple(
+            Symbol(
+                name=str(row["name"]),
+                kind=str(row["kind"]),
+                path=str(row["file_path"]),
+                start_line=int(row["start_line"]),
+                end_line=int(row["end_line"]),
+                signature=str(row["signature"]),
+            )
+            for row in rows
         )
 
     def file_summaries(self) -> tuple[FileSummary, ...]:
@@ -282,8 +363,10 @@ class SQLiteRepositoryView:
                        candidate.path AS candidate_path
                 FROM resolved_dependencies AS rd
                 JOIN dependencies AS d ON d.id = rd.dependency_id
+                JOIN files AS f ON f.path = rd.source_path
                 LEFT JOIN resolved_dependency_candidates AS candidate
                   ON candidate.dependency_id = rd.dependency_id
+                WHERE f.provenance = 'source' AND f.stale = 0
                 ORDER BY rd.source_path, rd.witness_line, d.target, d.kind,
                          rd.dependency_id, candidate.path
                 """

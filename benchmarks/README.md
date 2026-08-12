@@ -31,8 +31,11 @@ Mermaid diagram, symbol query, dependency-neighbor query, and fused retrieval. E
 is isolated in a fresh worker with an operation-level timeout and records wall time, CPU time,
 process peak RSS, application-issued SQLite statement count, database bytes, and WAL bytes.
 Absolute ceilings and relative SQLite-query regression limits live in the versioned manifest
-rather than being selected by the current CI run. Each checked-in baseline records the benchmark
-script hash and a deterministic digest of the measured RepoLocus implementation.
+rather than being selected by the current CI run. The checked-in manifests preserve the measured
+v0.2.0 reference baseline, including its benchmark-script hash and deterministic implementation
+digest. Every current CI/release run records its own version and implementation digest and compares
+its measurements with that historical reference; old measurements are never relabeled as a new
+baseline.
 
 ```bash
 uv run python benchmarks/benchmark_v020.py --manifest benchmarks/v0.2-gates.json
