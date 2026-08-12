@@ -192,7 +192,6 @@ def _snapshot_metadata(snapshot: Any) -> dict[str, object]:
     return {
         "format_version": snapshot.format_version,
         "schema_version": snapshot.schema_version,
-        "repository_identity": snapshot.repository_identity,
         "content_generation": snapshot.generation,
         "fingerprints": _fingerprints(snapshot),
         "dependency_resolver_fingerprint": snapshot.dependency_resolver_fingerprint,
