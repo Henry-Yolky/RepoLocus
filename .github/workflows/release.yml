@@ -85,6 +85,51 @@ jobs:
           --manifest benchmarks/v0.2-scale-gates.json
           --output
           "release-assets/repolocus-${PROJECT_VERSION}.scale-benchmark.json"
+      - name: Run the public-protocol 1k performance fixture
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          uv run python benchmarks/benchmark_v020.py
+          --manifest benchmarks/v0.2-gates.json
+          --output
+          "release-assets/repolocus-${PROJECT_VERSION}.public-performance.json"
+      - name: Build the provenance-pinned public regression report
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          uv run python scripts/public_benchmark_report.py
+          --manifest benchmarks/public-benchmark-manifest.json
+          --evaluation-report
+          "release-assets/repolocus-${PROJECT_VERSION}.external-evaluation.json"
+          --performance-report
+          "release-assets/repolocus-${PROJECT_VERSION}.public-performance.json"
+          --json-output
+          "release-assets/repolocus-${PROJECT_VERSION}.public-benchmark.json"
+          --markdown-output
+          "release-assets/repolocus-${PROJECT_VERSION}.public-benchmark.md"
+      - name: Verify the public report is byte-reproducible
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          uv run python scripts/public_benchmark_report.py
+          --manifest benchmarks/public-benchmark-manifest.json
+          --evaluation-report
+          "release-assets/repolocus-${PROJECT_VERSION}.external-evaluation.json"
+          --performance-report
+          "release-assets/repolocus-${PROJECT_VERSION}.public-performance.json"
+          --json-output
+          "release-assets/repolocus-${PROJECT_VERSION}.public-benchmark.json"
+          --markdown-output
+          "release-assets/repolocus-${PROJECT_VERSION}.public-benchmark.md"
+          --check
+      - name: Include the public benchmark protocol
+        env:
+          PROJECT_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cp benchmarks/public-benchmark-manifest.json \
+            "release-assets/repolocus-${PROJECT_VERSION}.public-benchmark-manifest.json"
+          cp benchmarks/public-benchmark-report.schema.json \
+            "release-assets/repolocus-${PROJECT_VERSION}.public-benchmark-report.schema.json"
       - name: Build and check Python distributions
         run: |
           mkdir -p release-assets

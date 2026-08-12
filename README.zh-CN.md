@@ -6,7 +6,7 @@ RepoLocus 是一个只读、本地优先的代码库理解工具。它不会执�
 安全扫描源码、建立 SQLite/FTS 索引、生成结构稳定的 `PROJECT_MAP.md`、输出经过校验的
 Mermaid 图，并为代码问题检索可核验的源码证据。
 
-当前仓库实现的是 CLI 优先的 v0.2 开发基线。静态依赖与调用关系是近似结果；路线图中的
+当前仓库实现的是 CLI 优先的 v0.2.1 开发基线。静态依赖与调用关系是近似结果；路线图中的
 公共仓库 Web Demo 尚未包含在本版本中。
 
 ## 快速开始
@@ -61,6 +61,24 @@ facts，`rebuild` 会重新解析所有源码，`never` 只读取最近一次兼
 后续问题关闭 refresh 并要求同一 generation。检索可见 facts 变化时 fail closed，仅诊断性的
 scan revision 不会让证据 snapshot 失效。输入空行即结束，问答历史不会落盘。
 
+`repolocus diff OLD NEW` 可以比较两个仓库目录或两个不可变架构 snapshot。结果覆盖文件、
+symbol、入口点、依赖边、配置、安全边界和测试区域变化；每项均带 old/new 路径与行号证据，
+并按透明、确定性的规则给出建议审阅顺序。比较过程不会调用 Git 或目标仓库命令；分析器指纹
+不一致时会明确标为 degraded，而不会把分析策略变化伪装成源码变化。
+
+可以先把两个 generation 固定为不含源码正文的规范 JSON snapshot，再输出 Markdown 或机器
+可读 JSON 差异：
+
+```bash
+repolocus snapshot /path/to/old-checkout old.snapshot.json
+repolocus snapshot /path/to/new-checkout new.snapshot.json
+repolocus diff old.snapshot.json new.snapshot.json
+repolocus diff old.snapshot.json new.snapshot.json --json > architecture-diff.json
+```
+
+`snapshot` 默认拒绝覆盖已有目标，只有显式传入 `--force` 才会替换。`diff` 也可直接接收仓库
+目录；只有在明确要求复用已经存在的外部索引状态、且不扫描目录时才使用 `--refresh never`。
+
 ## 常用命令
 
 | 命令 | 用途 |
@@ -70,6 +88,8 @@ scan revision 不会让证据 snapshot 失效。输入空行即结束，问答�
 | `repolocus map [PATH]` | 生成 `PROJECT_MAP.md`，或通过 `--stdout` 输出 |
 | `repolocus ask QUESTION [PATH]` | 检索带源码位置的证据，并可选调用模型 |
 | `repolocus diagram [PATH]` | 在 `ARCHITECTURE.md` 中生成经过校验的 Mermaid 图 |
+| `repolocus snapshot PATH OUTPUT` | 保存固定 generation 且不含源码正文的架构 snapshot |
+| `repolocus diff OLD NEW` | 对仓库目录或不可变 snapshot 生成带证据的差异 |
 | `repolocus privacy status` | 查看当前仓库记忆的供应商、端点和路由授权 |
 | `repolocus doctor --security` | 检查运行时、FTS5、cache 权限与本地模型连接 |
 | `repolocus clean` | 经确认后删除当前仓库的外部索引 |
@@ -94,13 +114,74 @@ scan revision 不会让证据 snapshot 失效。输入空行即结束，问答�
 - 模型校验：每个实质 claim 后必须紧跟相同 citation 和源码原文子串的 `Evidence quote`；
   校验只确认地址和原文子串，不判断语义支持关系，通过后 confidence 仍为 `needs_review`；
 - 架构图：确定性生成 Mermaid，并为每个节点附代表源码、为每条边附一条具体 import 证据；
+- 架构差异：从 generation-pinned、无源码正文的不可变 snapshot 比较文件、symbol、入口点、
+  依赖、配置、安全边界和测试区域变化，并为每个结论保留 old/new 证据；
+- PR Context Action：显式启用后分别扫描 base/head checkout，默认只生成 Markdown/JSON
+  artifact；调用 workflow 必须显式限制为 `contents: read`，PR comment 需要可信同仓 job 的
+  单独写权限和 token；
 - 模型适配：无模型提取式回答、Ollama、OpenAI-compatible、Anthropic；
 - 隐私控制：默认关闭遥测，云端逐次授权或按仓库和端点记忆授权，可预览与撤回；
 - 自托管 API：安装 `api` 可选依赖后运行 `repolocus serve`。
-- 评测：自仓库 smoke set 之外，固定六个独立合成仓库和 102 条逐项复核 qrels 作为
+- 评测：自仓库 smoke set 之外，固定六个由 RepoLocus 编写、彼此隔离的 synthetic
+  external-repository fixtures 和 102 条逐项复核 qrels 作为
   CI/release gate；覆盖定义、exact/expanded/partial symbol、入口点、正反依赖、配置和
   hard-negative，报告 recall@k、MRR、nDCG@k、citation、no-answer、`must_not_return`
-  及按仓库等维度的汇总；release gate 要求 citation recall 达到 1.0。
+  及按仓库等维度的汇总；release gate 要求 citation recall 达到 1.0。公开 regression
+  报告同时记录质量、no-answer、query latency、peak RSS 和 index cost；这些 fixture 由本项目
+  编写，只代表可复跑 smoke/regression，不作为独立跨项目质量结论。
+
+## PR Context Action
+
+PR Context Action 需要显式启用。wrapper 通过 `actions/checkout` 把精确的 base/head revision
+检出到两个独立目录，并把 `pr-context.md` 与 `pr-context.json` 上传到
+`repolocus-pr-context` artifact。完成 checkout 后，RepoLocus 分析 core 把两个目录都视为
+不可信数据：core 不调用 Git，也不执行目标仓库代码、hook、build 或 test。默认只生成
+artifact，只需要 `contents: read`：
+
+```yaml
+name: RepoLocus PR context
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Henry-Yolky/RepoLocus/.github/actions/pr-context@<FULL_40_CHARACTER_COMMIT_SHA>
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+```
+
+必须把占位符替换为 Action 的完整 40 位小写 commit SHA。Action 会拒绝 branch、tag、短 SHA
+以及本地 `./.github/actions/pr-context` 引用，避免从正在分析的 checkout 执行 Action 代码。
+
+只有同时传入 `comment: "true"` 和 `github-token` 才会发布 PR comment。把该授权放到独立的
+可信同仓 job 中，用条件排除 fork，并且只给这个 job `pull-requests: write`：
+
+```yaml
+  trusted-comment:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Henry-Yolky/RepoLocus/.github/actions/pr-context@<FULL_40_CHARACTER_COMMIT_SHA>
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+          comment: "true"
+          github-token: ${{ github.token }}
+```
+
+Action 只接受 `pull_request`，不接受 `pull_request_target`。按上述 job 边界配置后，Fork PR
+不会进入可获得 comment token 的 job；即使其他位置误开了 comment 模式，Action 也会再次
+跳过评论并继续生成 artifact。
 
 ## Agent Skill
 

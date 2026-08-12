@@ -17,8 +17,13 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from evaluate_retrieval import evaluate_cases
+from evaluate_retrieval import (
+    evaluate_cases,
+    summarize_outcomes,
+    validate_outcomes_against_qrels,
+)
 
+from repolocus import __version__
 from repolocus.config import Settings
 from repolocus.core import RepoLocusService
 from repolocus.index import RepositoryIndex
@@ -67,6 +72,7 @@ _QUERY_TYPE_INTENTS = {
 }
 _BOOTSTRAP_SEED = 2_020_020
 _BOOTSTRAP_SAMPLES = 2_000
+_DEFAULT_LIMIT = 5
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CANONICAL_INTENT = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _QREL_REQUIRED_FIELDS = frozenset(
@@ -112,6 +118,36 @@ _COUNT_THRESHOLDS = frozenset(
         "minimum_citation_qrels",
     }
 )
+
+
+def _canonical_bytes(payload: bytes) -> bytes:
+    """Normalize checkout line endings before computing protocol hashes."""
+
+    return payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _script_sha256() -> str:
+    return hashlib.sha256(_canonical_bytes(Path(__file__).read_bytes())).hexdigest()
+
+
+def _metrics_script_sha256() -> str:
+    metrics_runner = Path(__file__).with_name("evaluate_retrieval.py")
+    return hashlib.sha256(_canonical_bytes(metrics_runner.read_bytes())).hexdigest()
+
+
+def _implementation_sha256() -> str:
+    repository = Path(__file__).resolve().parents[1]
+    paths = [repository / "pyproject.toml", repository / "uv.lock"]
+    paths.extend(sorted((repository / "src" / "repolocus").rglob("*.py")))
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(repository).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        payload = _canonical_bytes(path.read_bytes())
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 def _reject_json_constant(value: str) -> None:
@@ -884,6 +920,7 @@ def evaluate_suite(
 
     all_cases: list[dict[str, Any]] = []
     routes: dict[str, RetrievalEngine] = {}
+    fixture_roots: dict[str, Path] = {}
     fixture_reports: list[dict[str, object]] = []
     seen_fixture_ids: set[str] = set()
     seen_roots: set[Path] = set()
@@ -927,6 +964,7 @@ def evaluate_suite(
                 raise ValueError(f"fixture roots and qrel paths must be unique: {fixture}")
             seen_roots.add(root)
             seen_qrel_paths.add(qrels)
+            fixture_roots[fixture] = root
 
             actual_tree = fixture_tree_sha256(root)
             actual_qrels = _sha256_file(qrels)
@@ -1069,12 +1107,23 @@ def evaluate_suite(
                 raise ValueError(f"fixture has too few must_not_return qrels: {fixture}")
 
         query_types = set(families_by_type)
-        outcomes, metrics = evaluate_cases(_RoutedRetrieval(routes), all_cases, limit=limit)
+        outcomes, _ = evaluate_cases(_RoutedRetrieval(routes), all_cases, limit=limit)
+        outcomes = validate_outcomes_against_qrels(
+            all_cases,
+            outcomes,
+            limit=limit,
+            fixture_roots=fixture_roots,
+        )
+        metrics = summarize_outcomes(outcomes)
 
     for fixture_report in fixture_reports:
         fixture_report["case_families"] = family_counts[str(fixture_report["id"])]
     return {
         "manifest": manifest_path.relative_to(evaluation_root).as_posix(),
+        "evaluation_script_sha256": _script_sha256(),
+        "evaluation_metrics_script_sha256": _metrics_script_sha256(),
+        "implementation_sha256": _implementation_sha256(),
+        "repolocus_version": __version__,
         "review_provenance": review_report,
         "fixtures": fixture_reports,
         "fixture_count": len(fixture_reports),
@@ -1217,6 +1266,37 @@ def _gate_report(
     }
 
 
+def default_thresholds() -> dict[str, int | float]:
+    """Return the release-gate thresholds used by the public protocol."""
+
+    return {
+        "minimum_hit_rate": 0.90,
+        "minimum_macro_recall": 0.80,
+        "minimum_mrr": 0.75,
+        "minimum_citation_recall": 1.0,
+        "minimum_no_answer_f1": 0.80,
+        "maximum_must_not_return_rate": 0.0,
+        "maximum_duplicate_evidence_rate": 0.0,
+        "maximum_line_iou": 0.79,
+        "minimum_intent_accuracy": 1.0,
+        "minimum_graph_grounded_rate": 1.0,
+        "minimum_mean_path_diversity": 0.50,
+        "minimum_slice_hit_rate": 0.50,
+        "minimum_slice_mrr": 0.50,
+        "minimum_slice_no_answer_f1": 0.75,
+        "minimum_qrels": 100,
+        "minimum_answerable_qrels": 60,
+        "minimum_no_answer_qrels": 20,
+        "minimum_citation_qrels": 60,
+    }
+
+
+def default_limit() -> int:
+    """Return the top-k limit used by the canonical public evaluation command."""
+
+    return _DEFAULT_LIMIT
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1225,7 +1305,7 @@ def main() -> int:
         nargs="?",
         default=Path("evaluation"),
     )
-    parser.add_argument("--limit", type=_positive_cli_integer, default=5)
+    parser.add_argument("--limit", type=_positive_cli_integer, default=default_limit())
     parser.add_argument("--minimum-hit-rate", type=_unit_interval, default=0.90)
     parser.add_argument("--minimum-macro-recall", type=_unit_interval, default=0.80)
     parser.add_argument("--minimum-mrr", type=_unit_interval, default=0.75)
@@ -1247,7 +1327,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()
     report = evaluate_suite(arguments.evaluation_root.resolve(strict=True), limit=arguments.limit)
-    thresholds = {
+    thresholds = default_thresholds() | {
         "minimum_hit_rate": arguments.minimum_hit_rate,
         "minimum_macro_recall": arguments.minimum_macro_recall,
         "minimum_mrr": arguments.minimum_mrr,

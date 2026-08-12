@@ -10,6 +10,8 @@ flowchart LR
     C --> D["Files, symbols, imports, chunks"]
     D --> E["SQLite, FTS5, and term index"]
     E --> F["Symbol, text, and graph retrieval"]
+    E --> L["Bounded architecture snapshot"]
+    L --> M["Pure old/new architecture diff"]
     F --> G["Source evidence bundle"]
     G --> H["Deterministic map and Mermaid"]
     G --> I["Extractive answer"]
@@ -31,6 +33,11 @@ flowchart LR
   candidates. `RepositoryView` pins one generation while exposing only bounded projections.
 - `graph/` owns the language-neutral dependency resolver used by index commits, retrieval, maps,
   and diagrams. Ambiguous aliases retain every candidate and never become a guessed edge.
+- `diff/` projects a generation-pinned index into a portable architecture snapshot and compares
+  two snapshots without reading source bodies or invoking repository tools. The result records
+  old/new evidence, explicit move confidence, fingerprint compatibility, and a deterministic
+  security-first review order. The CLI, PR-context wrapper, and future MCP surface share this
+  pure core.
 - `retrieval/` combines indexed symbol matches, FTS5/BM25 ranks, deterministic lexical terms, and
   resolved dependency neighbors with reciprocal-rank fusion. Query intent selects reverse graph
   retrieval for callers/references; content hashes, line-range overlap, and path diversity suppress
@@ -47,6 +54,9 @@ flowchart LR
 - `core/` is the workflow boundary shared by the CLI and optional API.
 - `api/` authenticates requests, bounds exposure, and holds short-lived single-use preview
   snapshots for two-stage cloud approval.
+- `.github/actions/pr-context/` is an opt-in GitHub wrapper, not part of the analysis core. It checks out
+  caller-selected revisions with GitHub's checkout Action, invokes RepoLocus on those directory
+  trees, and uploads the same JSON/Markdown diff artifacts available locally.
 
 ## Data invariants
 
@@ -86,6 +96,14 @@ Map and diagram generation open one `RepositoryView` read transaction. They cons
 entry points, area summaries, resolved edges, and bounded README prefixes; they do not materialize
 all source bodies, chunks, or symbols. Retrieval uses the same generation-pinned database snapshot,
 and every returned evidence item records that content generation.
+
+Architecture snapshot generation similarly opens a generation-pinned read transaction and selects
+only the file digests and sizes, symbol identities and ranges, resolved dependency witnesses,
+entry-point flags, schema version, repository identity, and analysis fingerprints required for a
+comparison. Snapshot serialization is canonical and integrity checked. It intentionally excludes
+source bodies and retrieval chunks. A snapshot whose schema or analysis fingerprints differ can
+still produce an explicitly degraded inventory comparison, but policy drift is never reported as
+a repository code change.
 
 Each scan starts from one transactionally consistent SQLite snapshot and commits with both content
 generation and scan revision compare-and-swap values. An old scan cannot overwrite a newer commit.

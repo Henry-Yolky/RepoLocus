@@ -139,8 +139,60 @@ jobs:
           path: v0.2-benchmark.json
           if-no-files-found: error
 
+  public-benchmark:
+    needs: [external-evaluation, performance-benchmark]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          version: "0.9.18"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: external-evaluation
+          path: public-inputs/evaluation
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: v0.2-benchmark
+          path: public-inputs/performance
+      - run: uv sync --all-extras --locked
+      - name: Build the provenance-pinned public regression report
+        run: >-
+          uv run python scripts/public_benchmark_report.py
+          --manifest benchmarks/public-benchmark-manifest.json
+          --evaluation-report public-inputs/evaluation/external-evaluation.json
+          --performance-report public-inputs/performance/v0.2-benchmark.json
+          --json-output benchmarks/results/public-report.json
+          --markdown-output benchmarks/results/public-report.md
+      - name: Verify the public report is byte-reproducible
+        run: >-
+          uv run python scripts/public_benchmark_report.py
+          --manifest benchmarks/public-benchmark-manifest.json
+          --evaluation-report public-inputs/evaluation/external-evaluation.json
+          --performance-report public-inputs/performance/v0.2-benchmark.json
+          --json-output benchmarks/results/public-report.json
+          --markdown-output benchmarks/results/public-report.md
+          --check
+      - name: Upload the public report and its reproduction inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-benchmark
+          path: |
+            benchmarks/results/public-report.json
+            benchmarks/results/public-report.md
+            public-inputs/evaluation/external-evaluation.json
+            public-inputs/performance/v0.2-benchmark.json
+            benchmarks/public-benchmark-manifest.json
+            benchmarks/public-benchmark-report.schema.json
+          if-no-files-found: error
+
   package:
-    needs: [test, coverage, security, external-evaluation, performance-benchmark]
+    needs: [test, coverage, security, external-evaluation, performance-benchmark, public-benchmark]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -149,12 +201,13 @@ jobs:
           COVERAGE_RESULT: ${{ needs.coverage.result }}
           EVALUATION_RESULT: ${{ needs.external-evaluation.result }}
           PERFORMANCE_RESULT: ${{ needs.performance-benchmark.result }}
+          PUBLIC_BENCHMARK_RESULT: ${{ needs.public-benchmark.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           TEST_RESULT: ${{ needs.test.result }}
         run: |
           for result in \
             "$TEST_RESULT" "$COVERAGE_RESULT" "$SECURITY_RESULT" \
-            "$EVALUATION_RESULT" "$PERFORMANCE_RESULT"; do
+            "$EVALUATION_RESULT" "$PERFORMANCE_RESULT" "$PUBLIC_BENCHMARK_RESULT"; do
             if [[ "$result" != "success" ]]; then
               echo "Required CI gate did not succeed: $result" >&2
               exit 1

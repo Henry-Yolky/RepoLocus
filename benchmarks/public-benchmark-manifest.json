@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "repolocus-public-benchmark-v1",
+  "hash_algorithm": "sha256-lf-v1",
+  "subject": {
+    "name": "RepoLocus"
+  },
+  "scope": {
+    "classification": "smoke",
+    "cross_repository_quality_claim": false,
+    "note": "Public, reproducible RepoLocus-authored synthetic smoke/regression suite only; quality results must not be extrapolated to independent or production repositories."
+  },
+  "artifacts": {
+    "evaluation_manifest": {
+      "path": "evaluation/external-manifest.json",
+      "sha256": "9e5b87c7d6c7a39b7b4c1a64807cb3c8f1e679209595aa60fa423cc7501aa8bd"
+    },
+    "evaluation_runner": {
+      "path": "scripts/evaluate_external_repositories.py",
+      "sha256": "163faf4f1ed8db56541e6261b475218a0f2277c0a4a3fd1ee615b504564eb244"
+    },
+    "evaluation_metrics_runner": {
+      "path": "scripts/evaluate_retrieval.py",
+      "sha256": "1f32aae5c7a7889b03d2919d0d85708de9ec92ad4b495803e01d2ee600190595"
+    },
+    "performance_manifest": {
+      "path": "benchmarks/v0.2-gates.json",
+      "sha256": "169d2a692f2bea50b01173791726eef8b9f88e18d44f1d9541142b1e99ffa091"
+    },
+    "performance_runner": {
+      "path": "benchmarks/benchmark_v020.py",
+      "sha256": "eb1dc57766c1380cfc5e88312d56d48a688e910ef8c87d7f98c50f550f98c801"
+    },
+    "report_runner": {
+      "path": "scripts/public_benchmark_report.py",
+      "sha256": "40159308338cbc0f19b7b05a88754a809d0369be8453496275904569e7ec13e2"
+    },
+    "report_schema": {
+      "path": "benchmarks/public-benchmark-report.schema.json",
+      "sha256": "5c863db840ba65bfc9de72d0fa67193d3c50123864cc7b27802204d4b66bc2cb"
+    }
+  },
+  "commands": [
+    {
+      "id": "evaluation",
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "scripts/evaluate_external_repositories.py",
+        "evaluation",
+        "--output",
+        "benchmarks/results/public-evaluation.json"
+      ]
+    },
+    {
+      "id": "performance",
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "benchmarks/benchmark_v020.py",
+        "--manifest",
+        "benchmarks/v0.2-gates.json",
+        "--output",
+        "benchmarks/results/public-performance.json"
+      ]
+    },
+    {
+      "id": "report",
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "scripts/public_benchmark_report.py",
+        "--manifest",
+        "benchmarks/public-benchmark-manifest.json",
+        "--evaluation-report",
+        "benchmarks/results/public-evaluation.json",
+        "--performance-report",
+        "benchmarks/results/public-performance.json",
+        "--json-output",
+        "benchmarks/results/public-report.json",
+        "--markdown-output",
+        "benchmarks/results/public-report.md"
+      ]
+    },
+    {
+      "id": "check",
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "scripts/public_benchmark_report.py",
+        "--manifest",
+        "benchmarks/public-benchmark-manifest.json",
+        "--evaluation-report",
+        "benchmarks/results/public-evaluation.json",
+        "--performance-report",
+        "benchmarks/results/public-performance.json",
+        "--json-output",
+        "benchmarks/results/public-report.json",
+        "--markdown-output",
+        "benchmarks/results/public-report.md",
+        "--check"
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "system": "RepoWiki",
+      "status": "N/A",
+      "protocol": null,
+      "metrics": null,
+      "reason": "N/A: no equivalent public protocol is pinned by this manifest; no comparison is made."
+    },
+    {
+      "system": "DeepWiki",
+      "status": "N/A",
+      "protocol": null,
+      "metrics": null,
+      "reason": "N/A: no equivalent public protocol is pinned by this manifest; no comparison is made."
+    },
+    {
+      "system": "Sourcebot",
+      "status": "N/A",
+      "protocol": null,
+      "metrics": null,
+      "reason": "N/A: no equivalent public protocol is pinned by this manifest; no comparison is made."
+    }
+  ]
+}

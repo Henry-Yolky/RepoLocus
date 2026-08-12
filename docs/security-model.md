@@ -6,7 +6,7 @@ RepoLocus protects source text outside the selected root, excluded secrets withi
 cloud credentials, locally indexed content, and the user's expectation that analysis is
 read-only.
 
-## Threats addressed in v0.1
+## Threats addressed
 
 | Threat | Control |
 |---|---|
@@ -26,6 +26,9 @@ read-only.
 | Generated-output symlink or replacement race | Descriptor-relative or handle-validated same-directory atomic writes attest parent and target identities and fail closed on races; ambiguous post-commit objects are preserved under reported recovery names rather than deleted |
 | Mermaid links or directives | Deterministic restricted grammar; model output is never diagram source |
 | Index committed to Git | Cache defaults outside the repository; `.repolocus/` is ignored |
+| Diff invokes untrusted repository code | Snapshot projection and comparison are pure reads; Git, hooks, builds, tests, and target executables remain outside the core interface |
+| Fork pull request receives write token or secrets | The opt-in PR-context Action is artifact-only by default, documents a caller job with only `contents: read`, persists no checkout credentials, and refuses comment mode for fork events |
+| Analysis-policy drift looks like a code change | Snapshot schema and component fingerprints are compared first and incompatible comparisons are labeled degraded |
 
 ## Non-goals and residual risk
 
@@ -69,3 +72,17 @@ A non-loopback listener is refused unless the operator supplies `--allow-remote`
 allowed Host, and a TLS certificate/key pair. Preview state is intentionally bounded and
 process-local; the built-in `repolocus serve` path runs one worker. This remains a self-hosted
 single-operator API, not the public Web Demo architecture.
+
+Architecture snapshots are metadata artifacts, not source archives: they contain paths, digests,
+bounded symbol/range data, dependency witnesses, repository identity, generation, schema, and
+analysis fingerprints, but no source bodies or retrieval chunks. Paths and symbol names may still
+be sensitive metadata, so callers should apply the same access controls used for repository build
+artifacts. Snapshot integrity detects accidental or malicious edits; it is not a signature or an
+authorization mechanism.
+
+The PR-context GitHub Action is deliberately artifact-first. A composite Action cannot set its
+caller's job permissions, so the documented workflow explicitly grants only `contents: read`;
+checkout credentials are not persisted, target repository code is never run, and no cloud provider
+is used. Commenting is an explicit trusted-context mode requiring a separate same-repository job,
+`pull-requests: write`, and a token. Fork pull requests never receive that capability, and the
+Action does not use `pull_request_target` to analyze untrusted head code with repository secrets.
