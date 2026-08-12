@@ -1,0 +1,170 @@
+name: RepoLocus PR Context
+description: Produce read-only architecture context artifacts for one pull request.
+
+inputs:
+  base-ref:
+    description: Full base commit SHA from github.event.pull_request.base.sha.
+    required: true
+  head-ref:
+    description: Full head commit SHA from github.event.pull_request.head.sha.
+    required: true
+  artifact-name:
+    description: Name for the uploaded Markdown and JSON artifact.
+    required: false
+    default: repolocus-pr-context
+  comment:
+    description: Explicitly opt in to a same-repository pull-request comment.
+    required: false
+    default: "false"
+  github-token:
+    description: Token used only when comment is true for a non-fork pull request.
+    required: false
+    default: ""
+
+outputs:
+  markdown-path:
+    description: Absolute path to the generated Markdown artifact.
+    value: ${{ steps.context.outputs.markdown-path }}
+  json-path:
+    description: Absolute path to the generated JSON artifact.
+    value: ${{ steps.context.outputs.json-path }}
+  comment-posted:
+    description: Whether the opt-in same-repository comment was posted.
+    value: ${{ steps.comment.outputs.posted || steps.validate.outputs.comment-posted }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate immutable PR inputs
+      id: validate
+      shell: bash
+      env:
+        ACTION_REF: ${{ github.action_ref }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        BASE_REF: ${{ inputs.base-ref }}
+        BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+        COMMENT: ${{ inputs.comment }}
+        EVENT_BASE_REF: ${{ github.event.pull_request.base.sha }}
+        EVENT_HEAD_REF: ${{ github.event.pull_request.head.sha }}
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$ACTION_REF" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "RepoLocus PR Context must be referenced by a full lowercase commit SHA." >&2
+          exit 1
+        fi
+        if [[ "$EVENT_NAME" != "pull_request" ]]; then
+          echo "RepoLocus PR Context only accepts the pull_request event." >&2
+          exit 1
+        fi
+        for revision in "$BASE_REF" "$HEAD_REF"; do
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Base and head refs must be full lowercase commit SHAs." >&2
+            exit 1
+          fi
+        done
+        if [[ "$BASE_REF" != "$EVENT_BASE_REF" || "$HEAD_REF" != "$EVENT_HEAD_REF" ]]; then
+          echo "Base and head refs must exactly match the pull-request event revisions." >&2
+          exit 1
+        fi
+        for repository in "$BASE_REPOSITORY" "$HEAD_REPOSITORY"; do
+          if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Pull-request repository identity is missing or invalid." >&2
+            exit 1
+          fi
+        done
+        if [[ ! "$ARTIFACT_NAME" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+          echo "artifact-name must contain only letters, digits, dot, underscore, or hyphen." >&2
+          exit 1
+        fi
+        if [[ "$COMMENT" != "true" && "$COMMENT" != "false" ]]; then
+          echo "comment must be exactly true or false." >&2
+          exit 1
+        fi
+        comment_eligible=false
+        if [[ "$COMMENT" == "true" && "$BASE_REPOSITORY" == "$HEAD_REPOSITORY" ]]; then
+          comment_eligible=true
+        elif [[ "$COMMENT" == "true" ]]; then
+          echo "::warning::PR comments are disabled for fork pull requests; artifacts will still be produced."
+        fi
+        echo "comment-eligible=$comment_eligible" >> "$GITHUB_OUTPUT"
+        echo "comment-posted=false" >> "$GITHUB_OUTPUT"
+
+    - name: Check out base revision
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ github.event.pull_request.base.repo.full_name }}
+        ref: ${{ inputs.base-ref }}
+        path: .repolocus-pr-context-${{ github.run_id }}-${{ github.run_attempt }}/base
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Check out head revision
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+        ref: ${{ inputs.head-ref }}
+        path: .repolocus-pr-context-${{ github.run_id }}-${{ github.run_attempt }}/head
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Install pinned uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        version: "0.9.18"
+        enable-cache: false
+
+    - name: Scan revisions and build PR context
+      id: context
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        trusted_root="$(cd "$GITHUB_ACTION_PATH/../../.." && pwd -P)"
+        if [[ "$trusted_root" == "$GITHUB_WORKSPACE" || "$trusted_root" == "$GITHUB_WORKSPACE/"* ]]; then
+          echo "Refusing to execute Action code from the analyzed checkout; use a full remote SHA." >&2
+          exit 1
+        fi
+        output_dir="$RUNNER_TEMP/repolocus-pr-context-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        export UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/repolocus-pr-context-venv"
+        export XDG_CACHE_HOME="$RUNNER_TEMP/repolocus-pr-context-cache"
+        cd "$RUNNER_TEMP"
+        uv run --project "$trusted_root" --frozen --no-dev \
+          python -I "$trusted_root/scripts/pr_context.py" \
+          --base "$GITHUB_WORKSPACE/.repolocus-pr-context-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/base" \
+          --head "$GITHUB_WORKSPACE/.repolocus-pr-context-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/head" \
+          --base-revision "$BASE_REF" \
+          --head-revision "$HEAD_REF" \
+          --repository "$REPOSITORY" \
+          --output-dir "$output_dir"
+        echo "markdown-path=$output_dir/pr-context.md" >> "$GITHUB_OUTPUT"
+        echo "json-path=$output_dir/pr-context.json" >> "$GITHUB_OUTPUT"
+
+    - name: Upload PR context artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ steps.context.outputs.markdown-path }}
+          ${{ steps.context.outputs.json-path }}
+        if-no-files-found: error
+        retention-days: 14
+
+    - name: Publish explicitly requested same-repository comment
+      id: comment
+      if: ${{ steps.validate.outputs.comment-eligible == 'true' }}
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        COMMENT_TOKEN: ${{ inputs.github-token }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        MARKDOWN_PATH: ${{ steps.context.outputs.markdown-path }}
+      run: |
+        set -euo pipefail
+        node "$GITHUB_ACTION_PATH/post-comment.js"
+        echo "posted=true" >> "$GITHUB_OUTPUT"
