@@ -5,6 +5,41 @@ Semantic Versioning while the project is in alpha.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-13
+
+### Added
+
+- Added deterministic architecture diffs between scanned repositories or immutable snapshot
+  files, with old/new evidence for file, symbol, entry-point, dependency, configuration,
+  security-boundary, and test-area changes.
+- Added portable, integrity-checked architecture snapshots containing repository identity,
+  schema and component fingerprints, content generation, and bounded fact projections without
+  source bodies.
+- Added an opt-in PR-context GitHub Action that checks out explicit base and head revisions and
+  publishes JSON and Markdown review artifacts. PR comments remain an explicit, trusted-context
+  option.
+- Added a provenance-pinned public regression package and report covering answer quality,
+  no-answer behavior, query latency, peak memory, and index cost on six openly published,
+  project-authored fixtures, explicitly labeled as a reproducible smoke suite rather than an
+  independent cross-project benchmark.
+
+### Changed
+
+- Architecture comparison reports incompatible analysis fingerprints as a degraded comparison
+  instead of presenting analysis-policy drift as a repository code change.
+- Suggested review order is now a deterministic projection of the changed security boundaries,
+  configuration, entry points, dependencies, symbols, tests, and files.
+
+### Security
+
+- Architecture diffing remains a pure read-only core operation: it does not invoke Git, hooks,
+  builds, tests, or target-repository commands, and it never stores source bodies in snapshots.
+- The PR-context Action is artifact-only by default, documents a caller job with only
+  `contents: read`, disables checkout credential persistence, never exposes secrets to fork code,
+  and cannot comment unless the caller explicitly grants that trusted-context mode.
+
+## [0.2.0] - 2026-08-13
+
 ### Added
 
 - Added a schema-v6 evidence index with normalized `symbol_terms`, persistent path aliases,
@@ -15,8 +50,8 @@ Semantic Versioning while the project is in alpha.
   cache identities and deterministic heuristic fallback.
 - Added structured query intent, reciprocal-rank fusion diagnostics, content/range deduplication,
   path diversity, and explicit no-answer reason codes.
-- Expanded the pinned external suite to 102 reviewed qrels with enforced query-type and
-  answerable/no-answer/citation coverage.
+- Expanded the six pinned, RepoLocus-authored external-repository fixtures to 102 reviewed qrels
+  with enforced query-type and answerable/no-answer/citation coverage.
 - Added a versioned benchmark gate for scan, map, diagram, symbol/dependency queries, and fused
   retrieval, recording wall/CPU time, peak RSS, SQLite statements, database size, and WAL bytes.
 

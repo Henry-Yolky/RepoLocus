@@ -18,8 +18,12 @@ def _workflow(name: str) -> str:
 
 
 def test_third_party_actions_are_pinned_with_readable_versions() -> None:
-    for name in ("ci.yml", "release.yml"):
-        references = _ACTION.findall(_workflow(name))
+    action_documents = [_workflow(name) for name in ("ci.yml", "release.yml")]
+    composite = _repository() / ".github" / "actions" / "pr-context" / "action.yml"
+    if composite.is_file():
+        action_documents.append(composite.read_text(encoding="utf-8"))
+    for document in action_documents:
+        references = _ACTION.findall(document)
         assert references
         for reference, readable_version in references:
             if reference.startswith("./"):
@@ -58,14 +62,32 @@ def test_external_evaluation_blocks_packaging() -> None:
     assert "performance-benchmark:" in workflow
     assert "--manifest benchmarks/v0.2-gates.json" in workflow
     assert "benchmarks/v0.2-scale-gates.json" not in workflow
+    assert "public-benchmark:" in workflow
+    assert "scripts/public_benchmark_report.py" in workflow
+    assert "benchmarks/public-benchmark-manifest.json" in workflow
+    assert "needs: [external-evaluation, performance-benchmark]" in workflow
     assert (
-        "needs: [test, coverage, security, external-evaluation, performance-benchmark]" in workflow
+        "needs: [test, coverage, security, external-evaluation, performance-benchmark, "
+        "public-benchmark]" in workflow
     )
     assert "if: ${{ always() }}" in workflow
     assert "EVALUATION_RESULT: ${{ needs.external-evaluation.result }}" in workflow
     assert "PERFORMANCE_RESULT: ${{ needs.performance-benchmark.result }}" in workflow
+    assert "PUBLIC_BENCHMARK_RESULT: ${{ needs.public-benchmark.result }}" in workflow
     assert 'if [[ "$result" != "success" ]]' in workflow
     assert 'python-version: ["3.10", "3.12", "3.14"]' in workflow
+
+    public_job = workflow.split("  public-benchmark:", 1)[1].split("  package:", 1)[0]
+    assert "Upload the public report and its reproduction inputs" in public_job
+    for artifact_path in (
+        "benchmarks/results/public-report.json",
+        "benchmarks/results/public-report.md",
+        "public-inputs/evaluation/external-evaluation.json",
+        "public-inputs/performance/v0.2-benchmark.json",
+        "benchmarks/public-benchmark-manifest.json",
+        "benchmarks/public-benchmark-report.schema.json",
+    ):
+        assert artifact_path in public_job
 
 
 def test_release_attests_and_verifies_every_asset_before_publish() -> None:
@@ -76,6 +98,13 @@ def test_release_attests_and_verifies_every_asset_before_publish() -> None:
     assert "--minimum-qrels 100" in workflow
     assert "benchmarks/v0.2-scale-gates.json" in workflow
     assert "repolocus-${PROJECT_VERSION}.scale-benchmark.json" in workflow
+    assert "benchmarks/public-benchmark-manifest.json" in workflow
+    assert "repolocus-${PROJECT_VERSION}.public-performance.json" in workflow
+    assert "repolocus-${PROJECT_VERSION}.public-benchmark.json" in workflow
+    assert "repolocus-${PROJECT_VERSION}.public-benchmark.md" in workflow
+    assert "repolocus-${PROJECT_VERSION}.public-benchmark-manifest.json" in workflow
+    assert "repolocus-${PROJECT_VERSION}.public-benchmark-report.schema.json" in workflow
+    assert "--check" in workflow
     assert "timeout-minutes: 45" in workflow
     assert "timeout-minutes: 20" in workflow
     assert "repolocus-${PROJECT_VERSION}.external-evaluation.json" in workflow
@@ -86,6 +115,11 @@ def test_release_attests_and_verifies_every_asset_before_publish() -> None:
     assert 'gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"' in workflow
     assert "needs: [build, verify-provenance]" in workflow
     assert "repolocus doctor --security --json" in workflow
+
+    protocol_copy = workflow.index("Include the public benchmark protocol")
+    checksums = workflow.index("Generate SHA-256 checksums")
+    attestation = workflow.index("Attest every release asset")
+    assert protocol_copy < checksums < attestation
 
 
 def test_core_and_treesitter_wheels_are_smoke_tested_separately() -> None:

@@ -1,0 +1,931 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:repolocus:public-benchmark-report:v1",
+  "title": "RepoLocus reproducible public smoke benchmark report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark_id",
+    "subject",
+    "protocol",
+    "fixtures",
+    "quality",
+    "performance",
+    "comparisons",
+    "validation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "benchmark_id": {
+      "const": "repolocus-public-benchmark-v1"
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "implementation_sha256",
+        "result_classification",
+        "cross_repository_quality_claim",
+        "note"
+      ],
+      "properties": {
+        "name": {
+          "const": "RepoLocus"
+        },
+        "version": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "implementation_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "result_classification": {
+          "const": "smoke"
+        },
+        "cross_repository_quality_claim": {
+          "const": false
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "[Ss][Mm][Oo][Kk][Ee]"
+        }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest",
+        "manifest_sha256",
+        "hash_algorithm",
+        "evaluation_manifest",
+        "evaluation_manifest_sha256",
+        "evaluation_runner",
+        "evaluation_runner_sha256",
+        "evaluation_metrics_runner",
+        "evaluation_metrics_runner_sha256",
+        "performance_manifest",
+        "performance_manifest_sha256",
+        "reproduction_commands"
+      ],
+      "properties": {
+        "manifest": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "hash_algorithm": {
+          "const": "sha256-lf-v1"
+        },
+        "evaluation_manifest": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "evaluation_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evaluation_runner": {
+          "const": "scripts/evaluate_external_repositories.py"
+        },
+        "evaluation_runner_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evaluation_metrics_runner": {
+          "const": "scripts/evaluate_retrieval.py"
+        },
+        "evaluation_metrics_runner_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "performance_manifest": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "performance_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reproduction_commands": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/evaluation_command"
+            },
+            {
+              "$ref": "#/$defs/performance_command"
+            },
+            {
+              "$ref": "#/$defs/report_command"
+            },
+            {
+              "$ref": "#/$defs/check_command"
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/fixture"
+      }
+    },
+    "quality": {
+      "$ref": "#/$defs/quality"
+    },
+    "performance": {
+      "$ref": "#/$defs/performance"
+    },
+    "comparisons": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/repowiki_comparison"
+        },
+        {
+          "$ref": "#/$defs/deepwiki_comparison"
+        },
+        {
+          "$ref": "#/$defs/sourcebot_comparison"
+        }
+      ],
+      "items": false
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluation_report_sha256",
+        "performance_report_sha256",
+        "evaluation_gate_passed",
+        "performance_gate_passed"
+      ],
+      "properties": {
+        "evaluation_report_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "performance_report_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evaluation_gate_passed": {
+          "type": "boolean"
+        },
+        "performance_gate_passed": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\r\\n\\u0000]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "positive_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "evaluation_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "argv"
+      ],
+      "properties": {
+        "id": {
+          "const": "evaluation"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "prefixItems": [
+            {
+              "const": "uv"
+            },
+            {
+              "const": "run"
+            },
+            {
+              "const": "python"
+            },
+            {
+              "const": "scripts/evaluate_external_repositories.py"
+            },
+            {
+              "const": "evaluation"
+            },
+            {
+              "const": "--output"
+            },
+            {
+              "const": "benchmarks/results/public-evaluation.json"
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "performance_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "argv"
+      ],
+      "properties": {
+        "id": {
+          "const": "performance"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "prefixItems": [
+            {
+              "const": "uv"
+            },
+            {
+              "const": "run"
+            },
+            {
+              "const": "python"
+            },
+            {
+              "const": "benchmarks/benchmark_v020.py"
+            },
+            {
+              "const": "--manifest"
+            },
+            {
+              "const": "benchmarks/v0.2-gates.json"
+            },
+            {
+              "const": "--output"
+            },
+            {
+              "const": "benchmarks/results/public-performance.json"
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "report_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "argv"
+      ],
+      "properties": {
+        "id": {
+          "const": "report"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "prefixItems": [
+            {
+              "const": "uv"
+            },
+            {
+              "const": "run"
+            },
+            {
+              "const": "python"
+            },
+            {
+              "const": "scripts/public_benchmark_report.py"
+            },
+            {
+              "const": "--manifest"
+            },
+            {
+              "const": "benchmarks/public-benchmark-manifest.json"
+            },
+            {
+              "const": "--evaluation-report"
+            },
+            {
+              "const": "benchmarks/results/public-evaluation.json"
+            },
+            {
+              "const": "--performance-report"
+            },
+            {
+              "const": "benchmarks/results/public-performance.json"
+            },
+            {
+              "const": "--json-output"
+            },
+            {
+              "const": "benchmarks/results/public-report.json"
+            },
+            {
+              "const": "--markdown-output"
+            },
+            {
+              "const": "benchmarks/results/public-report.md"
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "check_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "argv"
+      ],
+      "properties": {
+        "id": {
+          "const": "check"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 15,
+          "maxItems": 15,
+          "prefixItems": [
+            {
+              "const": "uv"
+            },
+            {
+              "const": "run"
+            },
+            {
+              "const": "python"
+            },
+            {
+              "const": "scripts/public_benchmark_report.py"
+            },
+            {
+              "const": "--manifest"
+            },
+            {
+              "const": "benchmarks/public-benchmark-manifest.json"
+            },
+            {
+              "const": "--evaluation-report"
+            },
+            {
+              "const": "benchmarks/results/public-evaluation.json"
+            },
+            {
+              "const": "--performance-report"
+            },
+            {
+              "const": "benchmarks/results/public-performance.json"
+            },
+            {
+              "const": "--json-output"
+            },
+            {
+              "const": "benchmarks/results/public-report.json"
+            },
+            {
+              "const": "--markdown-output"
+            },
+            {
+              "const": "benchmarks/results/public-report.md"
+            },
+            {
+              "const": "--check"
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "fixture_path",
+        "qrels_path",
+        "source",
+        "license",
+        "revision",
+        "tree_sha256",
+        "qrels_sha256",
+        "qrels",
+        "case_families",
+        "must_not_return_qrels"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "fixture_path": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "qrels_path": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "source": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "license": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "revision": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "tree_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "qrels_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "qrels": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "case_families": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "must_not_return_qrels": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "accuracy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hit_rate",
+        "macro_recall_at_k",
+        "mrr",
+        "citation_recall"
+      ],
+      "properties": {
+        "hit_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "macro_recall_at_k": {
+          "$ref": "#/$defs/rate"
+        },
+        "mrr": {
+          "$ref": "#/$defs/rate"
+        },
+        "citation_recall": {
+          "$ref": "#/$defs/rate"
+        }
+      }
+    },
+    "no_answer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1"
+      ],
+      "properties": {
+        "accuracy": {
+          "$ref": "#/$defs/rate"
+        },
+        "precision": {
+          "$ref": "#/$defs/rate"
+        },
+        "recall": {
+          "$ref": "#/$defs/rate"
+        },
+        "f1": {
+          "$ref": "#/$defs/rate"
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "duplicate_evidence_rate",
+        "must_not_return_violation_rate"
+      ],
+      "properties": {
+        "duplicate_evidence_rate": {
+          "$ref": "#/$defs/rate"
+        },
+        "must_not_return_violation_rate": {
+          "$ref": "#/$defs/rate"
+        }
+      }
+    },
+    "interval": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/rate"
+        },
+        {
+          "$ref": "#/$defs/rate"
+        }
+      ],
+      "items": false
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confidence",
+        "samples",
+        "cluster_unit",
+        "intervals"
+      ],
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/rate"
+        },
+        "samples": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "cluster_unit": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "intervals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "any_expected_path_rate",
+            "macro_recall_at_k",
+            "mrr",
+            "citation_recall",
+            "no_answer_f1"
+          ],
+          "properties": {
+            "any_expected_path_rate": {
+              "$ref": "#/$defs/interval"
+            },
+            "macro_recall_at_k": {
+              "$ref": "#/$defs/interval"
+            },
+            "mrr": {
+              "$ref": "#/$defs/interval"
+            },
+            "citation_recall": {
+              "$ref": "#/$defs/interval"
+            },
+            "no_answer_f1": {
+              "$ref": "#/$defs/interval"
+            }
+          }
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_count",
+        "qrels",
+        "case_families",
+        "answerable_qrels",
+        "no_answer_qrels",
+        "citation_qrels",
+        "must_not_return_qrels",
+        "accuracy",
+        "no_answer",
+        "safety",
+        "bootstrap",
+        "gate_passed"
+      ],
+      "properties": {
+        "fixture_count": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "qrels": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "case_families": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "answerable_qrels": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "no_answer_qrels": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "citation_qrels": {
+          "$ref": "#/$defs/positive_count"
+        },
+        "must_not_return_qrels": {
+          "$ref": "#/$defs/count"
+        },
+        "accuracy": {
+          "$ref": "#/$defs/accuracy"
+        },
+        "no_answer": {
+          "$ref": "#/$defs/no_answer"
+        },
+        "safety": {
+          "$ref": "#/$defs/safety"
+        },
+        "bootstrap": {
+          "$ref": "#/$defs/bootstrap"
+        },
+        "gate_passed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_seconds",
+        "cpu_seconds",
+        "peak_rss_bytes",
+        "sqlite_query_count",
+        "database_bytes",
+        "wal_bytes"
+      ],
+      "properties": {
+        "wall_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cpu_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "peak_rss_bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "sqlite_query_count": {
+          "$ref": "#/$defs/count"
+        },
+        "database_bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "wal_bytes": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "operation_measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scan",
+        "map",
+        "diagram",
+        "symbol_query",
+        "dependency_query",
+        "retrieval"
+      ],
+      "properties": {
+        "scan": {
+          "$ref": "#/$defs/measurement"
+        },
+        "map": {
+          "$ref": "#/$defs/measurement"
+        },
+        "diagram": {
+          "$ref": "#/$defs/measurement"
+        },
+        "symbol_query": {
+          "$ref": "#/$defs/measurement"
+        },
+        "dependency_query": {
+          "$ref": "#/$defs/measurement"
+        },
+        "retrieval": {
+          "$ref": "#/$defs/measurement"
+        }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment",
+        "fixture",
+        "query_latency_seconds",
+        "peak_rss_bytes",
+        "index_cost",
+        "operations",
+        "gate_passed"
+      ],
+      "properties": {
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "python",
+            "platform",
+            "machine",
+            "cpu_count"
+          ],
+          "properties": {
+            "python": {
+              "$ref": "#/$defs/non_empty_string"
+            },
+            "platform": {
+              "$ref": "#/$defs/non_empty_string"
+            },
+            "machine": {
+              "$ref": "#/$defs/non_empty_string"
+            },
+            "cpu_count": {
+              "$ref": "#/$defs/positive_count"
+            }
+          }
+        },
+        "fixture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "manifest",
+            "files",
+            "source_bytes",
+            "symbols",
+            "dependencies"
+          ],
+          "properties": {
+            "manifest": {
+              "$ref": "#/$defs/non_empty_string"
+            },
+            "files": {
+              "$ref": "#/$defs/positive_count"
+            },
+            "source_bytes": {
+              "$ref": "#/$defs/positive_count"
+            },
+            "symbols": {
+              "$ref": "#/$defs/positive_count"
+            },
+            "dependencies": {
+              "$ref": "#/$defs/positive_count"
+            }
+          }
+        },
+        "query_latency_seconds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "symbol_query",
+            "dependency_query",
+            "retrieval"
+          ],
+          "properties": {
+            "symbol_query": {
+              "type": "number",
+              "minimum": 0
+            },
+            "dependency_query": {
+              "type": "number",
+              "minimum": 0
+            },
+            "retrieval": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "peak_rss_bytes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scan",
+            "map",
+            "diagram",
+            "symbol_query",
+            "dependency_query",
+            "retrieval"
+          ],
+          "properties": {
+            "scan": {
+              "$ref": "#/$defs/count"
+            },
+            "map": {
+              "$ref": "#/$defs/count"
+            },
+            "diagram": {
+              "$ref": "#/$defs/count"
+            },
+            "symbol_query": {
+              "$ref": "#/$defs/count"
+            },
+            "dependency_query": {
+              "$ref": "#/$defs/count"
+            },
+            "retrieval": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        },
+        "index_cost": {
+          "$ref": "#/$defs/measurement"
+        },
+        "operations": {
+          "$ref": "#/$defs/operation_measurements"
+        },
+        "gate_passed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "system",
+        "status",
+        "protocol",
+        "metrics",
+        "reason"
+      ],
+      "properties": {
+        "system": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "status": {
+          "const": "N/A"
+        },
+        "protocol": {
+          "type": "null"
+        },
+        "metrics": {
+          "type": "null"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "[Ee][Qq][Uu][Ii][Vv][Aa][Ll][Ee][Nn][Tt] [Pp][Uu][Bb][Ll][Ii][Cc] [Pp][Rr][Oo][Tt][Oo][Cc][Oo][Ll]"
+        }
+      }
+    },
+    "repowiki_comparison": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/comparison"
+        },
+        {
+          "properties": {
+            "system": {
+              "const": "RepoWiki"
+            }
+          }
+        }
+      ]
+    },
+    "deepwiki_comparison": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/comparison"
+        },
+        {
+          "properties": {
+            "system": {
+              "const": "DeepWiki"
+            }
+          }
+        }
+      ]
+    },
+    "sourcebot_comparison": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/comparison"
+        },
+        {
+          "properties": {
+            "system": {
+              "const": "Sourcebot"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

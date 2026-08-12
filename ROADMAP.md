@@ -17,13 +17,14 @@
 - Indexed SQLite symbol and dependency-neighbor queries
 - Projection-only, generation-pinned map and diagram generation
 - Structured query intent, RRF, deduplication, diversity, and explicit no-answer results
-- 102 reviewed external qrels and versioned scan/map/diagram/query/RSS release gates
+- 102 reviewed qrels across six RepoLocus-authored external-repository fixtures, plus versioned
+  scan/map/diagram/query/RSS release gates
 
-## v0.2.x: maintainer workflows
+## v0.2.1: maintainer workflows
 
-- Repository/snapshot architecture diff
-- Opt-in GitHub Action that proposes project-map diffs
-- PR context summaries and reproducible public benchmarks
+- Repository/snapshot architecture diff with old/new evidence and deterministic review ordering
+- Opt-in, artifact-first GitHub Action for PR context summaries
+- Provenance-pinned, reproducible public benchmark reports
 
 ## v0.3: reusable understanding layer
 

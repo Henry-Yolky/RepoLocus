@@ -9,7 +9,7 @@ executing repository commands, builds a local SQLite/FTS index, writes a stable
 It works without an LLM; Ollama and explicitly approved cloud providers can add a narrative
 answer on top of the same evidence.
 
-> **Alpha:** this repository implements the CLI-first v0.2 baseline. Static dependency and
+> **Alpha:** this repository implements the CLI-first v0.2.1 baseline. Static dependency and
 > call relationships are approximations, and the hosted public-repository Web Demo described
 > in the roadmap is not part of this release.
 
@@ -89,6 +89,26 @@ intentionally ignored after upgrade.
 validated AST-like subset, not accepted directly from a model. The evidence tables keep a
 representative source for each node and one concrete import witness for every rendered edge.
 
+`repolocus diff OLD NEW` compares two repository directories or immutable architecture snapshot
+files. It reports file, symbol, entry-point, dependency, configuration, security-boundary, and
+test-area changes with old/new path-and-line evidence and a deterministic suggested review order.
+The comparison never invokes Git or repository commands. Analyzer fingerprint drift is reported
+as a degraded comparison instead of being presented as a source change.
+
+Capture generation-pinned canonical JSON snapshots without source text, then compare those
+immutable inputs in Markdown or machine-readable JSON:
+
+```bash
+repolocus snapshot /path/to/old-checkout old.snapshot.json
+repolocus snapshot /path/to/new-checkout new.snapshot.json
+repolocus diff old.snapshot.json new.snapshot.json
+repolocus diff old.snapshot.json new.snapshot.json --json > architecture-diff.json
+```
+
+`snapshot` refuses to replace an existing destination unless `--force` is explicit. `diff` also
+accepts repository directories directly; use `--refresh never` only to require an already-present
+external index state without scanning either directory.
+
 On POSIX, replacing an existing output preserves its previous contents in a reported hidden
 `.rollback` file. Remove that recovery file manually only when other repository writers are
 quiescent. New documents use atomic create-if-absent publication and do not leave a recovery file.
@@ -114,6 +134,8 @@ supports the claim. A model answer that passes these checks is still labeled `ne
 | `repolocus map [PATH]` | Generate `PROJECT_MAP.md` or print it with `--stdout` |
 | `repolocus ask QUESTION [PATH]` | Retrieve source-backed evidence and optionally use a model |
 | `repolocus diagram [PATH]` | Generate validated Mermaid in `ARCHITECTURE.md` |
+| `repolocus snapshot PATH OUTPUT` | Save a generation-pinned architecture snapshot without source text |
+| `repolocus diff OLD NEW` | Compare repository directories or immutable snapshots with evidence |
 | `repolocus privacy status` | Show remembered per-repository/provider/endpoint consent |
 | `repolocus privacy preview QUESTION` | Show fragments a question would send |
 | `repolocus privacy revoke` | Forget cloud-provider consent |
@@ -140,6 +162,62 @@ ends it. The first answer pins the content generation, and every follow-up uses 
 generation with refresh disabled. The session fails closed if retrieval-visible facts change, but
 a diagnostics-only scan revision does not invalidate the evidence snapshot.
 Follow-up context is never written to the repository or consent state.
+
+## PR Context Action
+
+The opt-in PR Context Action uses `actions/checkout` to materialize the exact base and head
+revisions in separate directories, then uploads `pr-context.md` and `pr-context.json` in the
+`repolocus-pr-context` artifact. After checkout, the RepoLocus analysis core treats both trees as
+untrusted data: it does not call Git or execute target-repository code, hooks, builds, or tests.
+The default is artifact-only and needs only `contents: read`:
+
+```yaml
+name: RepoLocus PR context
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Henry-Yolky/RepoLocus/.github/actions/pr-context@<FULL_40_CHARACTER_COMMIT_SHA>
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+```
+
+Replace the placeholder with the Action's complete 40-character lowercase commit SHA. Branches,
+tags, abbreviated SHAs, and a local `./.github/actions/pr-context` reference are rejected: the
+analyzer must come from immutable trusted Action code, not the checkout being analyzed.
+
+PR comments are disabled unless `comment: "true"` and `github-token` are both supplied. Put that
+opt-in in a separate job restricted to a trusted same-repository head, and grant
+`pull-requests: write` only to that job:
+
+```yaml
+  trusted-comment:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Henry-Yolky/RepoLocus/.github/actions/pr-context@<FULL_40_CHARACTER_COMMIT_SHA>
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+          comment: "true"
+          github-token: ${{ github.token }}
+```
+
+The Action accepts the `pull_request` event, not `pull_request_target`. With the job boundary
+above, fork PRs are never dispatched to a job that receives the comment token. As a second
+defense, if comment mode is requested for a fork elsewhere, the Action skips the comment and
+still produces the artifacts.
 
 ## Agent Skill
 
@@ -309,9 +387,13 @@ The repository includes reproducible synthetic scan and indexed-workflow gates u
 `benchmarks/`, a self-retrieval smoke set, and a fixed multi-repository release gate under
 `evaluation/`. Fixture source, revision, license, tree digest, qrel digest, and review status are
 recorded for all 102 qrels. v0.2 adds optional Tree-sitter adapters, an indexed
-resolved dependency graph, projection-only map/diagram reads, and structured RRF retrieval. The
-next milestones include a public-repository-only Web Demo and an opt-in GitHub Action. The
-project will not claim a complete dynamic call graph from static source. See
+resolved dependency graph, projection-only map/diagram reads, and structured RRF retrieval.
+v0.2.1 adds immutable architecture snapshots, evidence-backed diffs, an opt-in artifact-first
+GitHub Action, and a provenance-checked public regression report. The six benchmark fixtures are
+project-authored synthetic repositories, so their results are reproducible smoke/regression data,
+not independent cross-project quality claims. The next milestones include the read-only MCP and
+IDE surfaces and a public-repository-only Web Demo. The project will not claim a complete dynamic
+call graph from static source. See
 [ROADMAP.md](https://github.com/Henry-Yolky/RepoLocus/blob/main/ROADMAP.md) for scope.
 
 On the recorded Jetson Orin NX synthetic fixture, 10,000 small Python files scanned in 7.54 s

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import random
@@ -214,6 +215,10 @@ def test_evaluation_uses_structured_results_without_hiding_duplicate_ranges() ->
     outcome = outcomes[0]
     assert outcome["returned_paths"] == ["answer.py"]
     assert len(outcome["returned_evidence"]) == 2  # type: ignore[arg-type]
+    assert (
+        outcome["returned_evidence"][0]["content_sha256"]
+        == hashlib.sha256(duplicate.content.encode("utf-8")).hexdigest()
+    )
     assert outcome["duplicate_evidence_rate"] == 0.5
     assert outcome["path_diversity"] == 0.5
     assert outcome["maximum_line_iou"] == 1.0
@@ -887,6 +892,9 @@ def test_external_multi_repository_release_gate_is_reproducible() -> None:
         "must_not_return_violation_rate",
     }
     assert report["manifest"] == "external-manifest.json"
+    assert report["evaluation_metrics_script_sha256"] == (
+        _external_evaluation_script()._metrics_script_sha256()
+    )
     assert report["fixture_count"] == 6
     assert report["qrels"] == 102
     assert report["reviewed_qrels"] == 102
