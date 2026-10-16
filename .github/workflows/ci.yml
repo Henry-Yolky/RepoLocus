@@ -73,7 +73,7 @@ jobs:
           uv run python scripts/check_licenses.py licenses.json
       - name: Upload supply-chain reports
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: supply-chain-reports
           path: |
@@ -109,7 +109,7 @@ jobs:
           --output external-evaluation.json
       - name: Upload external evaluation report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: external-evaluation
           path: external-evaluation.json
@@ -133,7 +133,7 @@ jobs:
           --output v0.2-benchmark.json
       - name: Upload benchmark report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: v0.2-benchmark
           path: v0.2-benchmark.json
@@ -179,7 +179,7 @@ jobs:
           --markdown-output benchmarks/results/public-report.md
           --check
       - name: Upload the public report and its reproduction inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: public-benchmark
           path: |
